@@ -1,0 +1,15 @@
+{
+    "data_source": {
+      "type": "gsheet",
+      "gsheet_url": "https://docs.google.com/spreadsheets/d/1_PFvSf1v8g9p_8BdouTFk4lPFI2xOQC_iModlziUmMU/edit?usp=sharing",
+      "sheet_name": null
+    },
+    "payout_mode": "Tier based",
+    "rate_per_parcel": 1.0,
+    "tiers": [
+      {"Tier": "Tier 3", "Min Parcels": 0, "Max Parcels": 60, "Rate (RM)": 0.95},
+      {"Tier": "Tier 2", "Min Parcels": 61, "Max Parcels": 120, "Rate (RM)": 1.00},
+      {"Tier": "Tier 1", "Min Parcels": 121, "Max Parcels": null, "Rate (RM)": 1.10}
+    ],
+    "currency_symbol": "RM"
+  }
