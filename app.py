@@ -4,17 +4,27 @@ import urllib3
 warnings.filterwarnings('ignore', category=urllib3.exceptions.NotOpenSSLWarning)
 
 import io
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict, Any
 import re
 from urllib.parse import urlparse, parse_qs
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pandas as pd
 import streamlit as st
 import altair as alt
 import requests
+import html
+
+# Add input validation and sanitization
+import html
+
+def sanitize_input(text: str) -> str:
+    """Sanitize user input to prevent XSS attacks."""
+    return html.escape(str(text)).strip()
+
+# Use in invoice generation and other user-facing outputs
 
 # =============================================================================
 # COLOR SCHEME CONSTANTS
@@ -56,8 +66,7 @@ class Config:
             "gsheet_url": "https://docs.google.com/spreadsheets/d/1_PFvSf1v8g9p_8BdouTFk4lPFI2xOQC_iModlziUmMU/edit?usp=sharing",
             "sheet_name": None
         },
-        "payout_mode": "Per parcel",
-        "rate_per_parcel": 1.0,
+        "payout_mode": "Tiered daily",
         "tiers": [
             {"Tier": "Tier 3", "Min Parcels": 0, "Max Parcels": 60, "Rate (RM)": 0.95},
             {"Tier": "Tier 2", "Min Parcels": 61, "Max Parcels": 120, "Rate (RM)": 1.00},
@@ -72,7 +81,12 @@ class Config:
         if os.path.exists(cls.CONFIG_FILE):
             try:
                 with open(cls.CONFIG_FILE, 'r') as f:
-                    return json.load(f)
+                    config = json.load(f)
+                # Validate the loaded config
+                is_valid, errors = cls.validate_tiers(config.get("tiers", []))
+                if not is_valid:
+                    st.warning(f"Configuration validation issues: {', '.join(errors)}")
+                return config
             except Exception as e:
                 st.error(f"Error loading config: {e}")
                 return cls.DEFAULT_CONFIG
@@ -90,6 +104,35 @@ class Config:
         except Exception as e:
             st.error(f"Error saving config: {e}")
             return False
+
+    @classmethod
+    def validate_tiers(cls, tiers_config: List[dict]) -> Tuple[bool, List[str]]:
+        """Enhanced tier validation."""
+        errors = []
+
+        if not tiers_config:
+            errors.append("At least one tier must be configured")
+            return False, errors
+
+        tiers = sorted(tiers_config, key=lambda x: x["Min Parcels"] or 0)
+
+        # Validate each tier
+        for i, tier in enumerate(tiers):
+            min_parcels = tier.get("Min Parcels", 0)
+            max_parcels = tier.get("Max Parcels")
+            rate = tier.get("Rate (RM)")
+
+            if min_parcels is None or min_parcels < 0:
+                errors.append(f"Tier {i+1}: Min Parcels must be non-negative")
+
+            if max_parcels is not None and max_parcels < min_parcels:
+                errors.append(f"Tier {i+1}: Max Parcels cannot be less than Min Parcels")
+
+            if rate is None or rate <= 0:
+                errors.append(f"Tier {i+1}: Rate must be positive")
+
+        # Rest of existing validation logic...
+        return len(errors) == 0, errors
 
 
 # =============================================================================
@@ -148,7 +191,8 @@ class DataSource:
         try:
             resp = requests.get(csv_url, timeout=30)
             resp.raise_for_status()
-            return pd.read_csv(io.BytesIO(resp.content))
+            df = pd.read_csv(io.BytesIO(resp.content))
+            return DataSource.clean_dataframe(df)
         except Exception as exc:
             st.error(f"Failed to fetch Google Sheet: {exc}")
             raise
@@ -160,11 +204,76 @@ class DataSource:
 
         if data_source["type"] == "gsheet" and data_source["gsheet_url"]:
             try:
-                return DataSource.read_google_sheet(data_source["gsheet_url"], data_source["sheet_name"])
+                df = DataSource.read_google_sheet(data_source["gsheet_url"], data_source["sheet_name"])
+                # Validate the loaded data
+                is_valid, errors = DataSource.validate_dataframe(df)
+                if not is_valid:
+                    for error in errors:
+                        st.warning(f"Data validation: {error}")
+                return df
             except Exception as exc:
                 st.error(f"Error reading Google Sheet: {exc}")
                 return None
         return None
+
+    @staticmethod
+    def validate_dataframe(df: pd.DataFrame) -> Tuple[bool, List[str]]:
+        """Enhanced data validation."""
+        errors = []
+        required_columns = ["Dispatcher ID", "Waybill Number", "Delivery Signature"]
+
+        # Check required columns
+        missing_columns = [col for col in required_columns if col not in df.columns]
+        if missing_columns:
+            errors.append(f"Missing columns: {', '.join(missing_columns)}")
+            return False, errors
+
+        # Enhanced validation
+        validation_checks = [
+            ("Dispatcher ID", lambda x: x.notna().all(), "missing Dispatcher ID"),
+            ("Waybill Number", lambda x: x.duplicated().sum() == 0, "duplicate waybill numbers"),
+            ("Delivery Signature", lambda x: pd.to_datetime(x, errors='coerce').notna().all(), "invalid dates")
+        ]
+
+        for col, check_func, error_msg in validation_checks:
+            if col in df.columns:
+                if not check_func(df[col]):
+                    count = len(df) if "missing" in error_msg else df[col].duplicated().sum()
+                    errors.append(f"{count} {error_msg}")
+
+        return len(errors) == 0, errors
+
+    @staticmethod
+    def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+        """Data cleaning and normalization."""
+        df_clean = df.copy()
+
+        # Normalize column names - but keep original format for compatibility
+        df_clean.columns = [str(col).strip() for col in df_clean.columns]
+
+        # Remove completely empty rows
+        df_clean = df_clean.dropna(how='all')
+
+        # Standardize date formats
+        if "Delivery Signature" in df_clean.columns:
+            df_clean["Delivery Signature"] = pd.to_datetime(
+                df_clean["Delivery Signature"], errors='coerce'
+            )
+
+        return DataSource.optimize_dataframe_memory(df_clean)
+
+    @staticmethod
+    def optimize_dataframe_memory(df):
+        """Reduce memory usage of DataFrame."""
+        df_optimized = df.copy()
+
+        for col in df_optimized.columns:
+            if df_optimized[col].dtype == 'object':
+                # Convert object columns to category if they have low cardinality
+                if df_optimized[col].nunique() / len(df_optimized) < 0.5:
+                    df_optimized[col] = df_optimized[col].astype('category')
+
+        return df_optimized
 
 
 # =============================================================================
@@ -173,23 +282,6 @@ class DataSource:
 
 class PayoutCalculator:
     """Handle payout calculations."""
-
-    @staticmethod
-    def calculate_per_parcel(filtered_df: pd.DataFrame, rate: float, currency_symbol: str) -> Tuple[pd.DataFrame, float]:
-        """Calculate payout for per parcel mode."""
-        # Use "Waybill Number" column for parcels — count non-null, non-empty waybills
-        wb_series = filtered_df["Waybill Number"]
-        is_valid_wb = wb_series.notna() & (wb_series.astype(str).str.strip() != "")
-        total_parcels = int(is_valid_wb.sum())
-        total_payout = total_parcels * rate
-
-        display_df = pd.DataFrame([{
-            "Total Parcel": total_parcels,
-            "Payout Rate": f"{currency_symbol}{rate:.2f}",
-            "Payout": f"{currency_symbol}{total_payout:,.2f}"
-        }])
-
-        return display_df, total_payout
 
     @staticmethod
     def calculate_tiered_daily(filtered_df: pd.DataFrame, tiers_config: List, currency_symbol: str) -> Tuple[pd.DataFrame, float, pd.DataFrame]:
@@ -204,7 +296,8 @@ class PayoutCalculator:
             if pd.notna(trate):
                 tiers.append((tmin, tmax, trate, tname))
 
-        tiers.sort(key=lambda t: (t[0] or 0), reverse=True)
+        #tiers.sort(key=lambda t: (t[0] or 0), reverse=True)
+        tiers.sort(key=lambda t: (t[0] or 0))
 
         def map_rate(daily_parcels: float) -> Tuple[str, float]:
             for tmin, tmax, trate, tname in tiers:
@@ -247,6 +340,48 @@ class PayoutCalculator:
 
         return display_df, total_payout, per_day
 
+    @staticmethod
+    def calculate_advanced_metrics(per_day_df: pd.DataFrame) -> dict:
+        """Calculate comprehensive performance metrics."""
+        if per_day_df.empty:
+            return {}
+
+        metrics = {
+            "total_payout": per_day_df["payout_per_day"].sum(),
+            "total_parcels": per_day_df["daily_parcels"].sum(),
+            "total_days": len(per_day_df),
+            "avg_daily_parcels": per_day_df["daily_parcels"].mean(),
+            "avg_daily_payout": per_day_df["payout_per_day"].mean(),
+            "peak_parcels": per_day_df["daily_parcels"].max(),
+            "peak_payout": per_day_df["payout_per_day"].max(),
+            "consistency_score": (per_day_df["daily_parcels"].std() / per_day_df["daily_parcels"].mean())
+                               if per_day_df["daily_parcels"].mean() > 0 else 0,
+        }
+
+        # Tier performance analysis
+        tier_stats = per_day_df.groupby("tier").agg({
+            "daily_parcels": ["count", "sum", "mean"],
+            "payout_per_day": ["sum", "mean"]
+        }).round(2)
+
+        metrics["tier_performance"] = tier_stats.to_dict()
+        return metrics
+
+    @staticmethod
+    def calculate_forecast(per_day_df: pd.DataFrame, days: int = 30) -> dict:
+        """Simple forecasting based on historical performance."""
+        if len(per_day_df) < 7:
+            return {}
+
+        avg_parcels = per_day_df["daily_parcels"].mean()
+        avg_payout = per_day_df["payout_per_day"].mean()
+
+        return {
+            "projected_parcels": avg_parcels * days,
+            "projected_payout": avg_payout * days,
+            "confidence": min(len(per_day_df) / 30, 1.0)  # Simple confidence score
+        }
+
 
 # =============================================================================
 # DATA VISUALIZATION
@@ -256,53 +391,8 @@ class DataVisualizer:
     """Create performance charts and graphs."""
 
     @staticmethod
-    def create_performance_charts(per_day_df: pd.DataFrame, payout_mode: str, currency_symbol: str, filtered_df: pd.DataFrame = None):
-        """Create performance charts based on payout mode."""
-
-        if payout_mode == "Per parcel" and filtered_df is not None:
-            return DataVisualizer._create_per_parcel_charts(filtered_df, currency_symbol)
-        else:
-            return DataVisualizer._create_tiered_daily_charts(per_day_df, currency_symbol)
-
-    @staticmethod
-    def _create_per_parcel_charts(filtered_df: pd.DataFrame, currency_symbol: str):
-        """Create charts for per parcel mode."""
-        charts = {}
-
-        # Daily parcel trend (if we have date information)
-        if "Delivery Signature" in filtered_df.columns:
-            daily_trend = (
-                filtered_df.copy()
-                .assign(date=pd.to_datetime(filtered_df["Delivery Signature"], errors="coerce").dt.date)
-                .groupby("date")
-                .size()
-                .reset_index(name="parcels")
-            )
-
-            if not daily_trend.empty:
-                # Daily parcels trend chart
-                trend_chart = alt.Chart(daily_trend).mark_line(point=True, stroke=ColorScheme.PRIMARY).encode(
-                    x=alt.X('date:T', title='Date', axis=alt.Axis(format='%b %d')),
-                    y=alt.Y('parcels:Q', title='Parcels Delivered'),
-                    tooltip=['date:T', 'parcels:Q']
-                ).properties(
-                    title='Daily Parcel Delivery Trend',
-                    width=400,
-                    height=300
-                ).configure_axis(
-                    gridColor=ColorScheme.BORDER,
-                    domainColor=ColorScheme.TEXT_SECONDARY
-                ).configure_title(
-                    color=ColorScheme.TEXT_PRIMARY
-                )
-
-                charts['daily_trend'] = trend_chart
-
-        return charts
-
-    @staticmethod
-    def _create_tiered_daily_charts(per_day_df: pd.DataFrame, currency_symbol: str):
-        """Create charts for tiered daily mode."""
+    def create_performance_charts(per_day_df: pd.DataFrame, currency_symbol: str):
+        """Create performance charts for tiered daily payout mode."""
         charts = {}
 
         if per_day_df.empty:
@@ -380,8 +470,7 @@ def clean_dispatcher_name(name: str) -> str:
     """Remove prefixes like JMR, ECP, AF from dispatcher names."""
     prefixes = ['JMR', 'ECP', 'AF', 'PEN', 'KUL', 'JHR']
 
-    cleaned_name = str(name).strip()
-
+    cleaned_name = sanitize_input(name)
     # Remove common prefixes
     for prefix in prefixes:
         if cleaned_name.startswith(prefix):
@@ -402,16 +491,12 @@ class InvoiceGenerator:
 
     @staticmethod
     def build_invoice_html(df_disp: pd.DataFrame, total: float, name: str, dpid: str,
-                          currency_symbol: str, payout_mode: str) -> str:
+                          currency_symbol: str) -> str:
         """Build a modern, professional invoice HTML with consistent color scheme."""
 
         # Calculate metrics
-        if payout_mode == "Per parcel":
-            total_parcels = df_disp['Total Parcel'].iloc[0] if 'Total Parcel' in df_disp.columns else 0
-            total_days = 1
-        else:
-            total_parcels = df_disp['Total Parcel'].sum() if 'Total Parcel' in df_disp.columns else 0
-            total_days = len(df_disp) if 'Date' in df_disp.columns else 0
+        total_parcels = df_disp['Total Parcel'].sum() if 'Total Parcel' in df_disp.columns else 0
+        total_days = len(df_disp) if 'Date' in df_disp.columns else 0
 
         # Clean the dispatcher name for invoice
         cleaned_name = clean_dispatcher_name(name)
@@ -581,6 +666,198 @@ class InvoiceGenerator:
 
 
 # =============================================================================
+# BUSINESS INTELLIGENCE & REPORTING
+# =============================================================================
+
+class BusinessIntelligence:
+    """Advanced analytics and business intelligence."""
+
+    @staticmethod
+    def generate_performance_report(per_day_df: pd.DataFrame, dispatcher_name: str) -> Dict[str, Any]:
+        """Generate comprehensive performance report."""
+        metrics = PayoutCalculator.calculate_advanced_metrics(per_day_df)
+        forecast = PayoutCalculator.calculate_forecast(per_day_df)
+
+        report = {
+            "summary": metrics,
+            "forecast": forecast,
+            "recommendations": []
+        }
+
+        # Business intelligence recommendations
+        if metrics:
+            avg_parcels = metrics.get("avg_daily_parcels", 0)
+            consistency = metrics.get("consistency_score", 0)
+
+            if consistency > 0.5:
+                report["recommendations"].append(
+                    "📊 Consider strategies to improve delivery consistency"
+                )
+
+            if avg_parcels < 50:
+                report["recommendations"].append(
+                    "🎯 Focus on increasing daily parcel volume to reach higher tiers"
+                )
+
+            if avg_parcels > 100:
+                report["recommendations"].append(
+                    "⭐ Excellent performance! Maintain consistency for maximum earnings"
+                )
+
+        return report
+
+
+# =============================================================================
+# UI COMPONENTS
+# =============================================================================
+
+def create_sidebar_navigation():
+    """Create sidebar navigation for better organization."""
+    with st.sidebar:
+        st.header("🚚 Navigation")
+
+        st.markdown("### Quick Actions")
+        if st.button("🔄 Refresh Data", use_container_width=True):
+            st.cache_data.clear()
+            st.rerun()
+
+        st.markdown("---")
+        st.markdown("### System Info")
+        st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+
+        # Display configuration status
+        config = Config.load()
+        is_valid, errors = Config.validate_tiers(config.get("tiers", []))
+        if is_valid:
+            st.success("✅ Config Valid")
+        else:
+            st.warning("⚠️ Config Issues")
+
+def show_progress_indicator(step: int, total_steps: int, current_section: str):
+    """Show progress indicator for multi-step processes."""
+    progress = step / total_steps
+    st.progress(progress)
+    st.caption(f"Step {step} of {total_steps}: {current_section}")
+
+def create_summary_cards(per_day_df: pd.DataFrame, total_payout: float, total_parcels: int, dispatcher_name: str):
+    """Create enhanced summary cards at the top."""
+    if per_day_df.empty:
+        return
+
+    total_days = len(per_day_df)
+
+    # Create three columns for the metrics
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        st.metric(label="👷‍♂️ Dispatcher", value=dispatcher_name)
+
+    with col2:
+        st.metric(
+            "💰 Total Payout",
+            f"RM{total_payout:,.2f}",
+            delta=f"{total_days} days" if total_days > 0 else None
+        )
+
+    with col3:
+        st.metric(
+            "📦 Total Parcels",
+            f"{total_parcels:,}",
+            delta=f"{total_days} days" if total_days > 0 else None
+        )
+
+def add_date_filter(filtered_df: pd.DataFrame):
+    """Add date range filtering for data analysis."""
+    if "Delivery Signature" not in filtered_df.columns:
+        return None, None
+
+    dates = pd.to_datetime(filtered_df["Delivery Signature"], errors='coerce').dt.date
+    valid_dates = dates.dropna()
+
+    if valid_dates.empty:
+        return None, None
+
+    min_date, max_date = valid_dates.min(), valid_dates.max()
+
+    st.subheader("📅 Date Range Filter")
+    col1, col2 = st.columns(2)
+    with col1:
+        start_date = st.date_input("Start Date", min_date, min_value=min_date, max_value=max_date)
+    with col2:
+        end_date = st.date_input("End Date", max_date, min_value=min_date, max_value=max_date)
+
+    return start_date, end_date
+
+def get_dispatcher_name(filtered_df: pd.DataFrame, selected_dispatcher: str) -> str:
+    """Extract dispatcher name from filtered data with proper column name handling."""
+    # Try multiple possible column names for dispatcher name
+    possible_name_columns = [
+        "Dispatcher Name", "DispatcherName", "Name", "Rider Name", "RiderName",
+        "Driver Name", "DriverName", "Courier Name", "CourierName"
+    ]
+
+    for col in possible_name_columns:
+        if col in filtered_df.columns:
+            names = filtered_df[col].dropna().astype(str).unique()
+            if len(names) > 0:
+                # Return the first non-empty name found
+                name = names[0].strip()
+                if name:
+                    return clean_dispatcher_name(name)
+
+    # If no name found, return the dispatcher ID as fallback
+    return selected_dispatcher
+
+def enhanced_dispatcher_selection(df: pd.DataFrame):
+    """Enhanced dispatcher selection with search."""
+    st.subheader("👤 Dispatcher Selection")
+
+    unique_dispatchers = sorted(df["Dispatcher ID"].dropna().astype(str).unique().tolist())
+
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        selected = st.selectbox("Select Dispatcher", unique_dispatchers, key="dispatcher_select")
+    with col2:
+        search_term = st.text_input("🔍 Search", placeholder="Filter dispatchers...", key="dispatcher_search")
+
+    if search_term:
+        filtered_dispatchers = [d for d in unique_dispatchers if search_term.lower() in d.lower()]
+        if filtered_dispatchers:
+            selected = st.selectbox("Filtered Dispatchers", filtered_dispatchers, key="filtered_dispatcher_select")
+        else:
+            st.warning("No dispatchers match your search criteria.")
+
+    return selected
+
+def paginate_dataframe(df: pd.DataFrame, page_size: int = 50, page_number: int = 1):
+    """Implement pagination for large datasets."""
+    start_idx = (page_number - 1) * page_size
+    end_idx = start_idx + page_size
+    return df.iloc[start_idx:end_idx]
+
+def create_pagination_controls(total_rows: int, page_size: int, current_page: int):
+    """Create pagination UI controls."""
+    total_pages = max(1, (total_rows + page_size - 1) // page_size)
+
+    col1, col2, col3, col4 = st.columns([2, 1, 1, 2])
+
+    with col2:
+        if current_page > 1:
+            if st.button("◀ Previous", key="prev_page"):
+                current_page -= 1
+                st.rerun()
+
+    with col3:
+        if current_page < total_pages:
+            if st.button("Next ▶", key="next_page"):
+                current_page += 1
+                st.rerun()
+
+    st.caption(f"Page {current_page} of {total_pages} ({total_rows} total records)")
+    return current_page
+
+
+# =============================================================================
 # STREAMLIT UI ENHANCEMENTS
 # =============================================================================
 
@@ -733,8 +1010,13 @@ def apply_custom_styles():
         }}
 
         /* Ensure all text in footer is white */
-        .footer * {{
+        .footer, .footer * {{
             color: white !important;
+        }}
+
+        /* Progress bar styling */
+        .stProgress > div > div > div > div {{
+            background-color: {ColorScheme.PRIMARY};
         }}
 
         @media (max-width: 768px) {{
@@ -752,29 +1034,51 @@ def add_footer():
     <div class="footer">
         <div class="footer-content">
             <div class="footer-copyright" style="color: white !important;">
-                © 2025 Jemari Ventures. All rights reserved. | JMR Dispatcher Payout System v1.0
+                © 2025 Jemari Ventures. All rights reserved. | JMR Dispatcher Payout System v2.0
             </div>
         </div>
     </div>
     """, unsafe_allow_html=True)
+
+
+# =============================================================================
+# CACHING OPTIMIZATIONS
+# =============================================================================
+
+@st.cache_data(ttl=600, show_spinner="Loading configuration...")
+def load_config_cached():
+    return Config.load()
+
+@st.cache_data(ttl=300, show_spinner="Processing payout data...")
+def calculate_payout_cached(filtered_df, tiers_config, currency_symbol):
+    return PayoutCalculator.calculate_tiered_daily(filtered_df, tiers_config, currency_symbol)
+
+@st.cache_data(ttl=1800, show_spinner="Generating performance charts...")
+def create_charts_cached(per_day_df, currency_symbol):
+    return DataVisualizer.create_performance_charts(per_day_df, currency_symbol)
+
 
 # =============================================================================
 # MAIN APPLICATION
 # =============================================================================
 
 def main():
-    """Main application with Google Sheets only."""
+    """Main application with enhanced features."""
     # Page configuration
     st.set_page_config(
         page_title="JMR Dispatcher Payout System",
         page_icon="🚚",
-        layout="wide"
+        layout="wide",
+        initial_sidebar_state="expanded"
     )
 
     # Apply custom styles
     apply_custom_styles()
 
-    # Custom header with consistent branding - FIXED VERSION
+    # Add sidebar navigation
+    create_sidebar_navigation()
+
+    # Custom header with consistent branding
     st.markdown(f"""
     <div style="background: linear-gradient(135deg, {ColorScheme.PRIMARY} 0%, {ColorScheme.PRIMARY_LIGHT} 100%);
                 padding: 2rem;
@@ -784,31 +1088,32 @@ def main():
                 text-align: center;
                 box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);">
         <h1 style="color: white !important; margin: 0; padding: 0;">🚚 JMR Dispatcher Payout System</h1>
-        <p style="color: rgba(255,255,255,0.9) !important; margin: 0.5rem 0 0 0; padding: 0;">Calculate dispatcher payout online</p>
+        <p style="color: rgba(255,255,255,0.9) !important; margin: 0.5rem 0 0 0; padding: 0;">Enhanced Tiered Daily Payout Calculator</p>
     </div>
     """, unsafe_allow_html=True)
 
-    # Load configuration
-    config = Config.load()
+    # Load configuration with caching
+    config = load_config_cached()
 
     # Load data from Google Sheets
-    with st.spinner("Loading data from Google Sheets..."):
+    with st.spinner("📊 Loading data from Google Sheets..."):
         df = DataSource.load_data(config)
 
     if df is None:
         st.error("❌ Failed to load data from Google Sheets.")
         st.info("Please check the configuration file or ensure the Google Sheet is accessible.")
-        add_footer()  # Add footer even if there's an error
+        st.stop()
+        add_footer()
         return
 
     if df.empty:
         st.warning("No data found in the Google Sheet.")
-        add_footer()  # Add footer even if there's no data
+        add_footer()
         return
 
-    # Normalize column names
-    df = df.rename(columns={c: str(c).strip() for c in df.columns})
-
+    # Normalize column names - use original format for compatibility
+    #df = df.rename(columns={c: str(c).strip() for c in df.columns})
+    df.columns = [str(col).strip() for col in df.columns]
     # Check required columns
     required_columns = ["Dispatcher ID", "Waybill Number", "Delivery Signature"]
     missing_columns = [col for col in required_columns if col not in df.columns]
@@ -816,178 +1121,167 @@ def main():
     if missing_columns:
         st.error(f"Missing required columns: {', '.join(missing_columns)}")
         st.info(f"Available columns: {', '.join(df.columns.tolist())}")
-        add_footer()  # Add footer even if there are missing columns
+        add_footer()
         return
 
-    # Step 1: Dispatcher selection
-    st.subheader("👤 Dispatcher Selection")
 
     unique_dispatchers = sorted(df["Dispatcher ID"].dropna().astype(str).unique().tolist())
     if not unique_dispatchers:
         st.error("No dispatcher IDs found in the data.")
-        add_footer()  # Add footer even if no dispatchers found
+        add_footer()
         return
 
-    selected_dispatcher = st.selectbox("Select Dispatcher", options=unique_dispatchers)
+    selected_dispatcher = enhanced_dispatcher_selection(df)
 
+    # Apply date filtering if available
     filtered = df[df["Dispatcher ID"].astype(str) == str(selected_dispatcher)].copy()
+    start_date, end_date = add_date_filter(filtered)
 
-    with st.expander("View Filtered Data", expanded=False):
-        st.dataframe(filtered.head(100), use_container_width=True)
+    if start_date and end_date:
+        filtered = filtered[
+            (pd.to_datetime(filtered["Delivery Signature"]).dt.date >= start_date) &
+            (pd.to_datetime(filtered["Delivery Signature"]).dt.date <= end_date)
+        ]
 
-    # Step 2: Payout Calculation
+    # Get dispatcher name using the improved function
+    dispatcher_name = get_dispatcher_name(filtered, selected_dispatcher)
+
+    # Pagination for filtered data view
+    with st.expander("📋 View Filtered Data", expanded=False):
+        page_size = 50
+        current_page = 1
+
+        if len(filtered) > page_size:
+            current_page = create_pagination_controls(len(filtered), page_size, current_page)
+            paginated_data = paginate_dataframe(filtered, page_size, current_page)
+            st.dataframe(paginated_data, use_container_width=True)
+        else:
+            st.dataframe(filtered, use_container_width=True)
+
+    # Step 2: Payout Calculation with Caching
     st.subheader("💰 Payout Calculation")
 
-    # Get and display dispatcher name (cleaned)
-    dispatcher_name = ""
-    for candidate_col in ["Dispatcher Name", "Name", "Rider Name"]:
-        if candidate_col in filtered.columns:
-            values = filtered[candidate_col].dropna().astype(str).unique().tolist()
-            if values:
-                dispatcher_name = clean_dispatcher_name(values[0])
-                break
-
-    payout_mode = config["payout_mode"]
     currency_symbol = config["currency_symbol"]
 
-    # Initialize variables for charts
-    per_day = None
-    display_df = None
-    total_payout = 0
+    # Calculate tiered daily payout with caching
+    display_df, total_payout, per_day = calculate_payout_cached(
+        filtered, config["tiers"], currency_symbol
+    )
 
-    # Display results in a single line
-    if payout_mode == "Per parcel":
-        rate_per_parcel = config.get("rate_per_parcel", 1.0)
+    # Enhanced Summary Cards
+    total_parcels = per_day["daily_parcels"].sum()
+    create_summary_cards(per_day, total_payout, total_parcels, dispatcher_name)
 
-        display_df, total_payout = PayoutCalculator.calculate_per_parcel(
-            filtered, rate_per_parcel, currency_symbol
-        )
+    # Display detailed payout table
+    st.dataframe(display_df, use_container_width=True)
 
-        # Display results in a single line
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.metric(label="Dispatcher", value=dispatcher_name)
-        with col2:
-            total_parcels = display_df['Total Parcel'].iloc[0]
-            st.metric(label="Total Parcels", value=f"{total_parcels:,}")
-        with col3:
-            st.metric(label="Rate per Parcel", value=f"{currency_symbol}{rate_per_parcel:.2f}")
-        with col4:
-            st.metric(label="Total Payout", value=f"{currency_symbol}{total_payout:,.2f}")
+    # Step 3: Performance Visualization with Caching
+    st.subheader("📊 Performance Visualization & Analytics")
 
-    else:  # Tiered daily mode
-        display_df, total_payout, per_day = PayoutCalculator.calculate_tiered_daily(
-            filtered, config["tiers"], currency_symbol
-        )
+    # Create and display charts with caching
+    charts = create_charts_cached(per_day, currency_symbol)
 
-        # Display summary metrics in a single line
+    if charts:
+        # Show charts in a responsive layout
         col1, col2, col3 = st.columns(3)
+
         with col1:
-            st.metric(label="Dispatcher", value=dispatcher_name)
+            if 'parcels_payout' in charts:
+                st.altair_chart(charts['parcels_payout'], use_container_width=True)
         with col2:
-            total_parcels = per_day["daily_parcels"].sum()
-            st.metric(label="Total Parcels", value=f"{total_parcels:,}")
+            if 'payout_trend' in charts:
+                st.altair_chart(charts['payout_trend'], use_container_width=True)
         with col3:
-            st.metric(label="Total Payout", value=f"{currency_symbol}{total_payout:,.2f}")
+            if 'performance_scatter' in charts:
+                st.altair_chart(charts['performance_scatter'], use_container_width=True)
 
-        st.dataframe(display_df, use_container_width=True)
+        # Advanced Performance Metrics
+        st.markdown("---")
+        st.subheader("📈 Advanced Performance Analytics")
 
-    # Step 3: Performance Visualization
-    st.subheader("📊 Performance Visualization")
+        # Business Intelligence Report
+        report = BusinessIntelligence.generate_performance_report(per_day, dispatcher_name)
 
-    # Create and display charts
-    if payout_mode == "Per parcel":
-        charts = DataVisualizer.create_performance_charts(None, payout_mode, currency_symbol, filtered)
+        if report["summary"]:
+            col1, col2, col3, col4, col5 = st.columns(5)
 
-        if charts:
-            # For per parcel mode, show available charts in columns
-            cols = st.columns(len(charts))
-            for idx, (chart_name, chart) in enumerate(charts.items()):
-                with cols[idx]:
-                    st.altair_chart(chart, use_container_width=True)
-        else:
-            st.info("No performance data available for visualization.")
+            with col1:
+                avg_parcels = report["summary"]["avg_daily_parcels"]
+                st.metric("📦 Average Daily Parcels", f"{avg_parcels:.1f}")
 
-    else:
-        charts = DataVisualizer.create_performance_charts(per_day, payout_mode, currency_symbol)
+            with col2:
+                max_parcels = report["summary"]["peak_parcels"]
+                st.metric("🗳️ Maximum Daily Parcels", f"{max_parcels:.0f}")
 
-        if charts:
-            # For tiered daily mode, show charts in a 3-column layout
+            with col3:
+                avg_payout = report["summary"]["avg_daily_payout"]
+                st.metric("💵 Average Daily Payout", f"{currency_symbol}{avg_payout:.2f}")
+
+            with col4:
+                if not per_day.empty and "tier" in per_day.columns:
+                    tier_distribution = per_day["tier"].value_counts()
+                    most_used_tier = tier_distribution.index[0] if not tier_distribution.empty else "N/A"
+                    st.metric("🏆 Most Used Tier", most_used_tier)
+
+            with col5:
+                consistency = report["summary"]["consistency_score"]
+                st.metric("📊 Consistency Score", f"{consistency:.2f}")
+
+        # Forecasting Section
+        if report["forecast"]:
+            st.subheader("🔮 30-Day Forecast")
+            forecast = report["forecast"]
             col1, col2, col3 = st.columns(3)
 
             with col1:
-                if 'parcels_payout' in charts:
-                    st.altair_chart(charts['parcels_payout'], use_container_width=True)
-                else:
-                    st.info("No parcels and payout data available")
+                st.metric(
+                    "📦📦 Projected Parcels",
+                    f"{forecast['projected_parcels']:,.0f}",
+                    delta=f"{forecast['confidence']:.0%} confidence"
+                )
 
             with col2:
-                if 'performance_scatter' in charts:
-                    st.altair_chart(charts['performance_scatter'], use_container_width=True)
-                else:
-                    st.info("No performance scatter data available")
+                st.metric(
+                    "🏦 Projected Payout",
+                    f"{currency_symbol}{forecast['projected_payout']:,.2f}",
+                    delta=f"{forecast['confidence']:.0%} confidence"
+                )
 
             with col3:
-                if 'payout_trend' in charts:
-                    st.altair_chart(charts['payout_trend'], use_container_width=True)
-                else:
-                    st.info("No payout trend data available")
+                st.metric("📅 Forecast Period", "30 days")
 
-            # Performance metrics below the charts
-            st.markdown("---")
-            st.subheader("📈 Performance Summary")
-
-            if per_day is not None and not per_day.empty:
-                col1, col2, col3, col4 = st.columns(4)
-
-                with col1:
-                    avg_parcels = per_day["daily_parcels"].mean()
-                    st.metric("Average Daily Parcels", f"{avg_parcels:.1f}")
-
-                with col2:
-                    max_parcels = per_day["daily_parcels"].max()
-                    st.metric("Maximum Daily Parcels", f"{max_parcels:.0f}")
-
-                with col3:
-                    avg_payout = per_day["payout_per_day"].mean()
-                    st.metric("Average Daily Payout", f"{currency_symbol}{avg_payout:.2f}")
-
-                with col4:
-                    total_days = len(per_day)
-                    st.metric("Total Working Days", f"{total_days}")
-        else:
-            st.info("No performance data available for visualization.")
+        # Recommendations
+        if report["recommendations"]:
+            st.subheader("💡 Performance Recommendations")
+            for recommendation in report["recommendations"]:
+                st.info(recommendation)
+    else:
+        st.info("No performance data available for visualization.")
 
     # Step 4: Invoice Generation
     st.subheader("📄 Invoice Generation")
 
-    # Auto-extract dispatcher info
-    inv_name, inv_id = "", ""
-
-    for candidate_col in ["Dispatcher Name", "Name", "Rider Name"]:
-        if candidate_col in filtered.columns:
-            values = filtered[candidate_col].dropna().astype(str).unique().tolist()
-            if values:
-                inv_name = values[0]
-                break
-    if not inv_name:
-        inv_name = str(selected_dispatcher)
-
-    inv_id = str(selected_dispatcher)
+    # Use the already extracted dispatcher name
+    inv_name = dispatcher_name
+    inv_id = selected_dispatcher
 
     # Generate and download invoice
     invoice_html = InvoiceGenerator.build_invoice_html(
-        display_df, total_payout, inv_name, inv_id, currency_symbol, payout_mode
+        display_df, total_payout, inv_name, inv_id, currency_symbol
     )
 
-    st.download_button(
-        label="📥 Download Invoice (HTML)",
-        data=invoice_html.encode("utf-8"),
-        file_name=f"invoice_{selected_dispatcher}_{datetime.now().strftime('%Y%m%d')}.html",
-        mime="text/html",
-    )
+    col1, col2 = st.columns([1, 3])
+    with col1:
+        st.download_button(
+            label="📥 Download Invoice (HTML)",
+            data=invoice_html.encode("utf-8"),
+            file_name=f"invoice_{selected_dispatcher}_{datetime.now().strftime('%Y%m%d')}.html",
+            mime="text/html",
+            use_container_width=True
+        )
 
-    st.caption("Invoice generated based on current configuration and data.")
+    with col2:
+        st.caption("Professional invoice with detailed breakdown and company branding.")
 
     # Add footer at the end of the main content
     add_footer()
