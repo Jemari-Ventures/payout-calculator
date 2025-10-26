@@ -544,14 +544,6 @@ def apply_custom_styles():
         .stMarkdown div h1 {{
             color: white !important;
         }}
-        .stMarkdown div p {{
-            color: rgba(255,255,255,0.9) !important;
-        }}
-
-        /* Regular text elements */
-        .stMarkdown p, .stMarkdown div {{
-            color: {ColorScheme.TEXT_PRIMARY} !important;
-        }}
 
         /* Sidebar */
         .css-1d391kg, .css-1lcbmhc {{
