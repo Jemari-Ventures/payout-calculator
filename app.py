@@ -589,8 +589,8 @@ class InvoiceGenerator:
             <div class="container">
                 <div class="header">
                     <div>
-                        <div class="brand">🚚 Invoice</div>
-                        <div class="idline">From: Jemari Ventures &nbsp;&nbsp;|&nbsp;&nbsp; To: {cleaned_name}</div>
+                        <div class="brand">Invoice</div>
+                        <div class="idline">From: JEMARI VENTURES &nbsp;&nbsp;|&nbsp;&nbsp; To: {cleaned_name}</div>
                     </div>
                     <div class="total-badge">
                         <div class="label">Total Payout</div>
