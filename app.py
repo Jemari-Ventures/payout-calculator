@@ -56,8 +56,6 @@ class Config:
             "gsheet_url": "https://docs.google.com/spreadsheets/d/1_PFvSf1v8g9p_8BdouTFk4lPFI2xOQC_iModlziUmMU/edit?usp=sharing",
             "sheet_name": None
         },
-        "payout_mode": "Per parcel",
-        "rate_per_parcel": 1.0,
         "tiers": [
             {"Tier": "Tier 3", "Min Parcels": 0, "Max Parcels": 60, "Rate (RM)": 0.95},
             {"Tier": "Tier 2", "Min Parcels": 61, "Max Parcels": 120, "Rate (RM)": 1.00},
@@ -175,23 +173,6 @@ class PayoutCalculator:
     """Handle payout calculations."""
 
     @staticmethod
-    def calculate_per_parcel(filtered_df: pd.DataFrame, rate: float, currency_symbol: str) -> Tuple[pd.DataFrame, float]:
-        """Calculate payout for per parcel mode."""
-        # Use "Waybill Number" column for parcels — count non-null, non-empty waybills
-        wb_series = filtered_df["Waybill Number"]
-        is_valid_wb = wb_series.notna() & (wb_series.astype(str).str.strip() != "")
-        total_parcels = int(is_valid_wb.sum())
-        total_payout = total_parcels * rate
-
-        display_df = pd.DataFrame([{
-            "Total Parcel": total_parcels,
-            "Payout Rate": f"{currency_symbol}{rate:.2f}",
-            "Payout": f"{currency_symbol}{total_payout:,.2f}"
-        }])
-
-        return display_df, total_payout
-
-    @staticmethod
     def calculate_tiered_daily(filtered_df: pd.DataFrame, tiers_config: List, currency_symbol: str) -> Tuple[pd.DataFrame, float, pd.DataFrame]:
         """Calculate payout for tiered daily mode."""
         # Prepare tiers
@@ -256,49 +237,9 @@ class DataVisualizer:
     """Create performance charts and graphs."""
 
     @staticmethod
-    def create_performance_charts(per_day_df: pd.DataFrame, payout_mode: str, currency_symbol: str, filtered_df: pd.DataFrame = None):
-        """Create performance charts based on payout mode."""
-
-        if payout_mode == "Per parcel" and filtered_df is not None:
-            return DataVisualizer._create_per_parcel_charts(filtered_df, currency_symbol)
-        else:
-            return DataVisualizer._create_tiered_daily_charts(per_day_df, currency_symbol)
-
-    @staticmethod
-    def _create_per_parcel_charts(filtered_df: pd.DataFrame, currency_symbol: str):
-        """Create charts for per parcel mode."""
-        charts = {}
-
-        # Daily parcel trend (if we have date information)
-        if "Delivery Signature" in filtered_df.columns:
-            daily_trend = (
-                filtered_df.copy()
-                .assign(date=pd.to_datetime(filtered_df["Delivery Signature"], errors="coerce").dt.date)
-                .groupby("date")
-                .size()
-                .reset_index(name="parcels")
-            )
-
-            if not daily_trend.empty:
-                # Daily parcels trend chart
-                trend_chart = alt.Chart(daily_trend).mark_line(point=True, stroke=ColorScheme.PRIMARY).encode(
-                    x=alt.X('date:T', title='Date', axis=alt.Axis(format='%b %d')),
-                    y=alt.Y('parcels:Q', title='Parcels Delivered'),
-                    tooltip=['date:T', 'parcels:Q']
-                ).properties(
-                    title='Daily Parcel Delivery Trend',
-                    width=400,
-                    height=300
-                ).configure_axis(
-                    gridColor=ColorScheme.BORDER,
-                    domainColor=ColorScheme.TEXT_SECONDARY
-                ).configure_title(
-                    color=ColorScheme.TEXT_PRIMARY
-                )
-
-                charts['daily_trend'] = trend_chart
-
-        return charts
+    def create_performance_charts(per_day_df: pd.DataFrame, currency_symbol: str):
+        """Create performance charts for tiered daily mode."""
+        return DataVisualizer._create_tiered_daily_charts(per_day_df, currency_symbol)
 
     @staticmethod
     def _create_tiered_daily_charts(per_day_df: pd.DataFrame, currency_symbol: str):
@@ -402,16 +343,12 @@ class InvoiceGenerator:
 
     @staticmethod
     def build_invoice_html(df_disp: pd.DataFrame, total: float, name: str, dpid: str,
-                          currency_symbol: str, payout_mode: str) -> str:
+                          currency_symbol: str) -> str:
         """Build a modern, professional invoice HTML with consistent color scheme."""
 
-        # Calculate metrics
-        if payout_mode == "Per parcel":
-            total_parcels = df_disp['Total Parcel'].iloc[0] if 'Total Parcel' in df_disp.columns else 0
-            total_days = 1
-        else:
-            total_parcels = df_disp['Total Parcel'].sum() if 'Total Parcel' in df_disp.columns else 0
-            total_days = len(df_disp) if 'Date' in df_disp.columns else 0
+        # Calculate metrics for tiered daily mode
+        total_parcels = df_disp['Total Parcel'].sum() if 'Total Parcel' in df_disp.columns else 0
+        total_days = len(df_disp) if 'Date' in df_disp.columns else 0
 
         # Clean the dispatcher name for invoice
         cleaned_name = clean_dispatcher_name(name)
@@ -847,116 +784,77 @@ def main():
                 dispatcher_name = clean_dispatcher_name(values[0])
                 break
 
-    payout_mode = config["payout_mode"]
     currency_symbol = config["currency_symbol"]
 
-    # Initialize variables for charts
-    per_day = None
-    display_df = None
-    total_payout = 0
+    # Calculate payout using tiered daily mode
+    display_df, total_payout, per_day = PayoutCalculator.calculate_tiered_daily(
+        filtered, config["tiers"], currency_symbol
+    )
 
-    # Display results in a single line
-    if payout_mode == "Per parcel":
-        rate_per_parcel = config.get("rate_per_parcel", 1.0)
+    # Display summary metrics in a single line
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric(label="Dispatcher", value=dispatcher_name)
+    with col2:
+        total_parcels = per_day["daily_parcels"].sum()
+        st.metric(label="Total Parcels", value=f"{total_parcels:,}")
+    with col3:
+        st.metric(label="Total Payout", value=f"{currency_symbol}{total_payout:,.2f}")
 
-        display_df, total_payout = PayoutCalculator.calculate_per_parcel(
-            filtered, rate_per_parcel, currency_symbol
-        )
-
-        # Display results in a single line
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.metric(label="Dispatcher", value=dispatcher_name)
-        with col2:
-            total_parcels = display_df['Total Parcel'].iloc[0]
-            st.metric(label="Total Parcels", value=f"{total_parcels:,}")
-        with col3:
-            st.metric(label="Rate per Parcel", value=f"{currency_symbol}{rate_per_parcel:.2f}")
-        with col4:
-            st.metric(label="Total Payout", value=f"{currency_symbol}{total_payout:,.2f}")
-
-    else:  # Tiered daily mode
-        display_df, total_payout, per_day = PayoutCalculator.calculate_tiered_daily(
-            filtered, config["tiers"], currency_symbol
-        )
-
-        # Display summary metrics in a single line
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric(label="Dispatcher", value=dispatcher_name)
-        with col2:
-            total_parcels = per_day["daily_parcels"].sum()
-            st.metric(label="Total Parcels", value=f"{total_parcels:,}")
-        with col3:
-            st.metric(label="Total Payout", value=f"{currency_symbol}{total_payout:,.2f}")
-
-        st.dataframe(display_df, use_container_width=True)
+    st.dataframe(display_df, use_container_width=True)
 
     # Step 3: Performance Visualization
     st.subheader("📊 Performance Visualization")
 
-    # Create and display charts
-    if payout_mode == "Per parcel":
-        charts = DataVisualizer.create_performance_charts(None, payout_mode, currency_symbol, filtered)
+    # Create and display charts for tiered daily mode
+    charts = DataVisualizer.create_performance_charts(per_day, currency_symbol)
 
-        if charts:
-            # For per parcel mode, show available charts in columns
-            cols = st.columns(len(charts))
-            for idx, (chart_name, chart) in enumerate(charts.items()):
-                with cols[idx]:
-                    st.altair_chart(chart, use_container_width=True)
-        else:
-            st.info("No performance data available for visualization.")
+    if charts:
+        # Show charts in a 3-column layout
+        col1, col2, col3 = st.columns(3)
 
-    else:
-        charts = DataVisualizer.create_performance_charts(per_day, payout_mode, currency_symbol)
+        with col1:
+            if 'parcels_payout' in charts:
+                st.altair_chart(charts['parcels_payout'], use_container_width=True)
+            else:
+                st.info("No parcels and payout data available")
 
-        if charts:
-            # For tiered daily mode, show charts in a 3-column layout
-            col1, col2, col3 = st.columns(3)
+        with col2:
+            if 'performance_scatter' in charts:
+                st.altair_chart(charts['performance_scatter'], use_container_width=True)
+            else:
+                st.info("No performance scatter data available")
+
+        with col3:
+            if 'payout_trend' in charts:
+                st.altair_chart(charts['payout_trend'], use_container_width=True)
+            else:
+                st.info("No payout trend data available")
+
+        # Performance metrics below the charts
+        st.markdown("---")
+        st.subheader("📈 Performance Summary")
+
+        if per_day is not None and not per_day.empty:
+            col1, col2, col3, col4 = st.columns(4)
 
             with col1:
-                if 'parcels_payout' in charts:
-                    st.altair_chart(charts['parcels_payout'], use_container_width=True)
-                else:
-                    st.info("No parcels and payout data available")
+                avg_parcels = per_day["daily_parcels"].mean()
+                st.metric("Average Daily Parcels", f"{avg_parcels:.1f}")
 
             with col2:
-                if 'performance_scatter' in charts:
-                    st.altair_chart(charts['performance_scatter'], use_container_width=True)
-                else:
-                    st.info("No performance scatter data available")
+                max_parcels = per_day["daily_parcels"].max()
+                st.metric("Maximum Daily Parcels", f"{max_parcels:.0f}")
 
             with col3:
-                if 'payout_trend' in charts:
-                    st.altair_chart(charts['payout_trend'], use_container_width=True)
-                else:
-                    st.info("No payout trend data available")
+                avg_payout = per_day["payout_per_day"].mean()
+                st.metric("Average Daily Payout", f"{currency_symbol}{avg_payout:.2f}")
 
-            # Performance metrics below the charts
-            st.markdown("---")
-            st.subheader("📈 Performance Summary")
-
-            if per_day is not None and not per_day.empty:
-                col1, col2, col3, col4 = st.columns(4)
-
-                with col1:
-                    avg_parcels = per_day["daily_parcels"].mean()
-                    st.metric("Average Daily Parcels", f"{avg_parcels:.1f}")
-
-                with col2:
-                    max_parcels = per_day["daily_parcels"].max()
-                    st.metric("Maximum Daily Parcels", f"{max_parcels:.0f}")
-
-                with col3:
-                    avg_payout = per_day["payout_per_day"].mean()
-                    st.metric("Average Daily Payout", f"{currency_symbol}{avg_payout:.2f}")
-
-                with col4:
-                    total_days = len(per_day)
-                    st.metric("Total Working Days", f"{total_days}")
-        else:
-            st.info("No performance data available for visualization.")
+            with col4:
+                total_days = len(per_day)
+                st.metric("Total Working Days", f"{total_days}")
+    else:
+        st.info("No performance data available for visualization.")
 
     # Step 4: Invoice Generation
     st.subheader("📄 Invoice Generation")
@@ -977,7 +875,7 @@ def main():
 
     # Generate and download invoice
     invoice_html = InvoiceGenerator.build_invoice_html(
-        display_df, total_payout, inv_name, inv_id, currency_symbol, payout_mode
+        display_df, total_payout, inv_name, inv_id, currency_symbol
     )
 
     st.download_button(
