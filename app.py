@@ -909,13 +909,56 @@ def main():
     # Step 1: Dispatcher selection
     st.subheader("👤 Dispatcher Selection")
 
+    # Create a mapping of dispatcher IDs to names
+    dispatcher_mapping = {}
+    for candidate_col in ["Dispatcher Name", "Name", "Rider Name"]:
+        if candidate_col in df.columns:
+            # Create ID -> Name mapping
+            temp_mapping = df[["Dispatcher ID", candidate_col]].dropna()
+            temp_mapping["Dispatcher ID"] = temp_mapping["Dispatcher ID"].astype(str)
+            temp_mapping[candidate_col] = temp_mapping[candidate_col].astype(str)
+
+            for _, row in temp_mapping.iterrows():
+                dispatcher_id = row["Dispatcher ID"]
+                dispatcher_name = clean_dispatcher_name(row[candidate_col])
+                if dispatcher_id not in dispatcher_mapping:
+                    dispatcher_mapping[dispatcher_id] = dispatcher_name
+
+            if dispatcher_mapping:
+                break
+
+    # Get unique dispatchers
     unique_dispatchers = sorted(df["Dispatcher ID"].dropna().astype(str).unique().tolist())
     if not unique_dispatchers:
         st.error("No dispatcher IDs found in the data.")
         add_footer()
         return
 
-    selected_dispatcher = st.selectbox("Select Dispatcher", options=unique_dispatchers)
+    # Create display options with both name and ID
+    dispatcher_options = []
+    for dispatcher_id in unique_dispatchers:
+        dispatcher_name = dispatcher_mapping.get(dispatcher_id, "Unknown")
+        display_text = f"{dispatcher_name} ({dispatcher_id})"
+        dispatcher_options.append(display_text)
+
+    # Sort alphabetically by name (case-insensitive)
+    dispatcher_options.sort(key=lambda x: x.lower())
+
+    # Create a mapping from display text back to ID
+    display_to_id = {
+        f"{dispatcher_mapping.get(did, 'Unknown')} ({did})": did
+        for did in unique_dispatchers
+    }
+
+    # Selectbox with formatted options
+    selected_display = st.selectbox(
+        "Select Dispatcher",
+        options=dispatcher_options,
+        help="Choose a dispatcher to view their payout details"
+    )
+
+    # Extract the actual dispatcher ID from selection
+    selected_dispatcher = display_to_id[selected_display]
 
     filtered = df[df["Dispatcher ID"].astype(str) == str(selected_dispatcher)].copy()
 
