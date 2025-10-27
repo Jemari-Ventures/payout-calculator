@@ -10,5 +10,18 @@
       {"Tier": "Tier 3", "Min Parcels": 0, "Max Parcels": 60, "Rate (RM)": 0.95},
       {"Tier": "Tier 2", "Min Parcels": 61, "Max Parcels": 120, "Rate (RM)": 1.00},
       {"Tier": "Tier 1", "Min Parcels": 121, "Max Parcels": null, "Rate (RM)": 1.10}
+    ],
+    "kpi_incentives": [
+      {"parcels": 3000, "bonus": 100.00, "description": "3000 Parcel/month"},
+      {"parcels": 4000, "bonus": 150.00, "description": "4000 Parcel/month"}
+    ],
+      "special_rates": [
+        {
+          "start_date": "2025-10-10",
+          "end_date": "2025-10-15",
+          "rate": 1.15,
+          "description": "October Sale Week",
+          "min_parcels": 160
+        }
     ]
-  }
+}

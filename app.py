@@ -61,6 +61,19 @@ class Config:
             {"Tier": "Tier 2", "Min Parcels": 61, "Max Parcels": 120, "Rate (RM)": 1.00},
             {"Tier": "Tier 1", "Min Parcels": 121, "Max Parcels": None, "Rate (RM)": 1.10},
         ],
+        "kpi_incentives": [
+            {"parcels": 3000, "bonus": 100.00, "description": "3000 Parcel/month"},
+            {"parcels": 4000, "bonus": 150.00, "description": "4000 Parcel/month"}
+        ],
+        "special_rates": [
+            {
+                "start_date": "2025-01-01",
+                "end_date": "2025-01-01",
+                "rate": 1.50,
+                "description": "New Year Special",
+                "min_parcels": 160
+            }
+        ],
         "currency_symbol": "RM"
     }
 
@@ -70,7 +83,13 @@ class Config:
         if os.path.exists(cls.CONFIG_FILE):
             try:
                 with open(cls.CONFIG_FILE, 'r') as f:
-                    return json.load(f)
+                    config = json.load(f)
+                    # Ensure new fields exist
+                    if "kpi_incentives" not in config:
+                        config["kpi_incentives"] = cls.DEFAULT_CONFIG["kpi_incentives"]
+                    if "special_rates" not in config:
+                        config["special_rates"] = cls.DEFAULT_CONFIG["special_rates"]
+                    return config
             except Exception as e:
                 st.error(f"Error loading config: {e}")
                 return cls.DEFAULT_CONFIG
@@ -173,8 +192,63 @@ class PayoutCalculator:
     """Handle payout calculations."""
 
     @staticmethod
-    def calculate_tiered_daily(filtered_df: pd.DataFrame, tiers_config: List, currency_symbol: str) -> Tuple[pd.DataFrame, float, pd.DataFrame]:
-        """Calculate payout for tiered daily mode."""
+    def calculate_kpi_bonus(total_parcels: int, kpi_config: List) -> Tuple[float, str]:
+        """Calculate KPI bonus based on total monthly parcels."""
+        if not kpi_config:
+            return 0.0, "No KPI achieved"
+
+        # Sort KPI tiers by parcel count descending to get highest applicable tier
+        sorted_kpis = sorted(kpi_config, key=lambda x: x.get("parcels", 0), reverse=True)
+
+        for kpi in sorted_kpis:
+            required_parcels = kpi.get("parcels", 0)
+            bonus = kpi.get("bonus", 0.0)
+            description = kpi.get("description", f"{required_parcels} parcels")
+
+            if total_parcels >= required_parcels:
+                return float(bonus), description
+
+        return 0.0, "No KPI achieved"
+
+    @staticmethod
+    def get_special_rate(date, daily_parcels: int, special_rates_config: List) -> Tuple[Optional[float], str]:
+        """Get special rate for a specific date if configured and parcel count meets minimum requirement."""
+        if not special_rates_config:
+            return None, ""
+
+        date_obj = pd.to_datetime(date).date()
+
+        for special in special_rates_config:
+            # Get minimum parcels requirement (default to 160 if not specified)
+            min_parcels = special.get("min_parcels", 160)
+
+            # Check if daily parcels meets minimum requirement
+            if daily_parcels <= min_parcels:
+                continue
+
+            # Check if date falls within the special rate period
+            # Support both single date and date range formats
+            if "date" in special:
+                # Single date format (backward compatibility)
+                special_date = pd.to_datetime(special["date"]).date()
+                if date_obj == special_date:
+                    return float(special.get("rate", 0)), special.get("description", "Special Rate")
+
+            elif "start_date" in special and "end_date" in special:
+                # Date range format
+                start_date = pd.to_datetime(special["start_date"]).date()
+                end_date = pd.to_datetime(special["end_date"]).date()
+
+                if start_date <= date_obj <= end_date:
+                    return float(special.get("rate", 0)), special.get("description", "Special Rate")
+
+        return None, ""
+
+    @staticmethod
+    def calculate_tiered_daily(filtered_df: pd.DataFrame, tiers_config: List,
+                              kpi_config: List, special_rates_config: List,
+                              currency_symbol: str) -> Tuple[pd.DataFrame, float, float, str, pd.DataFrame]:
+        """Calculate payout for tiered daily mode with KPI bonus and special rates."""
         # Prepare tiers
         tiers = []
         for tier in tiers_config:
@@ -195,7 +269,7 @@ class PayoutCalculator:
                     return str(tname), float(trate)
             return "Unmatched", 0.0
 
-        # Process data - use fixed column names
+        # Process data
         work = filtered_df.copy()
         work["__date"] = pd.to_datetime(work["Delivery Signature"], errors="coerce").dt.date
         work["__waybill"] = work["Waybill Number"].astype(str).str.strip()
@@ -207,14 +281,46 @@ class PayoutCalculator:
             .rename(columns={"__waybill": "daily_parcels"})
         )
 
-        per_day[["tier", "rate_per_parcel"]] = per_day["daily_parcels"].apply(
+        # Apply tier rates or special rates
+        per_day[["tier", "base_rate"]] = per_day["daily_parcels"].apply(
             lambda x: pd.Series(map_rate(float(x)))
         )
-        per_day["payout_per_day"] = per_day["daily_parcels"] * per_day["rate_per_parcel"]
-        total_payout = float(per_day["payout_per_day"].sum())
 
-        # Create display dataframe
-        display_df = per_day.rename(columns={
+        # Check for special rates and apply them (only if daily parcels > 160)
+        per_day["special_rate"] = per_day.apply(
+            lambda row: PayoutCalculator.get_special_rate(row["__date"], int(row["daily_parcels"]), special_rates_config)[0],
+            axis=1
+        )
+        per_day["special_desc"] = per_day.apply(
+            lambda row: PayoutCalculator.get_special_rate(row["__date"], int(row["daily_parcels"]), special_rates_config)[1],
+            axis=1
+        )
+
+        # Use special rate if available, otherwise use base rate
+        per_day["rate_per_parcel"] = per_day.apply(
+            lambda row: row["special_rate"] if pd.notna(row["special_rate"]) else row["base_rate"],
+            axis=1
+        )
+
+        # Update tier description for special rate days
+        per_day["tier"] = per_day.apply(
+            lambda row: row["special_desc"] if pd.notna(row["special_rate"]) else row["tier"],
+            axis=1
+        )
+
+        per_day["payout_per_day"] = per_day["daily_parcels"] * per_day["rate_per_parcel"]
+        base_payout = float(per_day["payout_per_day"].sum())
+
+        # Calculate KPI bonus
+        total_parcels = int(per_day["daily_parcels"].sum())
+        kpi_bonus, kpi_description = PayoutCalculator.calculate_kpi_bonus(total_parcels, kpi_config)
+
+        # Total payout includes base + KPI bonus
+        total_payout = base_payout + kpi_bonus
+
+        # Create display dataframe - only include relevant columns
+        display_df = per_day[["__date", "daily_parcels", "tier", "rate_per_parcel", "payout_per_day"]].copy()
+        display_df = display_df.rename(columns={
             "__date": "Date",
             "daily_parcels": "Total Parcel",
             "tier": "Tier",
@@ -226,7 +332,7 @@ class PayoutCalculator:
         display_df["Payout Rate"] = display_df["Payout Rate"].apply(lambda x: f"{currency_symbol}{x:.2f}")
         display_df["Payout"] = display_df["Payout"].apply(lambda x: f"{currency_symbol}{x:.2f}")
 
-        return display_df, total_payout, per_day
+        return display_df, total_payout, kpi_bonus, kpi_description, per_day
 
 
 # =============================================================================
@@ -342,9 +448,10 @@ class InvoiceGenerator:
     """Generate professional invoices."""
 
     @staticmethod
-    def build_invoice_html(df_disp: pd.DataFrame, total: float, name: str, dpid: str,
+    def build_invoice_html(df_disp: pd.DataFrame, base_payout: float, kpi_bonus: float,
+                          total_payout: float, kpi_description: str, name: str, dpid: str,
                           currency_symbol: str) -> str:
-        """Build a modern, professional invoice HTML with consistent color scheme."""
+        """Build a modern, professional invoice HTML with KPI bonus."""
 
         # Calculate metrics for tiered daily mode
         total_parcels = df_disp['Total Parcel'].sum() if 'Total Parcel' in df_disp.columns else 0
@@ -399,6 +506,17 @@ class InvoiceGenerator:
             }}
             .chip .label {{ color: var(--text-secondary); font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600; }}
             .chip .value {{ font-size: 18px; font-weight: 700; margin-top: 6px; color: var(--primary); }}
+            .kpi-bonus {{
+              margin-top: 24px;
+              padding: 16px;
+              background: linear-gradient(135deg, var(--success) 0%, #059669 100%);
+              border-radius: 12px;
+              color: white;
+              box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+            }}
+            .kpi-bonus .title {{ font-size: 14px; opacity: 0.9; margin-bottom: 8px; }}
+            .kpi-bonus .amount {{ font-size: 28px; font-weight: 800; }}
+            .kpi-bonus .description {{ font-size: 12px; opacity: 0.9; margin-top: 4px; }}
             table {{
               border-collapse: collapse; width: 100%; margin-top: 24px;
               box-shadow: 0 1px 3px rgba(0,0,0,0.1);
@@ -416,14 +534,26 @@ class InvoiceGenerator:
             }}
             tbody tr:nth-child(even) {{ background: var(--background); }}
             tbody tr:hover {{ background: rgba(79, 70, 229, 0.05); }}
-            .footer {{
+            .payout-summary {{
               margin-top: 24px;
-              text-align: right;
-              font-weight: 700;
+              padding: 20px;
+              background: var(--surface);
+              border: 2px solid var(--border);
+              border-radius: 12px;
+            }}
+            .payout-row {{
+              display: flex;
+              justify-content: space-between;
+              padding: 8px 0;
+              font-size: 16px;
+            }}
+            .payout-row.total {{
+              border-top: 2px solid var(--border);
+              margin-top: 12px;
+              padding-top: 12px;
+              font-weight: 800;
               font-size: 20px;
               color: var(--primary);
-              padding: 16px;
-              border-top: 2px solid var(--border);
             }}
             .note {{
               margin-top: 8px;
@@ -459,12 +589,12 @@ class InvoiceGenerator:
             <div class="container">
                 <div class="header">
                     <div>
-                        <div class="brand">🚚 Invoice</div>
-                        <div class="idline">From: Jemari Ventures &nbsp;&nbsp;|&nbsp;&nbsp; To: {cleaned_name}</div>
+                        <div class="brand">Invoice</div>
+                        <div class="idline">From: JEMARI VENTURES &nbsp;&nbsp;|&nbsp;&nbsp; To: {cleaned_name}</div>
                     </div>
                     <div class="total-badge">
                         <div class="label">Total Payout</div>
-                        <div class="value">{currency_symbol} {total:,.2f}</div>
+                        <div class="value">{currency_symbol} {total_payout:,.2f}</div>
                     </div>
                 </div>
 
@@ -488,6 +618,16 @@ class InvoiceGenerator:
                 </div>
         """
 
+        # Add KPI Bonus section if applicable
+        if kpi_bonus > 0:
+            html_content += f"""
+                <div class="kpi-bonus">
+                    <div class="title">🎯 KPI Incentive Achieved!</div>
+                    <div class="amount">+ {currency_symbol} {kpi_bonus:,.2f}</div>
+                    <div class="description">{kpi_description}</div>
+                </div>
+            """
+
         # Add the table
         if len(df_disp) > 0:
             html_content += "<table>"
@@ -503,6 +643,24 @@ class InvoiceGenerator:
                     html_content += f"<td>{row[col]}</td>"
                 html_content += "</tr>"
             html_content += "</tbody></table>"
+
+        # Add payout summary
+        html_content += f"""
+            <div class="payout-summary">
+                <div class="payout-row">
+                    <span>Base Payout (Daily Rates):</span>
+                    <span>{currency_symbol} {base_payout:,.2f}</span>
+                </div>
+                <div class="payout-row">
+                    <span>KPI Incentive Bonus:</span>
+                    <span>{currency_symbol} {kpi_bonus:,.2f}</span>
+                </div>
+                <div class="payout-row total">
+                    <span>Total Payout:</span>
+                    <span>{currency_symbol} {total_payout:,.2f}</span>
+                </div>
+            </div>
+        """
 
         # Footer
         html_content += f"""
@@ -703,7 +861,7 @@ def main():
     # Apply custom styles
     apply_custom_styles()
 
-    # Custom header with consistent branding - FIXED VERSION
+    # Custom header with consistent branding
     st.markdown(f"""
     <div style="background: linear-gradient(135deg, {ColorScheme.PRIMARY} 0%, {ColorScheme.PRIMARY_LIGHT} 100%);
                 padding: 2rem;
@@ -727,12 +885,12 @@ def main():
     if df is None:
         st.error("❌ Failed to load data from Google Sheets.")
         st.info("Please check the configuration file or ensure the Google Sheet is accessible.")
-        add_footer()  # Add footer even if there's an error
+        add_footer()
         return
 
     if df.empty:
         st.warning("No data found in the Google Sheet.")
-        add_footer()  # Add footer even if there's no data
+        add_footer()
         return
 
     # Normalize column names
@@ -745,19 +903,62 @@ def main():
     if missing_columns:
         st.error(f"Missing required columns: {', '.join(missing_columns)}")
         st.info(f"Available columns: {', '.join(df.columns.tolist())}")
-        add_footer()  # Add footer even if there are missing columns
+        add_footer()
         return
 
     # Step 1: Dispatcher selection
     st.subheader("👤 Dispatcher Selection")
 
+    # Create a mapping of dispatcher IDs to names
+    dispatcher_mapping = {}
+    for candidate_col in ["Dispatcher Name", "Name", "Rider Name"]:
+        if candidate_col in df.columns:
+            # Create ID -> Name mapping
+            temp_mapping = df[["Dispatcher ID", candidate_col]].dropna()
+            temp_mapping["Dispatcher ID"] = temp_mapping["Dispatcher ID"].astype(str)
+            temp_mapping[candidate_col] = temp_mapping[candidate_col].astype(str)
+
+            for _, row in temp_mapping.iterrows():
+                dispatcher_id = row["Dispatcher ID"]
+                dispatcher_name = clean_dispatcher_name(row[candidate_col])
+                if dispatcher_id not in dispatcher_mapping:
+                    dispatcher_mapping[dispatcher_id] = dispatcher_name
+
+            if dispatcher_mapping:
+                break
+
+    # Get unique dispatchers
     unique_dispatchers = sorted(df["Dispatcher ID"].dropna().astype(str).unique().tolist())
     if not unique_dispatchers:
         st.error("No dispatcher IDs found in the data.")
-        add_footer()  # Add footer even if no dispatchers found
+        add_footer()
         return
 
-    selected_dispatcher = st.selectbox("Select Dispatcher", options=unique_dispatchers)
+    # Create display options with both name and ID
+    dispatcher_options = []
+    for dispatcher_id in unique_dispatchers:
+        dispatcher_name = dispatcher_mapping.get(dispatcher_id, "Unknown")
+        display_text = f"{dispatcher_name} ({dispatcher_id})"
+        dispatcher_options.append(display_text)
+
+    # Sort alphabetically by name (case-insensitive)
+    dispatcher_options.sort(key=lambda x: x.lower())
+
+    # Create a mapping from display text back to ID
+    display_to_id = {
+        f"{dispatcher_mapping.get(did, 'Unknown')} ({did})": did
+        for did in unique_dispatchers
+    }
+
+    # Selectbox with formatted options
+    selected_display = st.selectbox(
+        "Select Dispatcher",
+        options=dispatcher_options,
+        help="Choose a dispatcher to view their payout details"
+    )
+
+    # Extract the actual dispatcher ID from selection
+    selected_dispatcher = display_to_id[selected_display]
 
     filtered = df[df["Dispatcher ID"].astype(str) == str(selected_dispatcher)].copy()
 
@@ -778,27 +979,46 @@ def main():
 
     currency_symbol = config["currency_symbol"]
 
-    # Calculate payout using tiered daily mode
-    display_df, total_payout, per_day = PayoutCalculator.calculate_tiered_daily(
-        filtered, config["tiers"], currency_symbol
+    # Calculate payout with KPI bonus and special rates
+    display_df, total_payout, kpi_bonus, kpi_description, per_day = PayoutCalculator.calculate_tiered_daily(
+        filtered, config["tiers"], config.get("kpi_incentives", []),
+        config.get("special_rates", []), currency_symbol
     )
 
-    # Display summary metrics in a single line
-    col1, col2, col3 = st.columns(3)
+    base_payout = total_payout - kpi_bonus
+
+    # Display summary metrics
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.metric(label="Dispatcher", value=dispatcher_name)
     with col2:
         total_parcels = per_day["daily_parcels"].sum()
         st.metric(label="Total Parcels", value=f"{total_parcels:,}")
     with col3:
+        st.metric(label="Base Payout", value=f"{currency_symbol}{base_payout:,.2f}")
+    with col4:
         st.metric(label="Total Payout", value=f"{currency_symbol}{total_payout:,.2f}")
 
+    # Show KPI bonus if achieved
+    if kpi_bonus > 0:
+        st.success(f"🎯 **KPI Incentive Achieved!** +{currency_symbol}{kpi_bonus:,.2f} ({kpi_description})")
+
     st.dataframe(display_df, use_container_width=True)
+
+    # Breakdown section
+    with st.expander("📊 Payout Breakdown", expanded=False):
+        breakdown_col1, breakdown_col2, breakdown_col3 = st.columns(3)
+        with breakdown_col1:
+            st.metric("Base Payout", f"{currency_symbol}{base_payout:,.2f}", help="Daily rate payouts")
+        with breakdown_col2:
+            st.metric("KPI Bonus", f"{currency_symbol}{kpi_bonus:,.2f}", help=kpi_description)
+        with breakdown_col3:
+            st.metric("Total", f"{currency_symbol}{total_payout:,.2f}", help="Base + KPI Bonus")
 
     # Step 3: Performance Visualization
     st.subheader("📊 Performance Visualization")
 
-    # Create and display charts for tiered daily mode
+    # Create and display charts
     charts = DataVisualizer.create_performance_charts(per_day, currency_symbol)
 
     if charts:
@@ -867,7 +1087,8 @@ def main():
 
     # Generate and download invoice
     invoice_html = InvoiceGenerator.build_invoice_html(
-        display_df, total_payout, inv_name, inv_id, currency_symbol
+        display_df, base_payout, kpi_bonus, total_payout, kpi_description,
+        inv_name, inv_id, currency_symbol
     )
 
     st.download_button(
