@@ -10,7 +10,8 @@ from urllib.parse import urlparse, parse_qs
 import json
 import os
 from datetime import datetime
-
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import SQLAlchemyError
 import pandas as pd
 import streamlit as st
 import altair as alt
@@ -56,6 +57,9 @@ class Config:
             "gsheet_url": "https://docs.google.com/spreadsheets/d/1_PFvSf1v8g9p_8BdouTFk4lPFI2xOQC_iModlziUmMU/edit?usp=sharing",
             "sheet_name": None
         },
+        "database": {
+            "table_name": "dispatcher_raw_data"
+        },
         "tiers": [
             {"Tier": "Tier 3", "Min Parcels": 0, "Max Parcels": 60, "Rate (RM)": 0.95},
             {"Tier": "Tier 2", "Min Parcels": 61, "Max Parcels": 120, "Rate (RM)": 1.00},
@@ -94,76 +98,30 @@ class Config:
 # DATA SOURCE MANAGEMENT
 # =============================================================================
 
+@st.cache_resource
+def get_database_engine(db_url: str):
+    """Cached database engine - reused across reruns."""
+    return create_engine(db_url, pool_pre_ping=True)
+
+
 class DataSource:
-    """Handle data loading from Google Sheets."""
+    def __init__(self, db_url: str):
+        """
+        Initialize DataSource with a PostgreSQL connection string.
+        Example: postgresql://user:password@host:port/dbname
+        """
+        self.db_url = db_url
+        self.engine = get_database_engine(db_url)
 
-    @staticmethod
-    def _extract_gsheet_id_and_gid(url_or_id: str) -> Tuple[Optional[str], Optional[str]]:
-        """Extract spreadsheet ID and GID from Google Sheets URL or ID."""
-        if not url_or_id:
-            return None, None
-
-        if re.fullmatch(r"[A-Za-z0-9_-]{20,}", url_or_id):
-            return url_or_id, None
-
+    @st.cache_data(ttl=300)
+    def fetch_data(_self, query: str = "SELECT * FROM dispatcher_raw_data;") -> pd.DataFrame:
         try:
-            parsed = urlparse(url_or_id)
-            path_parts = [p for p in parsed.path.split('/') if p]
-            spreadsheet_id = None
-            if 'spreadsheets' in path_parts and 'd' in path_parts:
-                try:
-                    idx = path_parts.index('d')
-                    spreadsheet_id = path_parts[idx + 1]
-                except Exception:
-                    spreadsheet_id = None
-
-            query_gid = parse_qs(parsed.query).get('gid', [None])[0]
-            frag_gid_match = re.search(r"gid=(\d+)", parsed.fragment or "")
-            frag_gid = frag_gid_match.group(1) if frag_gid_match else None
-            gid = query_gid or frag_gid
-            return spreadsheet_id, gid
-        except Exception:
-            return None, None
-
-    @staticmethod
-    def _build_gsheet_csv_url(spreadsheet_id: str, sheet_name: Optional[str], gid: Optional[str]) -> str:
-        """Construct CSV export URL for Google Sheets."""
-        base = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}"
-        if sheet_name:
-            return f"{base}/gviz/tq?tqx=out:csv&sheet={sheet_name}"
-        if gid:
-            return f"{base}/export?format=csv&gid={gid}"
-        return f"{base}/export?format=csv"
-
-    @staticmethod
-    @st.cache_data(ttl=300)  # Cache for 5 minutes
-    def read_google_sheet(url_or_id: str, sheet_name: Optional[str] = None) -> pd.DataFrame:
-        """Fetch a Google Sheet as CSV and return a DataFrame."""
-        spreadsheet_id, gid = DataSource._extract_gsheet_id_and_gid(url_or_id)
-        if not spreadsheet_id:
-            raise ValueError("Invalid Google Sheet URL or ID.")
-        csv_url = DataSource._build_gsheet_csv_url(spreadsheet_id, sheet_name, gid)
-        try:
-            resp = requests.get(csv_url, timeout=30)
-            resp.raise_for_status()
-            return pd.read_csv(io.BytesIO(resp.content))
-        except Exception as exc:
-            st.error(f"Failed to fetch Google Sheet: {exc}")
-            raise
-
-    @staticmethod
-    def load_data(config: dict) -> Optional[pd.DataFrame]:
-        """Load data based on configuration."""
-        data_source = config["data_source"]
-
-        if data_source["type"] == "gsheet" and data_source["gsheet_url"]:
-            try:
-                return DataSource.read_google_sheet(data_source["gsheet_url"], data_source["sheet_name"])
-            except Exception as exc:
-                st.error(f"Error reading Google Sheet: {exc}")
-                return None
-        return None
-
+            with _self.engine.connect() as conn:
+                df = pd.read_sql(text(query), conn)
+            return df
+        except SQLAlchemyError as e:
+            st.error(f"Database error: {str(e)}")
+            return pd.DataFrame()
 
 # =============================================================================
 # NAME CLEANING
@@ -192,9 +150,24 @@ def clean_dispatcher_name(name: str) -> str:
 
 class PayoutCalculator:
     """Handle payout calculations for management view."""
+    @staticmethod
+    def validate_data(df: pd.DataFrame) -> Tuple[bool, str]:
+        """Validate data before processing."""
+        if df.empty:
+            return False, "DataFrame is empty"
+
+        if 'waybill' not in df.columns:
+            return False, "Missing 'waybill' column"
+
+        # Check for duplicate waybills
+        duplicates = df['waybill'].duplicated().sum()
+        if duplicates > 0:
+            return False, f"Found {duplicates} duplicate waybills"
+
+        return True, "Data validation passed"
 
     @staticmethod
-    def calculate_flat_rate(df: pd.DataFrame, payout_rate: float, currency_symbol: str) -> Tuple[pd.DataFrame, pd.DataFrame, float]:
+    def calculate_payout_rate(df: pd.DataFrame, payout_rate: float, currency_symbol: str) -> Tuple[pd.DataFrame, pd.DataFrame, float]:
         """Calculate payout using flat rate for management view."""
         # Standardize column names
         df_clean = df.copy()
@@ -228,6 +201,9 @@ class PayoutCalculator:
             .agg(parcel_count=("waybill", "nunique"))
             .reset_index()
         )
+
+        if grouped.empty:
+            return pd.DataFrame(), pd.DataFrame(), 0.0
         grouped["payout_rate"] = payout_rate
         grouped["total_payout"] = grouped["parcel_count"] * payout_rate
 
@@ -243,6 +219,7 @@ class PayoutCalculator:
         display_df = numeric_df.copy()
         display_df["Rate per Parcel"] = display_df["Rate per Parcel"].apply(lambda x: f"{currency_symbol}{x:.2f}")
         display_df["Total Payout"] = display_df["Total Payout"].apply(lambda x: f"{currency_symbol}{x:,.2f}")
+
 
         total_payout = grouped["total_payout"].sum()
 
@@ -313,10 +290,11 @@ class DataVisualizer:
                 y=alt.Y('Dispatcher Name:N', title='Dispatcher', sort='-x'),
                 x=alt.X('Parcels Delivered:Q', title='Parcels Delivered'),
                 color=alt.Color('Parcels Delivered:Q', scale=alt.Scale(scheme='blues'), legend=None),
-                tooltip=['Dispatcher Name:N', 'Parcels Delivered:Q', 'Total Payout:Q']
-            ).properties(
-                title='Top 10 Performers (Parcels)',
-                height=400
+                tooltip=[
+                    'Dispatcher Name:N',
+                    'Parcels Delivered:Q',
+                    alt.Tooltip('Total Payout:Q', format=',.2f', title='Payout (RM)')  # Add formatting
+                ]
             )
             charts['performers'] = performers_chart
 
@@ -326,6 +304,7 @@ class DataVisualizer:
                 color=alt.Color(field="Dispatcher Name", type="nominal",
                               scale=alt.Scale(range=ColorScheme.CHART_COLORS),
                               legend=alt.Legend(title="Dispatchers", orient="right")),
+                order=alt.Order(field="Total Payout", sort="descending"),
                 tooltip=['Dispatcher Name:N', 'Total Payout:Q']
             ).properties(
                 title='Payout Distribution',
@@ -335,10 +314,6 @@ class DataVisualizer:
             charts['payout_dist'] = payout_chart
 
         return charts
-
-# =============================================================================
-# INVOICE GENERATION
-# =============================================================================
 
 # =============================================================================
 # INVOICE GENERATION
@@ -773,12 +748,24 @@ def main():
         add_footer()
         return
 
-    # Load data from Google Sheets
-    with st.spinner("🔄 Loading data from Google Sheets..."):
-        df = DataSource.load_data(config)
+    # # Load data from Google Sheets
+    # with st.spinner("🔄 Loading data from Google Sheets..."):
+    #     df = DataSource.load_data(config)
+    # Load data from PostgreSQL
+    with st.spinner("🔄 Loading data from PostgreSQL database..."):
+        db_url = st.secrets.get("db_url") or os.getenv("DATABASE_URL")
+
+        if not db_url:
+            st.error("❌ Database URL not found. Please set it in .streamlit/secrets.toml or environment variables.")
+            add_footer()
+            return
+
+        data_source = DataSource(db_url)
+        df = data_source.fetch_data("SELECT * FROM dispatcher_raw_data;")
 
     if df is None or df.empty:
         st.error("❌ No data loaded. Please check your Google Sheets configuration.")
+        st.info("💡 Tip: Check if data exists in the 'dispatcher_raw_data' table")
         add_footer()
         return
 
@@ -798,7 +785,8 @@ def main():
 
     # Try to find date column for filtering
     date_column = None
-    for col in ["Delivery Signature", "Delivery Date", "Date"]:
+
+    for col in ["Delivery Signature", "Delivery Date", "signature_date"]:
         if col in df.columns:
             date_column = col
             break
@@ -817,9 +805,13 @@ def main():
 
         if len(date_range) == 2:
             start_date, end_date = date_range
-            df = df[(df[date_column].dt.date >= start_date) &
-                    (df[date_column].dt.date <= end_date)]
-
+            df_filtered = df[(df[date_column].dt.date >= start_date) &
+                            (df[date_column].dt.date <= end_date)]
+            if len(df_filtered) == 0:
+                st.warning(f"⚠️ No data found between {start_date} and {end_date}")
+            df = df_filtered
+        elif len(date_range) == 1:
+            st.warning("Please select both start and end dates")
     # ==============================================================
     # 🧮 SUMMARY METRICS
     # ==============================================================
@@ -827,7 +819,7 @@ def main():
     st.subheader("📈 Performance Overview")
 
     currency_symbol = config.get("currency_symbol", "RM")
-    display_df, numeric_df, total_payout = PayoutCalculator.calculate_flat_rate(df, payout_rate, currency_symbol)
+    display_df, numeric_df, total_payout = PayoutCalculator.calculate_payout_rate(df, payout_rate, currency_symbol)
 
     if numeric_df.empty:
         st.warning("No data available after filtering.")
@@ -907,6 +899,146 @@ def main():
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
+
+        # ==============================================================
+        # 🔮 FORECAST & INSIGHTS (Including Total Payout)
+        # ==============================================================
+
+        st.markdown("---")
+        st.subheader("🔮 Forecast & Insights")
+
+        try:
+            from prophet import Prophet
+            import altair as alt
+
+            # --- CONFIG ---
+            # Example flat payout rate per parcel (you can replace this with your actual config)
+            #payout_rate = payout_rate  # RM5 per parcel, for example
+            #currency_symbol = "RM"
+
+
+            # --- Data Preparation ---
+            forecast_df = daily_df.rename(columns={"signature_date": "ds", "total_parcels": "y"})[["ds", "y"]]
+
+            # Ensure valid datetime
+            forecast_df["ds"] = pd.to_datetime(forecast_df["ds"], errors="coerce")
+            forecast_df = forecast_df.dropna(subset=["ds", "y"])
+
+            if len(forecast_df) < 5:
+                st.warning("📉 Not enough historical data for reliable forecasting. Please keep at least 14 days of data.")
+            else:
+                # --- Prophet Model ---
+                model = Prophet(
+                    yearly_seasonality=False,
+                    weekly_seasonality=True,
+                    daily_seasonality=False,
+                    interval_width=0.8
+                )
+                model.fit(forecast_df)
+
+                # Forecast next 14 days
+                future = model.make_future_dataframe(periods=14)
+                forecast = model.predict(future)
+
+                # Ensure datetime alignment
+                forecast["ds"] = pd.to_datetime(forecast["ds"])
+                forecast_df["ds"] = pd.to_datetime(forecast_df["ds"])
+
+                # Merge actual + forecast data
+                forecast_chart_data = forecast[["ds", "yhat", "yhat_lower", "yhat_upper"]].merge(
+                    forecast_df, on="ds", how="left"
+                )
+
+                # --- Compute Payout ---
+                forecast_chart_data["yhat_payout"] = forecast_chart_data["yhat"] * payout_rate
+                forecast_chart_data["y_payout"] = forecast_chart_data["y"] * payout_rate
+
+                # Split into historical and future predictions
+                historical = forecast_chart_data[forecast_chart_data["y"].notna()]
+                future = forecast_chart_data[forecast_chart_data["y"].isna()]
+
+                # --- Visualization: Parcel Forecast ---
+                st.markdown("### 📦 Parcel Volume Forecast")
+
+                actual_line = alt.Chart(historical).mark_line(color="#1f77b4").encode(
+                    x=alt.X("ds:T", title="Date"),
+                    y=alt.Y("y:Q", title="Parcels Delivered"),
+                    tooltip=["ds:T", "y"]
+                )
+
+                forecast_line = alt.Chart(future).mark_line(
+                    strokeDash=[4, 4], color="#ffa500"
+                ).encode(
+                    x="ds:T",
+                    y="yhat:Q",
+                    tooltip=["ds:T", "yhat"]
+                )
+
+                confidence_band = alt.Chart(forecast_chart_data).mark_area(
+                    opacity=0.2, color="#ffa500"
+                ).encode(
+                    x="ds:T",
+                    y="yhat_lower:Q",
+                    y2="yhat_upper:Q"
+                )
+
+                st.altair_chart(confidence_band + actual_line + forecast_line, use_container_width=True)
+
+                # --- Visualization: Payout Forecast ---
+                st.markdown(f"### 💸 Total Payout Forecast ({currency_symbol})")
+
+                payout_actual = alt.Chart(forecast_chart_data).mark_line(color="#2ca02c").encode(
+                    x=alt.X("ds:T", title="Date"),
+                    y=alt.Y("y_payout:Q", title=f"Total Payout ({currency_symbol})"),
+                    tooltip=["ds:T", "y_payout"]
+                )
+
+                payout_forecast = alt.Chart(forecast_chart_data).mark_line(
+                    strokeDash=[4, 4], color="#ff7f0e"
+                ).encode(
+                    x="ds:T",
+                    y="yhat_payout:Q",
+                    tooltip=["ds:T", "yhat_payout"]
+                )
+
+                st.altair_chart(payout_actual + payout_forecast, use_container_width=True)
+
+                # --- Forecast Metrics ---
+                latest_actual = forecast_df["y"].iloc[-1]
+                tomorrow_forecast = forecast.iloc[-1]["yhat"]
+                next_week_forecast = forecast.tail(7)["yhat"].sum()
+
+                tomorrow_payout = tomorrow_forecast * payout_rate
+                next_week_payout = next_week_forecast * payout_rate
+
+                avg_daily = forecast_df["y"].mean()
+                growth_rate = ((tomorrow_forecast - avg_daily) / avg_daily * 100) if avg_daily > 0 else 0
+
+                st.markdown("### 📅 Short-Term Outlook")
+                metric1, metric2, metric3 = st.columns(3)
+                with metric1:
+                    st.metric("Tomorrow’s Volume (Est.)", f"{tomorrow_forecast:.0f} parcels",
+                            f"{tomorrow_forecast - latest_actual:+.1f} vs last day")
+                with metric2:
+                    st.metric(f"Next 7 Days Payout (Est.)", f"{currency_symbol}{next_week_payout:,.0f}")
+                with metric3:
+                    st.metric("Expected Change", f"{growth_rate:+.1f}% vs Avg Daily")
+
+                # --- Auto Insights ---
+                st.markdown("### 🧠 Auto Insights")
+                if growth_rate > 5:
+                    st.success(f"📈 Volume expected to increase — projected payout for next 7 days: {currency_symbol}{next_week_payout:,.0f}. Consider adding dispatch capacity.")
+                elif growth_rate < -5:
+                    st.warning(f"📉 Lower forecast — estimated payout next 7 days: {currency_symbol}{next_week_payout:,.0f}. May indicate slow demand period.")
+                else:
+                    st.info(f"📊 Stable forecast — total payout expected around {currency_symbol}{next_week_payout:,.0f} next week.")
+
+        except ImportError:
+            st.warning("⚠️ Prophet is not installed. Run `pip install prophet` to enable forecasting.")
+        except Exception as e:
+            st.error(f"Forecasting failed: {e}")
+
+
         # ==============================================================
         # 📋 DISPATCHER DETAILS TABLE
         # ==============================================================
