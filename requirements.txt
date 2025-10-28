@@ -4,3 +4,4 @@ altair
 requests
 sqlalchemy
 prophet
+psycopg2-binary

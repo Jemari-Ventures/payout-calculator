@@ -130,7 +130,7 @@ class DataSource:
         Initialize DataSource with a PostgreSQL connection string.
         Example: postgresql://user:password@host:port/dbname
         """
-        self.db_url = db_url
+        self.db_url = get_database_url()
         self.engine = get_database_engine(db_url)
 
     @st.cache_data(ttl=300)
