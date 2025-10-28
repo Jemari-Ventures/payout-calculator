@@ -98,6 +98,26 @@ class Config:
 # DATA SOURCE MANAGEMENT
 # =============================================================================
 
+# =============================================================================
+# DATABASE CONNECTION (from Streamlit secrets)
+# =============================================================================
+
+def get_database_url():
+    """Build database URL from Streamlit secrets."""
+    try:
+        db_host = st.secrets["DB_HOST"]
+        db_port = st.secrets["DB_PORT"]
+        db_name = st.secrets["DB_NAME"]
+        db_user = st.secrets["DB_USER"]
+        db_password = st.secrets["DB_PASSWORD"]
+
+        db_url = f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
+        return db_url
+    except Exception as e:
+        st.error("❌ Database URL not found. Please set it in .streamlit/secrets.toml or environment variables.")
+        st.stop()
+
+
 @st.cache_resource
 def get_database_engine(db_url: str):
     """Cached database engine - reused across reruns."""
@@ -760,7 +780,9 @@ def main():
             add_footer()
             return
 
+        db_url = get_database_url()
         data_source = DataSource(db_url)
+
         df = data_source.fetch_data("SELECT * FROM dispatcher_raw_data;")
 
     if df is None or df.empty:
