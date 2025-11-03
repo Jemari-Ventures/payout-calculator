@@ -636,7 +636,7 @@ class InvoiceGenerator:
             if kpi_bonus > 0:
                 html_content += f"""
                     <div class="kpi-bonus">
-                        <div class="bonus-title">🎯 KPI Incentive Achieved!</div>
+                        <div class="bonus-title">KPI Incentive Achieved!</div>
                         <div class="bonus-amount">+ {currency_symbol} {kpi_bonus:,.2f}</div>
                         <div class="bonus-description">{kpi_description}</div>
                     </div>
@@ -644,7 +644,7 @@ class InvoiceGenerator:
             if attendance_bonus > 0:
                 html_content += f"""
                     <div class="attendance-bonus">
-                        <div class="bonus-title">📅 Attendance Incentive Achieved!</div>
+                        <div class="bonus-title">Attendance Incentive Achieved!</div>
                         <div class="bonus-amount">+ {currency_symbol} {attendance_bonus:,.2f}</div>
                         <div class="bonus-description">{attendance_description}</div>
                     </div>
