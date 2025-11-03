@@ -26,5 +26,17 @@
           "description": "October Sale Week",
           "min_parcels": 160
         }
-    ]
+      ],
+    "attendance_incentive": {
+        "enabled": true,
+        "required_days": 26,
+        "min_parcels_per_day": 30,
+        "bonus": 100.00,
+        "description": "26 Days Attendance Bonus"
+    },
+    "advance_deduction": {
+        "enabled": true,
+        "percentage": 40.0,
+        "description": "Advance Payment Deduction"
+    }
 }
