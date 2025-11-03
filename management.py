@@ -1,337 +1,427 @@
 import warnings
 import urllib3
-# Suppress the NotOpenSSLWarning
 warnings.filterwarnings('ignore', category=urllib3.exceptions.NotOpenSSLWarning)
 
 import io
-from typing import List, Optional, Tuple
 import re
-from urllib.parse import urlparse, parse_qs
 import json
 import os
+from typing import Optional, Tuple, Dict, List
 from datetime import datetime
-from sqlalchemy import create_engine, text
-from sqlalchemy.exc import SQLAlchemyError
+from urllib.parse import urlparse, parse_qs
+
 import pandas as pd
 import streamlit as st
 import altair as alt
 import requests
 
 # =============================================================================
-# COLOR SCHEME CONSTANTS
+# CONSTANTS
 # =============================================================================
 
 class ColorScheme:
     """Consistent color scheme for the entire application."""
-    PRIMARY = "#4f46e5"  # Indigo - main brand color
-    PRIMARY_LIGHT = "#818cf8"  # Lighter indigo
-    SECONDARY = "#10b981"  # Emerald green
-    ACCENT = "#f59e0b"  # Amber
-    BACKGROUND = "#f8fafc"  # Slate 50
-    SURFACE = "#ffffff"  # White
-    TEXT_PRIMARY = "#1e293b"  # Slate 800
-    TEXT_SECONDARY = "#64748b"  # Slate 500
-    BORDER = "#e2e8f0"  # Slate 200
-    SUCCESS = "#10b981"  # Green
-    WARNING = "#f59e0b"  # Amber
-    ERROR = "#ef4444"  # Red
-
-    # Chart colors
+    PRIMARY = "#4f46e5"
+    PRIMARY_LIGHT = "#818cf8"
+    SECONDARY = "#10b981"
+    ACCENT = "#f59e0b"
+    BACKGROUND = "#f8fafc"
+    SURFACE = "#ffffff"
+    TEXT_PRIMARY = "#1e293b"
+    TEXT_SECONDARY = "#64748b"
+    BORDER = "#e2e8f0"
+    SUCCESS = "#10b981"
+    WARNING = "#f59e0b"
+    ERROR = "#ef4444"
     CHART_COLORS = [
         "#4f46e5", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6",
         "#06b6d4", "#84cc16", "#f97316", "#ec4899", "#6366f1"
     ]
 
 
+# Centralized column mappings
+COLUMN_MAPPINGS = {
+    'waybill': ['Waybill Number', 'Waybill', 'waybill_number', 'waybill'],
+    'date': ['Delivery Signature', 'Delivery Date', 'Date', 'signature_date', 'delivery_date'],
+    'dispatcher_id': ['Dispatcher ID', 'Dispatcher Id', 'dispatcher_id'],
+    'dispatcher_name': ['Dispatcher Name', 'Dispatcher', 'dispatcher_name'],
+    'weight': ['Billing Weight', 'Weight', 'weight', 'billing_weight']
+}
+
+DISPATCHER_PREFIXES = ['JMR', 'ECP', 'AF', 'PEN', 'KUL', 'JHR']
+
 # =============================================================================
-# CONFIGURATION MANAGEMENT
+# CONFIGURATION
 # =============================================================================
 
 class Config:
-    """Configuration management from JSON file."""
+    """Configuration management with caching."""
 
     CONFIG_FILE = "config.json"
     DEFAULT_CONFIG = {
         "data_source": {
             "type": "gsheet",
-            "gsheet_url": "https://docs.google.com/spreadsheets/d/1_PFvSf1v8g9p_8BdouTFk4lPFI2xOQC_iModlziUmMU/edit?usp=sharing",
+            "gsheet_url": "https://docs.google.com/spreadsheets/d/1Ivm-ORxdAyG3g-z0ZJuea6eXu0Smvzcf/edit?gid=1939981789#gid=1939981789",
             "sheet_name": None
         },
-        "database": {
-            "table_name": "dispatcher_raw_data"
-        },
-        "tiers": [
-            {"Tier": "Tier 3", "Min Parcels": 0, "Max Parcels": 60, "Rate (RM)": 0.95},
-            {"Tier": "Tier 2", "Min Parcels": 61, "Max Parcels": 120, "Rate (RM)": 1.00},
-            {"Tier": "Tier 1", "Min Parcels": 121, "Max Parcels": None, "Rate (RM)": 1.10},
+        "database": {"table_name": "dispatcher_raw_data"},
+        "weight_tiers": [
+            {"min": 0, "max": 5, "rate": 1.50},
+            {"min": 5, "max": 10, "rate": 1.60},
+            {"min": 10, "max": 30, "rate": 2.70},
+            {"min": 30, "max": float('inf'), "rate": 4.00}
         ],
         "currency_symbol": "RM"
     }
 
+    _cache = None
+
     @classmethod
-    def load(cls):
-        """Load configuration from file or create default."""
+    def load(cls) -> dict:
+        """Load configuration with caching."""
+        if cls._cache is not None:
+            return cls._cache
+
         if os.path.exists(cls.CONFIG_FILE):
             try:
                 with open(cls.CONFIG_FILE, 'r') as f:
-                    return json.load(f)
+                    cls._cache = json.load(f)
+                    return cls._cache
             except Exception as e:
                 st.error(f"Error loading config: {e}")
-                return cls.DEFAULT_CONFIG
-        else:
-            cls.save(cls.DEFAULT_CONFIG)
-            return cls.DEFAULT_CONFIG
+
+        cls.save(cls.DEFAULT_CONFIG)
+        cls._cache = cls.DEFAULT_CONFIG
+        return cls._cache
 
     @classmethod
-    def save(cls, config):
-        """Save configuration to file."""
+    def save(cls, config: dict) -> bool:
+        """Save configuration."""
         try:
             with open(cls.CONFIG_FILE, 'w') as f:
                 json.dump(config, f, indent=2)
+            cls._cache = config
             return True
         except Exception as e:
             st.error(f"Error saving config: {e}")
             return False
 
-
 # =============================================================================
-# DATA SOURCE MANAGEMENT
-# =============================================================================
-
-# =============================================================================
-# DATABASE CONNECTION (from Streamlit secrets)
+# UTILITIES
 # =============================================================================
 
-def get_database_url():
-    """Build database URL from Streamlit secrets."""
-    try:
-        db_host = st.secrets["DB_HOST"]
-        db_port = st.secrets["DB_PORT"]
-        db_name = st.secrets["DB_NAME"]
-        db_user = st.secrets["DB_USER"]
-        db_password = st.secrets["DB_PASSWORD"]
+def find_column(df: pd.DataFrame, column_type: str) -> Optional[str]:
+    """Find first matching column name from mappings."""
+    for col in COLUMN_MAPPINGS.get(column_type, []):
+        if col in df.columns:
+            return col
+    return None
 
-        db_url = f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
-        return db_url
-    except Exception as e:
-        st.error("❌ Database URL not found. Please set it in .streamlit/secrets.toml or environment variables.")
-        st.stop()
-
-
-@st.cache_resource
-def get_database_engine(db_url: str):
-    """Cached database engine - reused across reruns."""
-    return create_engine(db_url, pool_pre_ping=True)
-
-
-class DataSource:
-    def __init__(self, db_url: str):
-        """
-        Initialize DataSource with a PostgreSQL connection string.
-        Example: postgresql://user:password@host:port/dbname
-        """
-        self.db_url = get_database_url()
-        self.engine = get_database_engine(db_url)
-
-    @st.cache_data(ttl=300)
-    def fetch_data(_self, query: str = "SELECT * FROM dispatcher_raw_data;") -> pd.DataFrame:
-        try:
-            with _self.engine.connect() as conn:
-                df = pd.read_sql(text(query), conn)
-            return df
-        except SQLAlchemyError as e:
-            st.error(f"Database error: {str(e)}")
-            return pd.DataFrame()
-
-# =============================================================================
-# NAME CLEANING
-# =============================================================================
 
 def clean_dispatcher_name(name: str) -> str:
-    """Remove prefixes like JMR, ECP, AF from dispatcher names."""
-    prefixes = ['JMR', 'ECP', 'AF', 'PEN', 'KUL', 'JHR']
+    """Remove prefixes from dispatcher names."""
+    cleaned = str(name).strip()
+    for prefix in DISPATCHER_PREFIXES:
+        if cleaned.startswith(prefix):
+            return cleaned[len(prefix):].lstrip(' -')
+    return cleaned
 
-    cleaned_name = str(name).strip()
 
-    # Remove common prefixes
-    for prefix in prefixes:
-        if cleaned_name.startswith(prefix):
-            cleaned_name = cleaned_name[len(prefix):].strip()
-            # Remove any remaining hyphens or spaces at start
-            cleaned_name = cleaned_name.lstrip(' -')
-            break
-
-    return cleaned_name
-
+def normalize_weight(series: pd.Series) -> pd.Series:
+    """Normalize weight column to numeric."""
+    return pd.to_numeric(
+        series.astype(str)
+        .str.replace(',', '.', regex=False)
+        .str.replace(r'[^0-9\.-]', '', regex=True),
+        errors='coerce'
+    )
 
 # =============================================================================
-# PAYOUT CALCULATIONS - MANAGEMENT VIEW
+# DATA SOURCE
+# =============================================================================
+
+class DataSource:
+    """Handle data loading from Google Sheets."""
+
+    @staticmethod
+    def _extract_gsheet_id_and_gid(url_or_id: str) -> Tuple[Optional[str], Optional[str]]:
+        """Extract spreadsheet ID and GID from Google Sheets URL."""
+        if not url_or_id:
+            return None, None
+
+        # Direct ID format
+        if re.fullmatch(r"[A-Za-z0-9_-]{20,}", url_or_id):
+            return url_or_id, None
+
+        try:
+            parsed = urlparse(url_or_id)
+            path_parts = [p for p in parsed.path.split('/') if p]
+
+            # Extract spreadsheet ID
+            spreadsheet_id = None
+            if 'spreadsheets' in path_parts and 'd' in path_parts:
+                idx = path_parts.index('d')
+                if idx + 1 < len(path_parts):
+                    spreadsheet_id = path_parts[idx + 1]
+
+            # Extract GID
+            query_gid = parse_qs(parsed.query).get('gid', [None])[0]
+            frag_gid_match = re.search(r"gid=(\d+)", parsed.fragment or "")
+            gid = query_gid or (frag_gid_match.group(1) if frag_gid_match else None)
+
+            return spreadsheet_id, gid
+        except Exception:
+            return None, None
+
+    @staticmethod
+    def _build_csv_url(spreadsheet_id: str, sheet_name: Optional[str], gid: Optional[str]) -> str:
+        """Construct CSV export URL."""
+        base = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}"
+        if sheet_name:
+            return f"{base}/gviz/tq?tqx=out:csv&sheet={sheet_name}"
+        if gid:
+            return f"{base}/export?format=csv&gid={gid}"
+        return f"{base}/export?format=csv"
+
+    @staticmethod
+    @st.cache_data(ttl=300)
+    def read_google_sheet(url_or_id: str, sheet_name: Optional[str] = None) -> pd.DataFrame:
+        """Fetch Google Sheet as DataFrame."""
+        spreadsheet_id, gid = DataSource._extract_gsheet_id_and_gid(url_or_id)
+        if not spreadsheet_id:
+            raise ValueError("Invalid Google Sheet URL or ID.")
+
+        csv_url = DataSource._build_csv_url(spreadsheet_id, sheet_name, gid)
+        try:
+            resp = requests.get(csv_url, timeout=30)
+            resp.raise_for_status()
+            return pd.read_csv(io.BytesIO(resp.content))
+        except Exception as exc:
+            st.error(f"Failed to fetch Google Sheet: {exc}")
+            raise
+
+    @staticmethod
+    def load_data(config: dict) -> Optional[pd.DataFrame]:
+        """Load data based on configuration."""
+        data_source = config["data_source"]
+        if data_source["type"] == "gsheet" and data_source["gsheet_url"]:
+            try:
+                return DataSource.read_google_sheet(
+                    data_source["gsheet_url"],
+                    data_source["sheet_name"]
+                )
+            except Exception as exc:
+                st.error(f"Error reading Google Sheet: {exc}")
+        return None
+
+# =============================================================================
+# DATA PROCESSING
+# =============================================================================
+
+class DataProcessor:
+    """Handle data cleaning and preparation."""
+
+    @staticmethod
+    def prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+        """Clean and standardize dataframe columns."""
+        df_clean = df.copy()
+
+        # Standardize column names
+        for standard_name, possible_names in COLUMN_MAPPINGS.items():
+            col = find_column(df_clean, standard_name)
+            if col and col != standard_name:
+                df_clean[standard_name] = df_clean[col]
+
+        # Clean dispatcher names
+        if 'dispatcher_name' in df_clean.columns:
+            df_clean['dispatcher_name'] = df_clean['dispatcher_name'].apply(clean_dispatcher_name)
+        else:
+            df_clean['dispatcher_name'] = 'Unknown'
+
+        # Ensure dispatcher_id exists
+        if 'dispatcher_id' not in df_clean.columns:
+            df_clean['dispatcher_id'] = 'Unknown'
+
+        # Normalize weight
+        if 'weight' in df_clean.columns:
+            df_clean['weight'] = normalize_weight(df_clean['weight'])
+
+        return df_clean
+
+    @staticmethod
+    def remove_duplicates(df: pd.DataFrame) -> pd.DataFrame:
+        """Remove duplicate waybills and log count."""
+        waybill_col = find_column(df, 'waybill')
+
+        if waybill_col:
+            initial_count = len(df)
+            df_dedup = df.drop_duplicates(subset=[waybill_col])
+            removed = initial_count - len(df_dedup)
+            if removed > 0:
+                st.info(f"✅ Removed {removed} duplicate waybills")
+            return df_dedup
+
+        st.warning("⚠️ No waybill column found; duplicates cannot be removed")
+        return df
+
+# =============================================================================
+# PAYOUT CALCULATIONS
 # =============================================================================
 
 class PayoutCalculator:
-    """Handle payout calculations for management view."""
-    @staticmethod
-    def validate_data(df: pd.DataFrame) -> Tuple[bool, str]:
-        """Validate data before processing."""
-        if df.empty:
-            return False, "DataFrame is empty"
-
-        if 'waybill' not in df.columns:
-            return False, "Missing 'waybill' column"
-
-        # Check for duplicate waybills
-        duplicates = df['waybill'].duplicated().sum()
-        if duplicates > 0:
-            return False, f"Found {duplicates} duplicate waybills"
-
-        return True, "Data validation passed"
+    """Handle payout calculations."""
 
     @staticmethod
-    def calculate_payout_rate(df: pd.DataFrame, payout_rate: float, currency_symbol: str) -> Tuple[pd.DataFrame, pd.DataFrame, float]:
-        """Calculate payout using flat rate for management view."""
-        # Standardize column names
-        df_clean = df.copy()
+    def get_rate_by_weight(weight: float, tiers: Optional[List[dict]] = None) -> float:
+        """Get per-parcel rate based on weight tiers."""
+        if tiers is None:
+            tiers = Config.load().get("weight_tiers", Config.DEFAULT_CONFIG["weight_tiers"])
 
-        # Only rename columns that exist
-        existing_columns = {}
-        for orig, new in {
-            "Waybill Number": "waybill",
-            "Delivery Signature": "signature_date",
-            "Dispatcher ID": "dispatcher_id",
-            "Dispatcher Name": "dispatcher_name",
-        }.items():
-            if orig in df_clean.columns:
-                existing_columns[orig] = new
+        w = 0.0 if pd.isna(weight) else float(weight)
 
-        df_clean = df_clean.rename(columns=existing_columns)
+        for tier in sorted(tiers, key=lambda t: t['min']):
+            tier_max = tier.get('max', float('inf'))
+            if tier['min'] <= w < tier_max:
+                return tier['rate']
 
-        # Clean dispatcher names if the column exists
-        if 'dispatcher_name' in df_clean.columns:
-            df_clean['dispatcher_name'] = df_clean['dispatcher_name'].apply(clean_dispatcher_name)
+        return tiers[-1]['rate']
 
-        # Ensure we have the required columns
-        if 'dispatcher_id' not in df_clean.columns:
-            df_clean['dispatcher_id'] = 'Unknown'
-        if 'dispatcher_name' not in df_clean.columns:
-            df_clean['dispatcher_name'] = 'Unknown'
+    @staticmethod
+    def calculate_payout(df: pd.DataFrame, currency_symbol: str) -> Tuple[pd.DataFrame, pd.DataFrame, float]:
+        """Calculate payout using tier-based weight calculation."""
+        # Prepare data
+        df_clean = DataProcessor.prepare_dataframe(df)
+        df_clean = DataProcessor.remove_duplicates(df_clean)
 
-        # Count unique waybills per dispatcher
-        grouped = (
-            df_clean.groupby(["dispatcher_id", "dispatcher_name"])
-            .agg(parcel_count=("waybill", "nunique"))
-            .reset_index()
-        )
-
-        if grouped.empty:
+        if 'weight' not in df_clean.columns:
+            st.error("❌ Missing weight column in data")
             return pd.DataFrame(), pd.DataFrame(), 0.0
-        grouped["payout_rate"] = payout_rate
-        grouped["total_payout"] = grouped["parcel_count"] * payout_rate
 
-        # Format for display
+        # Calculate payout per parcel
+        tiers = Config.load().get("weight_tiers")
+        df_clean['payout_rate'] = df_clean['weight'].apply(
+            lambda w: PayoutCalculator.get_rate_by_weight(w, tiers)
+        )
+        df_clean['payout'] = df_clean['payout_rate']
+
+        # Deduplicate by dispatcher & waybill
+        waybill_col = find_column(df_clean, 'waybill') or 'waybill'
+        df_unique = df_clean.drop_duplicates(subset=['dispatcher_id', waybill_col], keep='first')
+
+        # Diagnostics
+        raw_weight = df_clean['weight'].sum()
+        dedup_weight = df_unique['weight'].sum()
+        duplicates = len(df_clean) - len(df_unique)
+        st.info(f"Weight totals — Raw: {raw_weight:,.2f} kg | Deduplicated: {dedup_weight:,.2f} kg | Duplicate rows: {duplicates}")
+
+        # Group by dispatcher
+        grouped = df_unique.groupby('dispatcher_id').agg(
+            dispatcher_name=('dispatcher_name', 'first'),
+            parcel_count=(waybill_col, 'nunique'),
+            total_weight=('weight', 'sum'),
+            avg_weight=('weight', 'mean'),
+            total_payout=('payout', 'sum')
+        ).reset_index()
+
+        grouped['avg_rate'] = grouped['total_payout'] / grouped['parcel_count']
+
+        # Create display and numeric dataframes
         numeric_df = grouped.rename(columns={
             "dispatcher_id": "Dispatcher ID",
             "dispatcher_name": "Dispatcher Name",
             "parcel_count": "Parcels Delivered",
-            "payout_rate": "Rate per Parcel",
+            "total_weight": "Total Weight (kg)",
+            "avg_weight": "Avg Weight (kg)",
+            "avg_rate": "Avg Rate per Parcel",
             "total_payout": "Total Payout"
-        })
+        }).sort_values(by="Total Payout", ascending=False)
 
         display_df = numeric_df.copy()
-        display_df["Rate per Parcel"] = display_df["Rate per Parcel"].apply(lambda x: f"{currency_symbol}{x:.2f}")
+        display_df["Total Weight (kg)"] = display_df["Total Weight (kg)"].apply(lambda x: f"{x:.2f}")
+        display_df["Avg Weight (kg)"] = display_df["Avg Weight (kg)"].apply(lambda x: f"{x:.2f}")
+        display_df["Avg Rate per Parcel"] = display_df["Avg Rate per Parcel"].apply(lambda x: f"{currency_symbol}{x:.2f}")
         display_df["Total Payout"] = display_df["Total Payout"].apply(lambda x: f"{currency_symbol}{x:,.2f}")
 
+        total_payout = numeric_df["Total Payout"].sum()
 
-        total_payout = grouped["total_payout"].sum()
-
-        # Sort by Parcels Delivered in descending order (highest first)
-        numeric_df = numeric_df.sort_values(by="Parcels Delivered", ascending=False)
-        display_df = display_df.sort_values(by="Parcels Delivered", ascending=False)
+        st.success(f"✅ Processed {len(df_unique)} unique parcels from {len(grouped)} dispatchers")
+        st.info(f"💰 Total Payout: {currency_symbol} {total_payout:,.2f}")
 
         return display_df, numeric_df, total_payout
 
     @staticmethod
-    def get_daily_trend_data(df: pd.DataFrame) -> pd.DataFrame:
-        """Get daily parcel delivery trend data."""
-        df_clean = df.copy()
+    def get_daily_trend(df: pd.DataFrame) -> pd.DataFrame:
+        """Get daily parcel delivery trend."""
+        date_col = find_column(df, 'date')
 
-        # Try to find date column
-        date_column = None
-        for col in ["Delivery Signature", "Delivery Date", "Date", "signature_date"]:
-            if col in df_clean.columns:
-                date_column = col
-                break
-
-        if date_column:
-            df_clean[date_column] = pd.to_datetime(df_clean[date_column], errors="coerce")
-            daily_df = (
-                df_clean.groupby(df_clean[date_column].dt.date)
-                .size()
-                .reset_index(name='total_parcels')
-            )
-            daily_df = daily_df.rename(columns={date_column: 'signature_date'})
+        if date_col:
+            df_copy = df.copy()
+            df_copy[date_col] = pd.to_datetime(df_copy[date_col], errors="coerce")
+            daily_df = df_copy.groupby(df_copy[date_col].dt.date).size().reset_index(name='total_parcels')
+            daily_df = daily_df.rename(columns={date_col: 'signature_date'})
             return daily_df.sort_values('signature_date')
 
         return pd.DataFrame()
 
-
 # =============================================================================
-# DATA VISUALIZATION - MANAGEMENT VIEW
+# VISUALIZATION
 # =============================================================================
 
 class DataVisualizer:
-    """Create performance charts and graphs for management view."""
+    """Create charts and visualizations."""
 
     @staticmethod
-    def create_management_charts(daily_df: pd.DataFrame, numeric_df: pd.DataFrame, currency_symbol: str):
-        """Create charts for management dashboard using numeric data."""
+    def create_daily_trend_chart(daily_df: pd.DataFrame) -> alt.Chart:
+        """Create daily trend area chart."""
+        return alt.Chart(daily_df).mark_area(
+            line={'color': ColorScheme.PRIMARY, 'width': 2},
+            color=ColorScheme.PRIMARY_LIGHT,
+            opacity=0.6
+        ).encode(
+            x=alt.X('signature_date:T', title='Date', axis=alt.Axis(format='%b %d')),
+            y=alt.Y('total_parcels:Q', title='Parcels Delivered'),
+            tooltip=['signature_date:T', 'total_parcels:Q']
+        ).properties(title='Daily Parcel Delivery Trend', height=300)
+
+    @staticmethod
+    def create_performers_chart(numeric_df: pd.DataFrame) -> alt.Chart:
+        """Create top performers bar chart."""
+        top_10 = numeric_df.head(10)
+        return alt.Chart(top_10).mark_bar(color=ColorScheme.PRIMARY).encode(
+            y=alt.Y('Dispatcher Name:N', title='Dispatcher', sort='-x'),
+            x=alt.X('Parcels Delivered:Q', title='Parcels Delivered'),
+            color=alt.Color('Parcels Delivered:Q', scale=alt.Scale(scheme='blues'), legend=None),
+            tooltip=[
+                'Dispatcher Name:N',
+                'Parcels Delivered:Q',
+                alt.Tooltip('Total Weight (kg):Q', format=',.2f'),
+                alt.Tooltip('Total Payout:Q', format=',.2f')
+            ]
+        )
+
+    @staticmethod
+    def create_payout_distribution(numeric_df: pd.DataFrame) -> alt.Chart:
+        """Create payout distribution donut chart."""
+        return alt.Chart(numeric_df).mark_arc(innerRadius=50).encode(
+            theta=alt.Theta(field="Total Payout", type="quantitative"),
+            color=alt.Color(field="Dispatcher Name", type="nominal",
+                          scale=alt.Scale(range=ColorScheme.CHART_COLORS),
+                          legend=alt.Legend(title="Dispatchers", orient="right")),
+            order=alt.Order(field="Total Payout", sort="descending"),
+            tooltip=['Dispatcher Name:N', 'Total Payout:Q']
+        ).properties(title='Payout Distribution', height=300, width=400)
+
+    @staticmethod
+    def create_all_charts(daily_df: pd.DataFrame, numeric_df: pd.DataFrame) -> Dict[str, alt.Chart]:
+        """Create all charts for dashboard."""
         charts = {}
 
         if not daily_df.empty:
-            # Daily Trend Chart (unchanged)
-            daily_trend = alt.Chart(daily_df).mark_area(
-                line={'color': ColorScheme.PRIMARY, 'width': 2},
-                color=ColorScheme.PRIMARY_LIGHT,
-                opacity=0.6
-            ).encode(
-                x=alt.X('signature_date:T', title='Date', axis=alt.Axis(format='%b %d')),
-                y=alt.Y('total_parcels:Q', title='Parcels Delivered'),
-                tooltip=['signature_date:T', 'total_parcels:Q']
-            ).properties(
-                title='Daily Parcel Delivery Trend',
-                height=300
-            )
-            charts['daily_trend'] = daily_trend
+            charts['daily_trend'] = DataVisualizer.create_daily_trend_chart(daily_df)
 
         if not numeric_df.empty:
-            # Top Performers Bar Chart - Use numeric_df directly
-            top_10 = numeric_df.head(10)  # Already sorted by Parcels Delivered
-
-            performers_chart = alt.Chart(top_10).mark_bar(color=ColorScheme.PRIMARY).encode(
-                y=alt.Y('Dispatcher Name:N', title='Dispatcher', sort='-x'),
-                x=alt.X('Parcels Delivered:Q', title='Parcels Delivered'),
-                color=alt.Color('Parcels Delivered:Q', scale=alt.Scale(scheme='blues'), legend=None),
-                tooltip=[
-                    'Dispatcher Name:N',
-                    'Parcels Delivered:Q',
-                    alt.Tooltip('Total Payout:Q', format=',.2f', title='Payout (RM)')  # Add formatting
-                ]
-            )
-            charts['performers'] = performers_chart
-
-            # Payout Distribution - Use numeric_df directly
-            payout_chart = alt.Chart(numeric_df).mark_arc(innerRadius=50).encode(
-                theta=alt.Theta(field="Total Payout", type="quantitative", title="Payout Amount"),
-                color=alt.Color(field="Dispatcher Name", type="nominal",
-                              scale=alt.Scale(range=ColorScheme.CHART_COLORS),
-                              legend=alt.Legend(title="Dispatchers", orient="right")),
-                order=alt.Order(field="Total Payout", sort="descending"),
-                tooltip=['Dispatcher Name:N', 'Total Payout:Q']
-            ).properties(
-                title='Payout Distribution',
-                height=300,
-                width=400
-            )
-            charts['payout_dist'] = payout_chart
+            charts['performers'] = DataVisualizer.create_performers_chart(numeric_df)
+            charts['payout_dist'] = DataVisualizer.create_payout_distribution(numeric_df)
 
         return charts
 
@@ -340,24 +430,23 @@ class DataVisualizer:
 # =============================================================================
 
 class InvoiceGenerator:
-    """Generate professional invoices."""
+    """Generate invoices."""
 
     @staticmethod
-    def build_invoice_html(display_df: pd.DataFrame, total_payout: float, payout_rate: float, currency_symbol: str) -> str:
-        """Build a management summary invoice HTML for the entire company."""
-
+    def build_invoice_html(display_df: pd.DataFrame, numeric_df: pd.DataFrame,
+                          total_payout: float, currency_symbol: str) -> str:
+        """Build management summary invoice HTML with original layout."""
         try:
-            # Calculate metrics directly from the display_df (Parcels Delivered is still numeric)
-            total_parcels = display_df["Parcels Delivered"].sum()
-            total_dispatchers = len(display_df)
-            avg_parcels = display_df["Parcels Delivered"].mean()
-            avg_payout = total_payout / total_dispatchers if total_dispatchers > 0 else 0
+            total_parcels = int(numeric_df["Parcels Delivered"].sum())
+            total_dispatchers = len(numeric_df)
+            total_weight = numeric_df["Total Weight (kg)"].sum()
+            top_3 = display_df.head(3)
 
-            # For top performers, we need to extract numeric values from formatted Total Payout
-            # But we can use Parcels Delivered directly since it's not formatted
-            top_3 = display_df.head(3).copy()
+            table_columns = ["Dispatcher ID", "Dispatcher Name", "Parcels Delivered",
+                           "Total Payout", "Total Weight (kg)"]
 
-            html_content = f"""
+            # Build HTML with original styling
+            html = f"""
             <html>
             <head>
                 <style>
@@ -371,12 +460,10 @@ class InvoiceGenerator:
                   --text-primary: {ColorScheme.TEXT_PRIMARY};
                   --text-secondary: {ColorScheme.TEXT_SECONDARY};
                   --border: {ColorScheme.BORDER};
-                  --success: {ColorScheme.SUCCESS};
-                  --warning: {ColorScheme.WARNING};
-                  --error: {ColorScheme.ERROR};
                 }}
                 html, body {{ margin: 0; padding: 0; background: var(--background); }}
-                body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; color: var(--text-primary); line-height: 1.5; }}
+                body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+                        color: var(--text-primary); line-height: 1.5; }}
                 .container {{ max-width: 1200px; margin: 24px auto; padding: 0 16px; }}
                 .header {{
                   display: grid; grid-template-columns: 1fr auto; gap: 16px;
@@ -386,9 +473,42 @@ class InvoiceGenerator:
                   box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
                 }}
                 .brand {{ font-weight: 700; font-size: 24px; letter-spacing: -0.5px; }}
-                .idline {{ opacity: 0.9; font-size: 14px; margin-top: 4px; }}
+                .subbrand {{ font-size: 16px; color: #fff; opacity:0.85; margin-top:4px; font-weight:500; }}
+                .idline {{ opacity: 0.9; font-size: 14px; margin-top: 8px; }}
+                .total-badge {{
+                  background: rgba(255,255,255,0.2);
+                  padding: 8px 16px;
+                  border-radius: 20px;
+                  text-align: center;
+                  border: 1px solid rgba(255,255,255,0.3);
+                }}
+                .total-badge .label {{ font-size: 12px; opacity: 0.9; margin-bottom: 4px; }}
+                .total-badge .value {{ font-size: 28px; font-weight: 800; }}
+                .tier-info {{
+                  margin-top: 24px;
+                  background: var(--surface);
+                  border: 1px solid var(--border);
+                  border-radius: 12px;
+                  padding: 20px;
+                  box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+                }}
+                .tier-info h3 {{ margin: 0 0 12px 0; color: var(--primary); }}
+                .tier-grid {{
+                  display: grid;
+                  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                  gap: 12px;
+                  margin-top: 12px;
+                }}
+                .tier-item {{
+                  background: var(--background);
+                  padding: 12px;
+                  border-radius: 8px;
+                  border: 1px solid var(--border);
+                }}
+                .tier-item .range {{ font-weight: 600; color: var(--text-primary); }}
+                .tier-item .rate {{ color: var(--primary); font-weight: 700; margin-top: 4px; }}
                 .summary {{
-                  margin-top: 24px; display: flex; gap: 12px; flex-wrap: wrap;
+                  margin-top: 24px; display: flex; gap: 12px; flex-wrap: wrap; justify-content: center;
                 }}
                 .chip {{
                   border: 1px solid var(--border); border-radius: 12px;
@@ -401,7 +521,8 @@ class InvoiceGenerator:
                   box-shadow: 0 4px 12px rgba(0,0,0,0.15);
                   border-color: var(--primary-light);
                 }}
-                .chip .label {{ color: var(--text-secondary); font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600; }}
+                .chip .label {{ color: var(--text-secondary); font-size: 12px; text-transform: uppercase;
+                               letter-spacing: 0.5px; font-weight: 600; }}
                 .chip .value {{ font-size: 18px; font-weight: 700; margin-top: 6px; color: var(--primary); }}
                 table {{
                   border-collapse: collapse; width: 100%; margin-top: 24px;
@@ -420,42 +541,46 @@ class InvoiceGenerator:
                 }}
                 tbody tr:nth-child(even) {{ background: var(--background); }}
                 tbody tr:hover {{ background: rgba(79, 70, 229, 0.05); }}
-                .footer {{
-                  margin-top: 24px;
-                  text-align: right;
-                  font-weight: 700;
-                  font-size: 20px;
-                  color: var(--primary);
-                  padding: 16px;
-                  border-top: 2px solid var(--border);
+                .top-performers {{
+                  margin-top: 32px;
                 }}
+                .top-performers h3 {{
+                  color: var(--text-primary);
+                  border-bottom: 2px solid var(--primary);
+                  padding-bottom: 8px;
+                  margin-bottom: 16px;
+                }}
+                .performers-grid {{
+                  display: grid;
+                  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+                  gap: 16px;
+                }}
+                .performer-card {{
+                  background: var(--surface);
+                  padding: 16px;
+                  border-radius: 8px;
+                  border: 1px solid var(--border);
+                }}
+                .performer-card .name {{
+                  font-weight: 700;
+                  color: var(--primary);
+                  margin-bottom: 8px;
+                }}
+                .performer-card .stats {{
+                  color: var(--text-secondary);
+                  font-size: 14px;
+                }}
+                .performer-card .stats div {{ margin: 4px 0; }}
                 .note {{
-                  margin-top: 8px;
+                  margin-top: 24px;
                   color: var(--text-secondary);
                   font-size: 12px;
                   text-align: center;
                   padding: 16px;
                 }}
-                .total-badge {{
-                  background: rgba(255,255,255,0.2);
-                  padding: 8px 16px;
-                  border-radius: 20px;
-                  text-align: center;
-                  border: 1px solid rgba(255,255,255,0.3);
-                }}
-                .total-badge .label {{
-                  font-size: 12px;
-                  opacity: 0.9;
-                  margin-bottom: 4px;
-                }}
-                .total-badge .value {{
-                  font-size: 28px;
-                  font-weight: 800;
-                }}
                 @media (max-width: 768px) {{
                   .header {{ grid-template-columns: 1fr; text-align: center; }}
-                  .summary {{ flex-direction: column; }}
-                  .chip {{ min-width: auto; }}
+                  .summary {{ flex-direction: column; align-items: center; }}
                 }}
                 </style>
             </head>
@@ -463,12 +588,37 @@ class InvoiceGenerator:
                 <div class="container">
                     <div class="header">
                         <div>
-                            <div class="brand">📊 Management Summary Invoice</div>
-                            <div class="idline">From: Jemari Ventures &nbsp;&nbsp;|&nbsp;&nbsp; Period: {datetime.now().strftime('%B %Y')}</div>
+                            <div class="brand">📊 Invoice</div>
+                            <div class="subbrand">From: Jemari Ventures</div>
+                            <div class="subbrand">To: Niagamatic Sdn Bhd</div>
+                            <div class="idline">Invoice No: JMR{datetime.now().strftime('%Y%m')}</div>
+                            <div class="idline">Period: {(datetime.now().replace(day=1) - pd.Timedelta(days=1)).strftime('%B %Y')}</div>
                         </div>
                         <div class="total-badge">
-                            <div class="label">Total Company Payout</div>
+                            <div class="label">Total Payout</div>
                             <div class="value">{currency_symbol} {total_payout:,.2f}</div>
+                        </div>
+                    </div>
+
+                    <div class="tier-info">
+                        <h3>⚖️ Weight-Based Payout Tiers</h3>
+                        <div class="tier-grid">
+                            <div class="tier-item">
+                                <div class="range">0 - 5 kg</div>
+                                <div class="rate">{currency_symbol}1.50 per parcel</div>
+                            </div>
+                            <div class="tier-item">
+                                <div class="range">5 - 10 kg</div>
+                                <div class="rate">{currency_symbol}1.60 per parcel</div>
+                            </div>
+                            <div class="tier-item">
+                                <div class="range">10 - 30 kg</div>
+                                <div class="rate">{currency_symbol}2.70 per parcel</div>
+                            </div>
+                            <div class="tier-item">
+                                <div class="range">30+ kg</div>
+                                <div class="rate">{currency_symbol}4.00 per parcel</div>
+                            </div>
                         </div>
                     </div>
 
@@ -482,649 +632,219 @@ class InvoiceGenerator:
                             <div class="value">{total_parcels:,}</div>
                         </div>
                         <div class="chip">
-                            <div class="label">Payout Rate</div>
-                            <div class="value">{currency_symbol}{payout_rate:.2f}</div>
-                        </div>
-                        <div class="chip">
-                            <div class="label">Avg Parcels/Dispatcher</div>
-                            <div class="value">{avg_parcels:.1f}</div>
-                        </div>
-                        <div class="chip">
-                            <div class="label">Avg Payout/Dispatcher</div>
-                            <div class="value">{currency_symbol} {avg_payout:.2f}</div>
+                            <div class="label">Total Weight</div>
+                            <div class="value">{total_weight:,.2f} kg</div>
                         </div>
                     </div>
-            """
 
-            # Add the table
-            if len(display_df) > 0:
-                html_content += "<table>"
-                html_content += "<thead><tr>"
-                for col in display_df.columns:
-                    html_content += f"<th>{col}</th>"
-                html_content += "</tr></thead>"
+                    <table>
+                        <thead><tr>"""
 
-                html_content += "<tbody>"
-                for _, row in display_df.iterrows():
-                    html_content += "<tr>"
-                    for col in display_df.columns:
-                        html_content += f"<td>{row[col]}</td>"
-                    html_content += "</tr>"
-                html_content += "</tbody></table>"
+            # Add table headers
+            for col in table_columns:
+                html += f"<th>{col}</th>"
+            html += "</tr></thead><tbody>"
 
-            # Add top performers section - use formatted values directly
+            # Add table rows
+            for _, row in display_df.iterrows():
+                html += "<tr>"
+                for col in table_columns:
+                    html += f"<td>{row.get(col, '')}</td>"
+                html += "</tr>"
+
+            html += "</tbody></table>"
+
+            # Add top performers section
             if len(top_3) > 0:
-                html_content += """
-                    <div style="margin-top: 32px;">
-                        <h3 style="color: var(--text-primary); border-bottom: 2px solid var(--primary); padding-bottom: 8px;">🏆 Top Performers</h3>
-                        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 16px; margin-top: 16px;">
+                html += """
+                    <div class="top-performers">
+                        <h3>🏆 Top Performers</h3>
+                        <div class="performers-grid">
                 """
 
                 for idx, row in top_3.iterrows():
-                    html_content += f"""
-                        <div style="background: var(--surface); padding: 16px; border-radius: 8px; border: 1px solid var(--border);">
-                            <div style="font-weight: 700; color: var(--primary); margin-bottom: 8px;">{row['Dispatcher Name']}</div>
-                            <div style="color: var(--text-secondary); font-size: 14px;">
-                                <div>📦 {row['Parcels Delivered']:,} parcels</div>
+                    html += f"""
+                        <div class="performer-card">
+                            <div class="name">{row['Dispatcher Name']}</div>
+                            <div class="stats">
+                                <div>📦 {row['Parcels Delivered']} parcels</div>
+                                <div>⚖️ {row['Total Weight (kg)']} kg total</div>
                                 <div>💰 {row['Total Payout']}</div>
                             </div>
                         </div>
                     """
 
-                html_content += "</div></div>"
+                html += "</div></div>"
 
-            # Footer
-            html_content += f"""
+            html += f"""
                     <div class="note">
-                        Generated on {datetime.now().strftime('%Y-%m-%d at %H:%M')} • JMR Management Dashboard
+                        Generated on {datetime.now().strftime('%Y-%m-%d at %H:%M')} • JMR Management Dashboard<br>
+                        <em>Payout calculated using tier-based weight system</em>
                     </div>
                 </div>
             </body>
             </html>
             """
-
-            return html_content
-
+            return html
         except Exception as e:
-            st.error(f"Error generating invoice: {e}")
-            # Return a simple error HTML as fallback
-            return f"""
-            <html>
-            <body>
-                <h1>Error Generating Invoice</h1>
-                <p>There was an error generating the invoice: {str(e)}</p>
-                <p>Please try again or contact support.</p>
-            </body>
-            </html>
-            """
+            return f"<html><body><h1>Error: {str(e)}</h1></body></html>"
 
 # =============================================================================
-# STREAMLIT UI ENHANCEMENTS
+# UI COMPONENTS
 # =============================================================================
 
 def apply_custom_styles():
-    """Apply consistent color scheme to Streamlit components."""
+    """Apply custom CSS styling."""
     st.markdown(f"""
     <style>
-        /* Main background */
-        .stApp {{
-            background-color: {ColorScheme.BACKGROUND};
-        }}
-
-        /* Override Streamlit default text colors */
-        .stMarkdown, .stText, .stWrite {{
-            color: {ColorScheme.TEXT_PRIMARY} !important;
-        }}
-
-        /* Override Streamlit header colors */
-        .stMarkdown h1, .stMarkdown h2, .stMarkdown h3, .stMarkdown h4, .stMarkdown h5, .stMarkdown h6 {{
-            color: {ColorScheme.TEXT_PRIMARY} !important;
-        }}
-
-        /* Specific override for our custom header */
-        .stMarkdown div h1 {{
-            color: white !important;
-        }}
-
-        /* Sidebar */
-        .css-1d391kg, .css-1lcbmhc {{
-            background-color: {ColorScheme.SURFACE};
-        }}
-
-        /* Buttons */
-        .stButton>button {{
-            background-color: {ColorScheme.PRIMARY};
-            color: white;
-            border: none;
-            border-radius: 8px;
-            padding: 0.5rem 1rem;
-            font-weight: 600;
-        }}
-        .stButton>button:hover {{
-            background-color: {ColorScheme.PRIMARY_LIGHT};
-            color: white;
-        }}
-
-        /* Expanders */
-        .streamlit-expanderHeader {{
-            background-color: {ColorScheme.SURFACE};
-            border: 1px solid {ColorScheme.BORDER};
-            border-radius: 8px;
-            color: {ColorScheme.TEXT_PRIMARY} !important;
-        }}
-
-        /* Expander content */
-        .streamlit-expanderContent {{
-            color: {ColorScheme.TEXT_PRIMARY} !important;
-        }}
-
-        /* Dataframes */
-        .dataframe {{
-            border: 1px solid {ColorScheme.BORDER};
-            border-radius: 8px;
-        }}
-
-        /* Metrics */
-        [data-testid="stMetric"] {{
-            background-color: {ColorScheme.SURFACE};
-            border: 1px solid {ColorScheme.BORDER};
-            padding: 1rem;
-            border-radius: 8px;
-        }}
-        [data-testid="stMetricLabel"] {{
-            color: {ColorScheme.TEXT_SECONDARY};
-        }}
-        [data-testid="stMetricValue"] {{
-            color: {ColorScheme.PRIMARY};
-        }}
-
-        /* Select boxes */
-        .stSelectbox>div>div {{
-            border: 1px solid {ColorScheme.BORDER};
-            border-radius: 8px;
-        }}
-
-        /* Success, warning, error messages */
-        .stAlert {{
-            border-radius: 8px;
-        }}
-
-        /* Caption text */
-        .stCaption {{
-            color: {ColorScheme.TEXT_SECONDARY} !important;
-        }}
-
-        /* Footer styling - FIXED TEXT COLOR */
-        .footer {{
-            position: relative;
-            bottom: 0;
-            width: 100%;
-            margin-top: 3rem;
-            padding: 1.5rem 0;
-            background: linear-gradient(135deg, {ColorScheme.PRIMARY} 0%, {ColorScheme.PRIMARY_LIGHT} 100%);
-            color: white !important;
-            text-align: center;
-            border-radius: 12px;
-        }}
-        .footer-content {{
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            gap: 0.5rem;
-            color: white !important;
-        }}
-        .footer-logo {{
-            font-weight: 700;
-            font-size: 1.2rem;
-            margin-bottom: 0.5rem;
-            color: white !important;
-        }}
-        .footer-links {{
-            display: flex;
-            gap: 1.5rem;
-            margin: 0.5rem 0;
-            flex-wrap: wrap;
-            justify-content: center;
-            color: white !important;
-        }}
-        .footer-link {{
-            color: rgba(255,255,255,0.8) !important;
-            text-decoration: none;
-            font-size: 0.9rem;
-            transition: color 0.2s;
-        }}
-        .footer-link:hover {{
-            color: white !important;
-        }}
-        .footer-copyright {{
-            color: rgba(255,255,255,0.9) !important;
-            font-size: 0.9rem;
-            margin-top: 0.5rem;
-        }}
-
-        /* Ensure all text in footer is white */
-        .footer * {{
-            color: white !important;
-        }}
-
-        @media (max-width: 768px) {{
-            .footer-links {{
-                flex-direction: column;
-                gap: 0.5rem;
-            }}
-        }}
+        .stApp {{ background-color: {ColorScheme.BACKGROUND}; }}
+        .stButton>button {{ background-color: {ColorScheme.PRIMARY}; color: white;
+                           border-radius: 8px; padding: 0.5rem 1rem; font-weight: 600; border: none; }}
+        .stButton>button:hover {{ background-color: {ColorScheme.PRIMARY_LIGHT}; }}
+        [data-testid="stMetric"] {{ background: white; border: 1px solid {ColorScheme.BORDER};
+                                    padding: 1rem; border-radius: 8px; }}
+        [data-testid="stMetricValue"] {{ color: {ColorScheme.PRIMARY}; }}
     </style>
     """, unsafe_allow_html=True)
 
+
 def add_footer():
-    """Add a professional footer to the main page."""
+    """Add footer to page."""
     st.markdown(f"""
-    <div class="footer">
-        <div class="footer-content">
-            <div class="footer-copyright" style="color: white !important;">
-                © 2025 Jemari Ventures. All rights reserved. | JMR Management Dashboard v1.0
-            </div>
-        </div>
+    <div style="margin-top: 3rem; padding: 1.5rem; background: linear-gradient(135deg, {ColorScheme.PRIMARY}, {ColorScheme.PRIMARY_LIGHT});
+                color: white; text-align: center; border-radius: 12px;">
+        © 2025 Jemari Ventures. All rights reserved. | JMR Management Dashboard v2.0
     </div>
     """, unsafe_allow_html=True)
 
 # =============================================================================
-# MAIN MANAGEMENT APPLICATION
+# MAIN APPLICATION
 # =============================================================================
 
 def main():
-    """Main management dashboard application."""
-
-    # Page configuration
-    st.set_page_config(
-        page_title="JMR Management Dashboard",
-        page_icon="📊",
-        layout="wide"
-    )
-
-    # Apply custom styles
+    """Main application."""
+    st.set_page_config(page_title="JMR Management Dashboard", page_icon="📊", layout="wide")
     apply_custom_styles()
 
-    # Custom header with consistent branding
+    # Header
     st.markdown(f"""
-    <div style="background: linear-gradient(135deg, {ColorScheme.PRIMARY} 0%, {ColorScheme.PRIMARY_LIGHT} 100%);
-                padding: 2rem;
-                border-radius: 12px;
-                color: white;
-                margin-bottom: 2rem;
-                text-align: center;
-                box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);">
-        <h1 style="color: white !important; margin: 0; padding: 0;">📊 JMR Management Dashboard</h1>
-        <p style="color: rgba(255,255,255,0.9) !important; margin: 0.5rem 0 0 0; padding: 0;">
+    <div style="background: linear-gradient(135deg, {ColorScheme.PRIMARY}, {ColorScheme.PRIMARY_LIGHT});
+                padding: 2rem; border-radius: 12px; color: white; margin-bottom: 2rem; text-align: center;">
+        <h1 style="color: white; margin: 0;">📊 JMR Management Dashboard</h1>
+        <p style="color: rgba(255,255,255,0.9); margin: 0.5rem 0 0 0;">
             Overview of dispatcher performance and payouts
         </p>
     </div>
     """, unsafe_allow_html=True)
 
-    # Load configuration
+    # Load config and data
     config = Config.load()
-    if not config:
-        st.error("❌ Failed to load configuration. Please check config.json file.")
-        add_footer()
-        return
-
-    # # Load data from Google Sheets
-    # with st.spinner("🔄 Loading data from Google Sheets..."):
-    #     df = DataSource.load_data(config)
-    # Load data from PostgreSQL
-    with st.spinner("🔄 Loading data from PostgreSQL database..."):
-        db_url = st.secrets.get("db_url") or os.getenv("DATABASE_URL")
-
-        if not db_url:
-            st.error("❌ Database URL not found. Please set it in .streamlit/secrets.toml or environment variables.")
-            add_footer()
-            return
-
-        db_url = get_database_url()
-        data_source = DataSource(db_url)
-
-        df = data_source.fetch_data("SELECT * FROM dispatcher_raw_data;")
+    with st.spinner("📄 Loading data from Google Sheets..."):
+        df = DataSource.load_data(config)
 
     if df is None or df.empty:
-        st.error("❌ No data loaded. Please check your Google Sheets configuration.")
-        st.info("💡 Tip: Check if data exists in the 'dispatcher_raw_data' table")
+        st.error("❌ No data loaded. Check your Google Sheet configuration.")
         add_footer()
         return
 
-    # Sidebar Configuration
+    # Sidebar
     st.sidebar.header("⚙️ Configuration")
+    st.sidebar.info("**💰 Weight-Based Payout:**\n- 0-5kg: RM1.50\n- 5-10kg: RM1.60\n- 10-30kg: RM2.70\n- 30kg+: RM4.00")
 
-    payout_rate = st.sidebar.number_input(
-        "💰 Payout Rate (RM/parcel)",
-        min_value=0.0,
-        value=1.5,
-        step=0.1,
-        help="Flat rate per parcel delivered"
-    )
-
-    # Date range filter
-    st.sidebar.header("📅 Date Range Filter")
-
-    # Try to find date column for filtering
-    date_column = None
-
-    for col in ["Delivery Signature", "Delivery Date", "signature_date"]:
-        if col in df.columns:
-            date_column = col
-            break
-
-    if date_column:
-        df[date_column] = pd.to_datetime(df[date_column], errors="coerce")
-        min_date = df[date_column].min().date()
-        max_date = df[date_column].max().date()
-
-        date_range = st.sidebar.date_input(
-            "Select Date Range",
-            value=(min_date, max_date),
-            min_value=min_date,
-            max_value=max_date
-        )
-
+    # Date filter
+    date_col = find_column(df, 'date')
+    if date_col:
+        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+        min_date, max_date = df[date_col].min().date(), df[date_col].max().date()
+        date_range = st.sidebar.date_input("Select Date Range", value=(min_date, max_date),
+                                          min_value=min_date, max_value=max_date)
         if len(date_range) == 2:
             start_date, end_date = date_range
-            df_filtered = df[(df[date_column].dt.date >= start_date) &
-                            (df[date_column].dt.date <= end_date)]
-            if len(df_filtered) == 0:
-                st.warning(f"⚠️ No data found between {start_date} and {end_date}")
-            df = df_filtered
-        elif len(date_range) == 1:
-            st.warning("Please select both start and end dates")
-    # ==============================================================
-    # 🧮 SUMMARY METRICS
-    # ==============================================================
+            df = df[(df[date_col].dt.date >= start_date) & (df[date_col].dt.date <= end_date)]
 
-    st.subheader("📈 Performance Overview")
-
-    currency_symbol = config.get("currency_symbol", "RM")
-    display_df, numeric_df, total_payout = PayoutCalculator.calculate_payout_rate(df, payout_rate, currency_symbol)
+    # Calculate payouts
+    currency = config.get("currency_symbol", "RM")
+    display_df, numeric_df, total_payout = PayoutCalculator.calculate_payout(df, currency)
 
     if numeric_df.empty:
-        st.warning("No data available after filtering.")
+        st.warning("No data after filtering.")
         add_footer()
         return
 
+    # Metrics
+    st.subheader("📈 Performance Overview")
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
+    col1.metric("Dispatchers", f"{len(display_df):,}")
+    col2.metric("Parcels", f"{int(numeric_df['Parcels Delivered'].sum()):,}")
+    col3.metric("Total Weight", f"{numeric_df['Total Weight (kg)'].sum():,.2f} kg")
+    col4.metric("Total Payout", f"{currency} {total_payout:,.2f}")
+    col5.metric("Avg Weight", f"{numeric_df['Avg Weight (kg)'].mean():.2f} kg")
+    col6.metric("Avg Payout", f"{currency} {total_payout/len(numeric_df):.2f}")
 
-    total_dispatchers = len(display_df)
-    total_parcels = numeric_df["Parcels Delivered"].sum()
-    avg_parcels = numeric_df["Parcels Delivered"].mean()
-    avg_payout = total_payout / total_dispatchers if total_dispatchers > 0 else 0
-
-    # Top Metrics Layout
-    col1, col2, col3, col4, col5 = st.columns(5)
-
-    with col1:
-        st.metric("Total Dispatchers", f"{total_dispatchers:,}")
-    with col2:
-        st.metric("Total Parcels", f"{total_parcels:,}")
-    with col3:
-        st.metric("Total Payout", f"{currency_symbol} {total_payout:,.2f}")
-    with col4:
-        st.metric("Avg Parcels/Dispatcher", f"{avg_parcels:.1f}")
-    with col5:
-        st.metric("Avg Payout/Dispatcher", f"{currency_symbol} {avg_payout:.2f}")
-
-    # ==============================================================
-    # 📊 PERFORMANCE CHARTS
-    # ==============================================================
-
+    # Charts
     st.markdown("---")
     st.subheader("📊 Performance Analytics")
+    daily_df = PayoutCalculator.get_daily_trend(df)
+    charts = DataVisualizer.create_all_charts(daily_df, numeric_df)
 
-    # Prepare daily data for charts
-    daily_df = PayoutCalculator.get_daily_trend_data(df)
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        if 'daily_trend' in charts:
+            st.altair_chart(charts['daily_trend'], use_container_width=True)
+        if 'performers' in charts:
+            st.altair_chart(charts['performers'], use_container_width=True)
 
-    # Create and display charts
-    charts = DataVisualizer.create_management_charts(daily_df, numeric_df, currency_symbol)
+    with col2:
+        if 'payout_dist' in charts:
+            st.altair_chart(charts['payout_dist'], use_container_width=True)
 
-    if charts:
-        # First row: Charts side by side
-        col1, col2 = st.columns([1, 1])
-
-        with col1:
-            if 'daily_trend' in charts:
-                st.altair_chart(charts['daily_trend'], use_container_width=True)
-
-            # Metrics below daily trend chart
-            if not daily_df.empty:
-                metric_col1, metric_col2 = st.columns(2)
-                with metric_col1:
-                    highest_day = daily_df.loc[daily_df['total_parcels'].idxmax()]
-                    st.metric("Peak Delivery Day",
-                            f"{highest_day['total_parcels']} parcels",
-                            f"on {highest_day['signature_date'].strftime('%b %d')}")
-                with metric_col2:
-                    avg_daily = daily_df['total_parcels'].mean()
-                    st.metric("Average Daily Volume", f"{avg_daily:.1f} parcels")
-
-            # Bar chart below metrics
-            if 'performers' in charts:
-                st.altair_chart(charts['performers'], use_container_width=True)
-
-        with col2:
-            if 'payout_dist' in charts:
-                st.altair_chart(charts['payout_dist'], use_container_width=True)
-
-            # Top 5 performers below donut chart
-            st.markdown("##### 🏆 Top Performers")
-            top_5 = numeric_df.head(5)
-            for idx, row in top_5.iterrows():
-                st.markdown(f"""
-                <div style="background: {ColorScheme.SURFACE}; padding: 0.8rem 1rem; border-radius: 8px; border: 1px solid {ColorScheme.BORDER}; margin: 0.4rem 0;">
-                    <div style="font-weight: 600; color: {ColorScheme.PRIMARY}; margin-bottom: 0.2rem;">{row['Dispatcher Name']}</div>
-                    <div style="color: {ColorScheme.TEXT_SECONDARY}; font-size: 0.9rem;">
-                        {row['Parcels Delivered']} parcels • {row['Total Payout']}
-                    </div>
+        st.markdown("##### 🏆 Top Performers")
+        for _, row in numeric_df.head(5).iterrows():
+            st.markdown(f"""
+            <div style="background: white; padding: 12px; border-radius: 8px; border: 1px solid #e2e8f0; margin: 8px 0;">
+                <div style="font-weight: 600; color: {ColorScheme.PRIMARY};">{row['Dispatcher Name']}</div>
+                <div style="color: #64748b; font-size: 0.9rem;">
+                    {row['Parcels Delivered']} parcels • {row['Total Weight (kg)']:.2f} kg • {currency}{row['Total Payout']:,.2f}
                 </div>
-                """, unsafe_allow_html=True)
+            </div>
+            """, unsafe_allow_html=True)
 
-        # ==============================================================
-        # 🔮 FORECAST & INSIGHTS (Including Total Payout)
-        # ==============================================================
+    # Data table
+    st.markdown("---")
+    st.subheader("👥 Dispatcher Performance Details")
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
 
-        st.markdown("---")
-        st.subheader("🔮 Forecast & Insights")
+    # Invoice generation
+    st.markdown("---")
+    st.subheader("📄 Invoice Generation")
+    invoice_html = InvoiceGenerator.build_invoice_html(display_df, numeric_df, total_payout, currency)
+    st.download_button(
+        label="📥 Download Invoice (HTML)",
+        data=invoice_html.encode("utf-8"),
+        file_name=f"invoice_{datetime.now().strftime('%Y%m%d')}.html",
+        mime="text/html"
+    )
 
-        try:
-            from prophet import Prophet
-            import altair as alt
-
-            # --- CONFIG ---
-            # Example flat payout rate per parcel (you can replace this with your actual config)
-            #payout_rate = payout_rate  # RM5 per parcel, for example
-            #currency_symbol = "RM"
-
-
-            # --- Data Preparation ---
-            forecast_df = daily_df.rename(columns={"signature_date": "ds", "total_parcels": "y"})[["ds", "y"]]
-
-            # Ensure valid datetime
-            forecast_df["ds"] = pd.to_datetime(forecast_df["ds"], errors="coerce")
-            forecast_df = forecast_df.dropna(subset=["ds", "y"])
-
-            if len(forecast_df) < 5:
-                st.warning("📉 Not enough historical data for reliable forecasting. Please keep at least 14 days of data.")
-            else:
-                # --- Prophet Model ---
-                model = Prophet(
-                    yearly_seasonality=False,
-                    weekly_seasonality=True,
-                    daily_seasonality=False,
-                    interval_width=0.8
-                )
-                model.fit(forecast_df)
-
-                # Forecast next 14 days
-                future = model.make_future_dataframe(periods=14)
-                forecast = model.predict(future)
-
-                # Ensure datetime alignment
-                forecast["ds"] = pd.to_datetime(forecast["ds"])
-                forecast_df["ds"] = pd.to_datetime(forecast_df["ds"])
-
-                # Merge actual + forecast data
-                forecast_chart_data = forecast[["ds", "yhat", "yhat_lower", "yhat_upper"]].merge(
-                    forecast_df, on="ds", how="left"
-                )
-
-                # --- Compute Payout ---
-                forecast_chart_data["yhat_payout"] = forecast_chart_data["yhat"] * payout_rate
-                forecast_chart_data["y_payout"] = forecast_chart_data["y"] * payout_rate
-
-                # Split into historical and future predictions
-                historical = forecast_chart_data[forecast_chart_data["y"].notna()]
-                future = forecast_chart_data[forecast_chart_data["y"].isna()]
-
-                # --- Visualization: Parcel Forecast ---
-                st.markdown("### 📦 Parcel Volume Forecast")
-
-                actual_line = alt.Chart(historical).mark_line(color="#1f77b4").encode(
-                    x=alt.X("ds:T", title="Date"),
-                    y=alt.Y("y:Q", title="Parcels Delivered"),
-                    tooltip=["ds:T", "y"]
-                )
-
-                forecast_line = alt.Chart(future).mark_line(
-                    strokeDash=[4, 4], color="#ffa500"
-                ).encode(
-                    x="ds:T",
-                    y="yhat:Q",
-                    tooltip=["ds:T", "yhat"]
-                )
-
-                confidence_band = alt.Chart(forecast_chart_data).mark_area(
-                    opacity=0.2, color="#ffa500"
-                ).encode(
-                    x="ds:T",
-                    y="yhat_lower:Q",
-                    y2="yhat_upper:Q"
-                )
-
-                st.altair_chart(confidence_band + actual_line + forecast_line, use_container_width=True)
-
-                # --- Visualization: Payout Forecast ---
-                st.markdown(f"### 💸 Total Payout Forecast ({currency_symbol})")
-
-                payout_actual = alt.Chart(forecast_chart_data).mark_line(color="#2ca02c").encode(
-                    x=alt.X("ds:T", title="Date"),
-                    y=alt.Y("y_payout:Q", title=f"Total Payout ({currency_symbol})"),
-                    tooltip=["ds:T", "y_payout"]
-                )
-
-                payout_forecast = alt.Chart(forecast_chart_data).mark_line(
-                    strokeDash=[4, 4], color="#ff7f0e"
-                ).encode(
-                    x="ds:T",
-                    y="yhat_payout:Q",
-                    tooltip=["ds:T", "yhat_payout"]
-                )
-
-                st.altair_chart(payout_actual + payout_forecast, use_container_width=True)
-
-                # --- Forecast Metrics ---
-                latest_actual = forecast_df["y"].iloc[-1]
-                tomorrow_forecast = forecast.iloc[-1]["yhat"]
-                next_week_forecast = forecast.tail(7)["yhat"].sum()
-
-                tomorrow_payout = tomorrow_forecast * payout_rate
-                next_week_payout = next_week_forecast * payout_rate
-
-                avg_daily = forecast_df["y"].mean()
-                growth_rate = ((tomorrow_forecast - avg_daily) / avg_daily * 100) if avg_daily > 0 else 0
-
-                st.markdown("### 📅 Short-Term Outlook")
-                metric1, metric2, metric3 = st.columns(3)
-                with metric1:
-                    st.metric("Tomorrow’s Volume (Est.)", f"{tomorrow_forecast:.0f} parcels",
-                            f"{tomorrow_forecast - latest_actual:+.1f} vs last day")
-                with metric2:
-                    st.metric(f"Next 7 Days Payout (Est.)", f"{currency_symbol}{next_week_payout:,.0f}")
-                with metric3:
-                    st.metric("Expected Change", f"{growth_rate:+.1f}% vs Avg Daily")
-
-                # --- Auto Insights ---
-                st.markdown("### 🧠 Auto Insights")
-                if growth_rate > 5:
-                    st.success(f"📈 Volume expected to increase — projected payout for next 7 days: {currency_symbol}{next_week_payout:,.0f}. Consider adding dispatch capacity.")
-                elif growth_rate < -5:
-                    st.warning(f"📉 Lower forecast — estimated payout next 7 days: {currency_symbol}{next_week_payout:,.0f}. May indicate slow demand period.")
-                else:
-                    st.info(f"📊 Stable forecast — total payout expected around {currency_symbol}{next_week_payout:,.0f} next week.")
-
-        except ImportError:
-            st.warning("⚠️ Prophet is not installed. Run `pip install prophet` to enable forecasting.")
-        except Exception as e:
-            st.error(f"Forecasting failed: {e}")
-
-
-        # ==============================================================
-        # 📋 DISPATCHER DETAILS TABLE
-        # ==============================================================
-
-        st.markdown("---")
-        st.subheader("👥 Dispatcher Performance Details")
-
-        st.dataframe(
-            display_df,
-            use_container_width=True,
-            hide_index=True
-        )
-
-        # ==============================================================
-        # 📥 INVOICE GENERATION
-        # ==============================================================
-        st.markdown("---")
-        st.subheader("📄 Invoice Generation")
-
-        # Generate and download invoice
-        invoice_html = InvoiceGenerator.build_invoice_html(
-            display_df, total_payout, payout_rate, currency_symbol
-        )
-
+    # Export options
+    st.markdown("---")
+    st.subheader("📥 Export Data")
+    col1, col2 = st.columns(2)
+    with col1:
         st.download_button(
-            label="📥 Download Invoice (HTML)",
-            data=invoice_html.encode("utf-8"),
-            file_name=f"invoice_{datetime.now().strftime('%Y%m%d')}.html",
-            mime="text/html",
+            label="📊 Download Summary CSV",
+            data=numeric_df.to_csv(index=False),
+            file_name=f"summary_{datetime.now().strftime('%Y%m%d')}.csv",
+            mime="text/csv"
+        )
+    with col2:
+        st.download_button(
+            label="📋 Download Raw Data CSV",
+            data=df.to_csv(index=False),
+            file_name=f"raw_data_{datetime.now().strftime('%Y%m%d')}.csv",
+            mime="text/csv"
         )
 
-        st.caption("Invoice generated based on current configuration and data.")
-
-        # ==============================================================
-        # 📥 EXPORT OPTIONS
-        # ==============================================================
-
-        st.markdown("---")
-        st.subheader("📥 Export Data")
-
-        col1, col2 = st.columns(2)
-
-        with col1:
-            # Export summary data
-            csv_data = numeric_df.to_csv(index=False)
-            st.download_button(
-                label="📊 Download Summary CSV",
-                data=csv_data,
-                file_name=f"management_summary_{datetime.now().strftime('%Y%m%d')}.csv",
-                mime="text/csv"
-            )
-
-        with col2:
-            # Export raw data
-            raw_csv = df.to_csv(index=False)
-            st.download_button(
-                label="📋 Download Raw Data CSV",
-                data=raw_csv,
-                file_name=f"raw_data_{datetime.now().strftime('%Y%m%d')}.csv",
-                mime="text/csv"
-            )
-
-        # Add footer
-        add_footer()
+    add_footer()
 
 
 if __name__ == "__main__":
