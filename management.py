@@ -588,7 +588,7 @@ class InvoiceGenerator:
                 <div class="container">
                     <div class="header">
                         <div>
-                            <div class="brand">📊 Invoice</div>
+                            <div class="brand">Invoice</div>
                             <div class="subbrand">From: Jemari Ventures</div>
                             <div class="subbrand">To: Niagamatic Sdn Bhd</div>
                             <div class="idline">Invoice No: JMR{datetime.now().strftime('%Y%m')}</div>
@@ -601,7 +601,7 @@ class InvoiceGenerator:
                     </div>
 
                     <div class="tier-info">
-                        <h3>⚖️ Weight-Based Payout Tiers</h3>
+                        <h3>Weight-Based Payout Tiers</h3>
                         <div class="tier-grid">
                             <div class="tier-item">
                                 <div class="range">0 - 5 kg</div>
@@ -658,7 +658,7 @@ class InvoiceGenerator:
             if len(top_3) > 0:
                 html += """
                     <div class="top-performers">
-                        <h3>🏆 Top Performers</h3>
+                        <h3>Top Performers</h3>
                         <div class="performers-grid">
                 """
 
@@ -667,9 +667,9 @@ class InvoiceGenerator:
                         <div class="performer-card">
                             <div class="name">{row['Dispatcher Name']}</div>
                             <div class="stats">
-                                <div>📦 {row['Parcels Delivered']} parcels</div>
-                                <div>⚖️ {row['Total Weight (kg)']} kg total</div>
-                                <div>💰 {row['Total Payout']}</div>
+                                <div>{row['Parcels Delivered']} parcels</div>
+                                <div>{row['Total Weight (kg)']} kg total</div>
+                                <div>{row['Total Payout']}</div>
                             </div>
                         </div>
                     """
