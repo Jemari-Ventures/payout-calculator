@@ -8,6 +8,7 @@
       "table_name": "dispatcher_raw_data"
     },
     "currency_symbol": "RM",
+    "pickup_fee": 17.50,
     "payout_rate": 1.5,
     "tiers": [
       {"Tier": "Tier 3", "Min Parcels": 0, "Max Parcels": 60, "Rate (RM)": 0.95},
@@ -34,9 +35,9 @@
         "bonus": 100.00,
         "description": "26 Days Attendance Bonus"
     },
-    "advance_deduction": {
+    "advance_payout": {
         "enabled": true,
         "percentage": 40.0,
-        "description": "Advance Payment Deduction"
+        "description": "Advance Payout"
     }
 }
