@@ -199,6 +199,19 @@ class DataSource:
                 return None
         return None
 
+    @staticmethod
+    def load_penalty_data(config: dict, sheet_name: str = "Sheet2") -> Optional[pd.DataFrame]:
+        """Load penalty data from Sheet2 based on configuration."""
+        data_source = config["data_source"]
+
+        if data_source["type"] == "gsheet" and data_source["gsheet_url"]:
+            try:
+                return DataSource.read_google_sheet(data_source["gsheet_url"], sheet_name)
+            except Exception as exc:
+                st.warning(f"Could not load penalty data from {sheet_name}: {exc}")
+                return None
+        return None
+
 
 # =============================================================================
 # PAYOUT CALCULATIONS
@@ -271,9 +284,60 @@ class PayoutCalculator:
         return None, ""
 
     @staticmethod
+    def calculate_penalty(dispatcher_id: str, penalty_df: Optional[pd.DataFrame], penalty_rate: float = 100.0) -> Tuple[float, int, List[str]]:
+        """Calculate penalty for a dispatcher based on penalty data from Sheet2.
+
+        Args:
+            dispatcher_id: The dispatcher ID to check
+            penalty_df: DataFrame containing penalty data with 'RESPONSIBLE' column
+            penalty_rate: Penalty amount per parcel (default RM100)
+
+        Returns:
+            Tuple of (total_penalty_amount, penalty_parcel_count, list_of_waybill_numbers)
+        """
+        if penalty_df is None or penalty_df.empty:
+            return 0.0, 0, []
+
+        # Find RESPONSIBLE column (case-insensitive)
+        responsible_col = None
+        for col in penalty_df.columns:
+            if col.upper().strip() == "RESPONSIBLE":
+                responsible_col = col
+                break
+
+        if responsible_col is None:
+            return 0.0, 0, []
+
+        # Find waybill column (check for 运单号, Airway Bill, Waybill Number, etc.)
+        waybill_col = None
+        waybill_keywords = ["运单号", "AIRWAY BILL", "WAYBILL NUMBER", "WAYBILL", "AIRWAY"]
+        for col in penalty_df.columns:
+            col_upper = col.upper().strip()
+            if any(keyword in col_upper for keyword in waybill_keywords):
+                waybill_col = col
+                break
+
+        # Count parcels where dispatcher ID matches RESPONSIBLE column
+        penalty_records = penalty_df[
+            penalty_df[responsible_col].astype(str).str.strip() == str(dispatcher_id).strip()
+        ]
+
+        penalty_count = len(penalty_records)
+        penalty_amount = penalty_count * penalty_rate
+
+        # Extract waybill numbers if column exists
+        waybill_numbers = []
+        if waybill_col and penalty_count > 0:
+            waybill_numbers = penalty_records[waybill_col].astype(str).str.strip().tolist()
+            waybill_numbers = [wb for wb in waybill_numbers if wb and wb.lower() != 'nan']
+
+        return float(penalty_amount), penalty_count, waybill_numbers
+
+    @staticmethod
     def calculate_tiered_daily(filtered_df: pd.DataFrame, tiers_config: List,
                               kpi_config: List, special_rates_config: List,
-                              attendance_config: dict, currency_symbol: str) -> Tuple[pd.DataFrame, float, float, str, float, str, int, pd.DataFrame]:
+                              attendance_config: dict, currency_symbol: str,
+                              penalty_df: Optional[pd.DataFrame] = None, penalty_rate: float = 100.0) -> Tuple[pd.DataFrame, float, float, str, float, str, int, pd.DataFrame, float, int, List[str]]:
         """Calculate payout for tiered daily mode with KPI bonus, attendance bonus, and special rates."""
         tiers = []
         for tier in tiers_config:
@@ -298,9 +362,17 @@ class PayoutCalculator:
         work["__date"] = pd.to_datetime(work["Delivery Signature"], errors="coerce").dt.date
         work["__waybill"] = work["Waybill Number"].astype(str).str.strip()
 
+        # Filter out invalid waybills (NaN, empty, or "nan" string)
+        work = work[work["__waybill"].notna() & (work["__waybill"] != "") & (work["__waybill"].str.lower() != "nan")]
+
+        # Remove duplicate waybills per date, keeping the latest record
+        # This ensures accurate counting and prevents double-counting
+        work = work.sort_values(by=["__date", "__waybill", "Delivery Signature"])
+        work = work.drop_duplicates(subset=["__date", "__waybill"], keep="last")
+
         per_day = (
             work.groupby(["__date"], dropna=False)["__waybill"]
-            .nunique(dropna=True)
+            .nunique()  # No need for dropna since we already filtered invalid waybills
             .reset_index()
             .rename(columns={"__waybill": "daily_parcels"})
         )
@@ -336,7 +408,24 @@ class PayoutCalculator:
             per_day, attendance_config
         )
 
-        total_payout = base_payout + kpi_bonus + attendance_bonus
+        # Calculate penalty if penalty data is provided
+        penalty_amount = 0.0
+        penalty_count = 0
+        penalty_waybills = []
+        if penalty_df is not None and not penalty_df.empty:
+            # Get dispatcher ID from filtered data
+            dispatcher_id = None
+            for col in ["Dispatcher ID", "Dispatcher Id", "dispatcher_id"]:
+                if col in filtered_df.columns:
+                    dispatcher_id = filtered_df[col].iloc[0] if len(filtered_df) > 0 else None
+                    break
+
+            if dispatcher_id:
+                penalty_amount, penalty_count, penalty_waybills = PayoutCalculator.calculate_penalty(
+                    str(dispatcher_id), penalty_df, penalty_rate
+                )
+
+        total_payout = base_payout + kpi_bonus + attendance_bonus - penalty_amount
 
         display_df = per_day[["__date", "daily_parcels", "tier", "rate_per_parcel", "payout_per_day"]].copy()
         display_df = display_df.rename(columns={
@@ -350,7 +439,7 @@ class PayoutCalculator:
         display_df["Payout Rate"] = display_df["Payout Rate"].apply(lambda x: f"{currency_symbol}{x:.2f}")
         display_df["Payout"] = display_df["Payout"].apply(lambda x: f"{currency_symbol}{x:.2f}")
 
-        return display_df, total_payout, kpi_bonus, kpi_description, attendance_bonus, attendance_desc, qualified_days, per_day
+        return display_df, total_payout, kpi_bonus, kpi_description, attendance_bonus, attendance_desc, qualified_days, per_day, penalty_amount, penalty_count, penalty_waybills
 
 
 # =============================================================================
@@ -454,11 +543,16 @@ class InvoiceGenerator:
         df_disp: pd.DataFrame, base_payout: float, kpi_bonus: float,
         attendance_bonus: float, total_payout: float, kpi_description: str,
         attendance_description: str, name: str, dpid: str, currency_symbol: str,
-        advance_payout: float, advance_payout_desc: str
+        advance_payout: float, advance_payout_desc: str,
+        penalty_amount: float = 0.0, penalty_count: int = 0, penalty_rate: float = 100.0,
+        penalty_waybills: List[str] = None
     ) -> str:
         total_parcels = df_disp['Total Parcel'].sum() if 'Total Parcel' in df_disp.columns else 0
         total_days = len(df_disp) if 'Date' in df_disp.columns else 0
         cleaned_name = clean_dispatcher_name(name)
+
+        if penalty_waybills is None:
+            penalty_waybills = []
 
         html_content = f"""
         <html>
@@ -522,6 +616,13 @@ class InvoiceGenerator:
             .attendance-bonus {{
               padding: 16px;
               background: linear-gradient(135deg, var(--accent) 0%, #d97706 100%);
+              border-radius: 12px;
+              color: white;
+              box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+            }}
+            .penalty-section {{
+              padding: 16px;
+              background: linear-gradient(135deg, var(--error) 0%, #dc2626 100%);
               border-radius: 12px;
               color: white;
               box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
@@ -631,7 +732,7 @@ class InvoiceGenerator:
                 </div>
         """
 
-        if kpi_bonus > 0 or attendance_bonus > 0:
+        if kpi_bonus > 0 or attendance_bonus > 0 or penalty_amount > 0:
             html_content += '<div class="bonus-section">'
             if kpi_bonus > 0:
                 html_content += f"""
@@ -647,6 +748,19 @@ class InvoiceGenerator:
                         <div class="bonus-title">Attendance Incentive Achieved!</div>
                         <div class="bonus-amount">+ {currency_symbol} {attendance_bonus:,.2f}</div>
                         <div class="bonus-description">{attendance_description}</div>
+                    </div>
+                """
+            if penalty_amount > 0:
+                waybill_list = ", ".join(penalty_waybills) if penalty_waybills else "N/A"
+                html_content += f"""
+                    <div class="penalty-section">
+                        <div class="bonus-title">Penalty Applied</div>
+                        <div class="bonus-amount">- {currency_symbol} {penalty_amount:,.2f}</div>
+                        <div class="bonus-description">{penalty_count} parcel(s) × {currency_symbol}{penalty_rate:.2f}</div>
+                        <div class="bonus-description" style="margin-top: 8px; font-size: 11px; opacity: 0.8;">
+                            <strong>Waybill Numbers:</strong><br>
+                            {waybill_list if len(waybill_list) < 200 else waybill_list[:200] + "..."}
+                        </div>
                     </div>
                 """
             html_content += '</div>'
@@ -678,7 +792,22 @@ class InvoiceGenerator:
                 <div class="payout-row">
                     <span>Attendance Incentive Bonus:</span>
                     <span>{currency_symbol} {attendance_bonus:,.2f}</span>
-                </div>
+                </div>"""
+
+        if penalty_amount > 0:
+            waybill_list = ", ".join(penalty_waybills) if penalty_waybills else "N/A"
+            html_content += f"""
+                <div class="payout-row" style="color: var(--error);">
+                    <span>Penalty ({penalty_count} parcel(s) × {currency_symbol}{penalty_rate:.2f}):</span>
+                    <span>- {currency_symbol} {penalty_amount:,.2f}</span>
+                </div>"""
+            if penalty_waybills:
+                html_content += f"""
+                <div class="payout-row" style="font-size: 12px; color: var(--text-secondary); padding-left: 20px;">
+                    <span><strong>Waybill Numbers:</strong> {waybill_list}</span>
+                </div>"""
+
+        html_content += f"""
                 <div class="payout-row">
                     <span>{advance_payout_desc}:</span>
                     <span>- {currency_symbol} {advance_payout:,.2f}</span>
@@ -931,21 +1060,29 @@ def main():
                 dispatcher_name = clean_dispatcher_name(values[0])
                 break
     currency_symbol = config["currency_symbol"]
-    display_df, total_payout, kpi_bonus, kpi_description, attendance_bonus, attendance_desc, qualified_days, per_day = PayoutCalculator.calculate_tiered_daily(
-        filtered, config["tiers"], config.get("kpi_incentives", []),
-        config.get("special_rates", []), config.get("attendance_incentive", {}), currency_symbol
-    )
-    base_payout = total_payout - kpi_bonus - attendance_bonus
 
+    # Load penalty data from Sheet2
+    penalty_df = DataSource.load_penalty_data(config, "Sheet2")
+    penalty_rate = config.get("penalty_rate", 100.0)  # Default RM100 per parcel
+
+    display_df, total_payout, kpi_bonus, kpi_description, attendance_bonus, attendance_desc, qualified_days, per_day, penalty_amount, penalty_count, penalty_waybills = PayoutCalculator.calculate_tiered_daily(
+        filtered, config["tiers"], config.get("kpi_incentives", []),
+        config.get("special_rates", []), config.get("attendance_incentive", {}), currency_symbol,
+        penalty_df, penalty_rate
+    )
+    base_payout = total_payout - kpi_bonus - attendance_bonus + penalty_amount  # Add penalty back to get base
+
+    # Calculate advance payout BEFORE penalty deduction
     advance_payout_config = config.get("advance_payout", {})
     advance_payout_enabled = advance_payout_config.get("enabled", False)
     advance_payout_percentage = advance_payout_config.get("percentage", 0.0)
     advance_payout_desc = advance_payout_config.get("description", "Advance Payout")
     advance_payout = 0.0
+    payout_before_penalty = base_payout + kpi_bonus + attendance_bonus  # Calculate advance on this amount
     if advance_payout_enabled and advance_payout_percentage > 0:
-        advance_payout = round(total_payout * (advance_payout_percentage / 100.0), 2)
+        advance_payout = round(payout_before_penalty * (advance_payout_percentage / 100.0), 2)
 
-    col1, col2, col3, col4, col5 = st.columns(5)
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
     with col1:
         st.metric(label="Dispatcher", value=dispatcher_name)
     with col2:
@@ -954,9 +1091,23 @@ def main():
     with col3:
         st.metric(label="Base Payout", value=f"{currency_symbol}{base_payout:,.2f}")
     with col4:
-        st.metric(label="Total Payout", value=f"{currency_symbol}{total_payout:,.2f}")
+        if penalty_amount > 0:
+            # Format waybill numbers for display
+            if penalty_waybills:
+                waybill_display = ", ".join(penalty_waybills[:5])  # Show first 5 waybills
+                if len(penalty_waybills) > 5:
+                    waybill_display += f" ... (+{len(penalty_waybills) - 5} more)"
+                help_text = f"{penalty_count} parcel(s) × {currency_symbol}{penalty_rate:.2f}\n\nWaybill Numbers:\n{waybill_display}"
+            else:
+                help_text = f"{penalty_count} parcel(s) × {currency_symbol}{penalty_rate:.2f}"
+            st.metric(label="Penalty", value=f"-{currency_symbol}{penalty_amount:,.2f}", help=help_text)
+        else:
+            st.metric(label="Penalty", value=f"{currency_symbol}0.00")
     with col5:
-        st.metric(label=advance_payout_desc, value=f"{currency_symbol}{advance_payout:,.2f}", help=f"{advance_payout_percentage}% of Total Payout")
+        st.metric(label="Total Payout", value=f"{currency_symbol}{total_payout:,.2f}")
+    with col6:
+        st.metric(label=advance_payout_desc, value=f"{currency_symbol}{advance_payout:,.2f}",
+                 help=f"{advance_payout_percentage}% of Payout Before Penalty ({currency_symbol}{payout_before_penalty:,.2f})")
 
     if kpi_bonus > 0:
         st.success(f"🎯 **KPI Incentive Achieved!** +{currency_symbol}{kpi_bonus:,.2f} ({kpi_description})")
@@ -964,11 +1115,25 @@ def main():
         st.success(f"📅 **Attendance Incentive Achieved!** +{currency_symbol}{attendance_bonus:,.2f} ({attendance_desc})")
     else:
         st.info(f"📅 Attendance Progress: {attendance_desc}")
+    if penalty_amount > 0:
+        st.error(f"⚠️ **Penalty Applied:** -{currency_symbol}{penalty_amount:,.2f} ({penalty_count} parcel(s) × {currency_symbol}{penalty_rate:.2f})")
+        # Show waybill numbers in a table format for better continuity
+        with st.expander(f"📋 View All Penalty Waybill Numbers ({penalty_count} parcel(s))", expanded=False):
+            if penalty_waybills:
+                # Create a DataFrame for table display
+                waybill_df = pd.DataFrame({
+                    'Waybill Number': penalty_waybills,
+                    'Penalty Amount': [f"{currency_symbol}{penalty_rate:.2f}"] * len(penalty_waybills)
+                })
+                waybill_df.index = waybill_df.index + 1  # Start index from 1
+                st.dataframe(waybill_df, use_container_width=True, hide_index=False)
+            else:
+                st.info("No waybill numbers available")
 
     st.dataframe(display_df, use_container_width=True)
 
     with st.expander("📊 Payout Breakdown", expanded=False):
-        breakdown_col1, breakdown_col2, breakdown_col3, breakdown_col4, breakdown_col5 = st.columns(5)
+        breakdown_col1, breakdown_col2, breakdown_col3, breakdown_col4, breakdown_col5, breakdown_col6 = st.columns(6)
         with breakdown_col1:
             st.metric("Base Payout", f"{currency_symbol}{base_payout:,.2f}", help="Daily rate payouts")
         with breakdown_col2:
@@ -976,9 +1141,18 @@ def main():
         with breakdown_col3:
             st.metric("Attendance Bonus", f"{currency_symbol}{attendance_bonus:,.2f}", help=attendance_desc)
         with breakdown_col4:
-            st.metric("Total", f"{currency_symbol}{total_payout:,.2f}", help="Base + KPI + Attendance")
+            waybill_info = f"{penalty_count} parcel(s) × {currency_symbol}{penalty_rate:.2f}"
+            if penalty_waybills:
+                waybill_preview = ", ".join(penalty_waybills[:3])
+                if len(penalty_waybills) > 3:
+                    waybill_preview += f" (+{len(penalty_waybills) - 3} more)"
+                waybill_info += f"\nWaybills: {waybill_preview}"
+            st.metric("Penalty", f"-{currency_symbol}{penalty_amount:,.2f}", help=waybill_info)
         with breakdown_col5:
-            st.metric(advance_payout_desc, f"{currency_symbol}{advance_payout:,.2f}", help=f"{advance_payout_percentage}% of total payout")
+            st.metric("Total Payout", f"{currency_symbol}{total_payout:,.2f}", help="Base + KPI + Attendance - Penalty")
+        with breakdown_col6:
+            st.metric(advance_payout_desc, f"{currency_symbol}{advance_payout:,.2f}",
+                     help=f"{advance_payout_percentage}% of Payout Before Penalty ({currency_symbol}{payout_before_penalty:,.2f})")
 
     st.subheader("📊 Performance Visualization")
     charts = DataVisualizer.create_performance_charts(per_day, currency_symbol)
@@ -1050,7 +1224,7 @@ def main():
     invoice_html = InvoiceGenerator.build_invoice_html(
         display_df, base_payout, kpi_bonus, attendance_bonus, total_payout,
         kpi_description, attendance_desc, inv_name, inv_id, currency_symbol,
-        advance_payout, advance_payout_desc
+        advance_payout, advance_payout_desc, penalty_amount, penalty_count, penalty_rate, penalty_waybills
     )
 
     st.download_button(

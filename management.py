@@ -66,11 +66,12 @@ class Config:
         },
         "database": {"table_name": "dispatcher_raw_data"},
         "weight_tiers": [
-            {"min": 0, "max": 5, "rate": 1.50},
-            {"min": 5, "max": 10, "rate": 1.60},
-            {"min": 10, "max": 30, "rate": 2.70},
-            {"min": 30, "max": float('inf'), "rate": 4.00}
+            {"min": 0, "max": 5, "rate": 1.50},       # w <= 5
+            {"min": 5, "max": 10, "rate": 1.60},      # 5 < w <= 10
+            {"min": 10, "max": 30, "rate": 2.70},     # 10 < w <= 30
+            {"min": 30, "max": float('inf'), "rate": 4.00}  # w > 30
         ],
+        "pickup_fee": 17.50,
         "currency_symbol": "RM"
     }
 
@@ -149,7 +150,6 @@ class DataSource:
         if not url_or_id:
             return None, None
 
-        # Direct ID format
         if re.fullmatch(r"[A-Za-z0-9_-]{20,}", url_or_id):
             return url_or_id, None
 
@@ -157,14 +157,12 @@ class DataSource:
             parsed = urlparse(url_or_id)
             path_parts = [p for p in parsed.path.split('/') if p]
 
-            # Extract spreadsheet ID
             spreadsheet_id = None
             if 'spreadsheets' in path_parts and 'd' in path_parts:
                 idx = path_parts.index('d')
                 if idx + 1 < len(path_parts):
                     spreadsheet_id = path_parts[idx + 1]
 
-            # Extract GID
             query_gid = parse_qs(parsed.query).get('gid', [None])[0]
             frag_gid_match = re.search(r"gid=(\d+)", parsed.fragment or "")
             gid = query_gid or (frag_gid_match.group(1) if frag_gid_match else None)
@@ -214,6 +212,19 @@ class DataSource:
                 st.error(f"Error reading Google Sheet: {exc}")
         return None
 
+    @staticmethod
+    def load_penalty_data(config: dict, sheet_name: str = "Sheet2") -> Optional[pd.DataFrame]:
+        """Load penalty data from Sheet2 based on configuration."""
+        data_source = config["data_source"]
+
+        if data_source["type"] == "gsheet" and data_source["gsheet_url"]:
+            try:
+                return DataSource.read_google_sheet(data_source["gsheet_url"], sheet_name)
+            except Exception as exc:
+                st.warning(f"Could not load penalty data from {sheet_name}: {exc}")
+                return None
+        return None
+
 # =============================================================================
 # DATA PROCESSING
 # =============================================================================
@@ -252,10 +263,18 @@ class DataProcessor:
     def remove_duplicates(df: pd.DataFrame) -> pd.DataFrame:
         """Remove duplicate waybills and log count."""
         waybill_col = find_column(df, 'waybill')
+        date_col = find_column(df, 'date')
 
         if waybill_col:
             initial_count = len(df)
-            df_dedup = df.drop_duplicates(subset=[waybill_col])
+            df_to_dedup = df.copy()
+            if date_col and date_col in df_to_dedup.columns:
+                # Use latest record by delivery/signature date
+                df_to_dedup[date_col] = pd.to_datetime(df_to_dedup[date_col], errors='coerce')
+                df_to_dedup = df_to_dedup.sort_values(by=[date_col, waybill_col])
+                df_dedup = df_to_dedup.drop_duplicates(subset=[waybill_col], keep='last')
+            else:
+                df_dedup = df.drop_duplicates(subset=[waybill_col], keep='first')
             removed = initial_count - len(df_dedup)
             if removed > 0:
                 st.info(f"✅ Removed {removed} duplicate waybills")
@@ -279,15 +298,70 @@ class PayoutCalculator:
 
         w = 0.0 if pd.isna(weight) else float(weight)
 
-        for tier in sorted(tiers, key=lambda t: t['min']):
+        for idx, tier in enumerate(sorted(tiers, key=lambda t: t['min'])):
             tier_max = tier.get('max', float('inf'))
-            if tier['min'] <= w < tier_max:
+            is_first_tier = idx == 0
+            is_last_tier = idx == len(tiers) - 1
+
+            if is_first_tier:
+                if w <= tier_max:
+                    return tier['rate']
+                continue
+
+            if is_last_tier:
+                if w > tier['min']:
+                    return tier['rate']
+                continue
+
+            if (w > tier['min']) and (w <= tier_max):
                 return tier['rate']
 
         return tiers[-1]['rate']
 
     @staticmethod
-    def calculate_payout(df: pd.DataFrame, currency_symbol: str) -> Tuple[pd.DataFrame, pd.DataFrame, float]:
+    def calculate_penalty(dispatcher_id: str, penalty_df: Optional[pd.DataFrame], penalty_rate: float = 100.0) -> Tuple[float, int, List[str]]:
+        """
+        Calculate penalty for a dispatcher based on penalty data from Sheet2.
+
+        Returns: (penalty_amount, penalty_count, waybill_numbers)
+        """
+        if penalty_df is None or penalty_df.empty or not dispatcher_id:
+            return 0.0, 0, []
+
+        # Find 'RESPONSIBLE' column, case and space insensitive
+        responsible_col = None
+        for col in penalty_df.columns:
+            if col.strip().replace(' ', '').lower() == "responsible":
+                responsible_col = col
+                break
+        if responsible_col is None:
+            return 0.0, 0, []
+
+        # Find waybill column by keywords
+        waybill_keywords = ["运单号", "airway bill", "waybill number", "waybill", "airway"]
+        waybill_col = None
+        for col in penalty_df.columns:
+            col_clean = col.strip().lower()
+            if any(keyword in col_clean for keyword in waybill_keywords):
+                waybill_col = col
+                break
+
+        dispatcher_id_clean = str(dispatcher_id).strip().lower()
+        responsible_series = penalty_df[responsible_col].astype(str).str.strip().str.lower()
+
+        penalty_records = penalty_df[responsible_series == dispatcher_id_clean]
+        penalty_count = len(penalty_records)
+        penalty_amount = penalty_count * penalty_rate
+
+        waybill_numbers = []
+        if waybill_col and penalty_count > 0:
+            waybill_series = penalty_records[waybill_col].astype(str).str.strip()
+            waybill_numbers = [wb for wb in waybill_series if wb and wb.lower() != 'nan']
+
+        return float(penalty_amount), penalty_count, waybill_numbers
+
+    @staticmethod
+    def calculate_payout(df: pd.DataFrame, currency_symbol: str, penalty_df: Optional[pd.DataFrame] = None, penalty_rate: float = 100.0, pickup_fee: float = 0.0) -> Tuple[pd.DataFrame, pd.DataFrame, float]:
         """Calculate payout using tier-based weight calculation."""
         # Prepare data
         df_clean = DataProcessor.prepare_dataframe(df)
@@ -304,15 +378,35 @@ class PayoutCalculator:
         )
         df_clean['payout'] = df_clean['payout_rate']
 
-        # Deduplicate by dispatcher & waybill
+        # Deduplicate by dispatcher & waybill (keep latest by date when available)
         waybill_col = find_column(df_clean, 'waybill') or 'waybill'
-        df_unique = df_clean.drop_duplicates(subset=['dispatcher_id', waybill_col], keep='first')
+        date_col = find_column(df_clean, 'date')
+        df_for_unique = df_clean.copy()
+        if date_col and date_col in df_for_unique.columns:
+            df_for_unique[date_col] = pd.to_datetime(df_for_unique[date_col], errors='coerce')
+            df_for_unique = df_for_unique.sort_values(by=[date_col, 'dispatcher_id', waybill_col])
+            df_unique = df_for_unique.drop_duplicates(subset=['dispatcher_id', waybill_col], keep='last')
+        else:
+            df_unique = df_clean.drop_duplicates(subset=['dispatcher_id', waybill_col], keep='first')
 
         # Diagnostics
         raw_weight = df_clean['weight'].sum()
         dedup_weight = df_unique['weight'].sum()
         duplicates = len(df_clean) - len(df_unique)
-        st.info(f"Weight totals — Raw: {raw_weight:,.2f} kg | Deduplicated: {dedup_weight:,.2f} kg | Duplicate rows: {duplicates}")
+        st.info(f"Weight totals – Raw: {raw_weight:,.2f} kg | Deduplicated: {dedup_weight:,.2f} kg | Duplicate rows: {duplicates}")
+
+        # 🆕 ADD TIER COLUMNS TO df_unique for groupby aggregation
+        # Derive tier buckets directly from payout_rate to ensure exact consistency
+        tiers = Config.load().get("weight_tiers", Config.DEFAULT_CONFIG["weight_tiers"])
+        rate_tier1 = next(t['rate'] for t in tiers if t['min'] == 0)
+        rate_tier2 = next(t['rate'] for t in tiers if t['min'] == 5)
+        rate_tier3 = next(t['rate'] for t in tiers if t['min'] == 10)
+        rate_tier4 = next(t['rate'] for t in tiers if t['min'] == 30)
+
+        df_unique['tier1_count'] = (df_unique['payout_rate'] == rate_tier1).astype(int)
+        df_unique['tier2_count'] = (df_unique['payout_rate'] == rate_tier2).astype(int)
+        df_unique['tier3_count'] = (df_unique['payout_rate'] == rate_tier3).astype(int)
+        df_unique['tier4_count'] = (df_unique['payout_rate'] == rate_tier4).astype(int)
 
         # Group by dispatcher
         grouped = df_unique.groupby('dispatcher_id').agg(
@@ -320,10 +414,51 @@ class PayoutCalculator:
             parcel_count=(waybill_col, 'nunique'),
             total_weight=('weight', 'sum'),
             avg_weight=('weight', 'mean'),
-            total_payout=('payout', 'sum')
+            total_payout=('payout', 'sum'),
+            # 🆕 ADD TIER COUNTS
+            tier1_parcels=('tier1_count', 'sum'),
+            tier2_parcels=('tier2_count', 'sum'),
+            tier3_parcels=('tier3_count', 'sum'),
+            tier4_parcels=('tier4_count', 'sum')
         ).reset_index()
 
+        # Recompute total payout from tier counts to ensure exact consistency with DELIVERY(RM)
+        tiers = Config.load().get("weight_tiers", Config.DEFAULT_CONFIG["weight_tiers"])
+        tier_rates = [
+            next(t['rate'] for t in tiers if t['min'] == 0),
+            next(t['rate'] for t in tiers if t['min'] == 5),
+            next(t['rate'] for t in tiers if t['min'] == 10),
+            next(t['rate'] for t in tiers if t['min'] == 30),
+        ]
+
+        grouped['total_payout'] = (
+            grouped['tier1_parcels'] * tier_rates[0]
+            + grouped['tier2_parcels'] * tier_rates[1]
+            + grouped['tier3_parcels'] * tier_rates[2]
+            + grouped['tier4_parcels'] * tier_rates[3]
+        )
+
         grouped['avg_rate'] = grouped['total_payout'] / grouped['parcel_count']
+
+        # Calculate penalties for each dispatcher
+        grouped['penalty_amount'] = 0.0
+        grouped['penalty_count'] = 0
+        grouped['penalty_waybills'] = ''
+
+        if penalty_df is not None and not penalty_df.empty:
+            for i, row in grouped.iterrows():
+                dispatcher_id = row['dispatcher_id']  # <-- Use dispatcher_id from the row!
+                penalty_amount, penalty_count, penalty_waybills = PayoutCalculator.calculate_penalty(
+                    str(dispatcher_id), penalty_df, penalty_rate
+                )
+                grouped.at[i, 'penalty_amount'] = penalty_amount
+                grouped.at[i, 'penalty_count'] = penalty_count
+                grouped.at[i, 'penalty_waybills'] = ', '.join(penalty_waybills) if penalty_waybills else ''
+                # Deduct penalty from total payout
+                grouped.at[i, 'total_payout'] = row['total_payout'] - penalty_amount
+
+        # Add pickup fee to each dispatcher if desired (for global only, don't add per dispatcher)
+        # grouped['total_payout'] = grouped['total_payout'] + pickup_fee
 
         # Create display and numeric dataframes
         numeric_df = grouped.rename(columns={
@@ -333,7 +468,14 @@ class PayoutCalculator:
             "total_weight": "Total Weight (kg)",
             "avg_weight": "Avg Weight (kg)",
             "avg_rate": "Avg Rate per Parcel",
-            "total_payout": "Total Payout"
+            "total_payout": "Total Payout",
+            "penalty_amount": "Penalty",
+            "penalty_count": "Penalty Parcels",
+            "penalty_waybills": "Penalty Waybills",
+            "tier1_parcels": "Parcels 0-5kg",
+            "tier2_parcels": "Parcels 5.01-10kg",
+            "tier3_parcels": "Parcels 10.01-30kg",
+            "tier4_parcels": "Parcels 30+kg"
         }).sort_values(by="Total Payout", ascending=False)
 
         display_df = numeric_df.copy()
@@ -341,11 +483,17 @@ class PayoutCalculator:
         display_df["Avg Weight (kg)"] = display_df["Avg Weight (kg)"].apply(lambda x: f"{x:.2f}")
         display_df["Avg Rate per Parcel"] = display_df["Avg Rate per Parcel"].apply(lambda x: f"{currency_symbol}{x:.2f}")
         display_df["Total Payout"] = display_df["Total Payout"].apply(lambda x: f"{currency_symbol}{x:,.2f}")
+        display_df["Penalty"] = display_df["Penalty"].apply(lambda x: f"-{currency_symbol}{x:,.2f}" if x > 0 else f"{currency_symbol}0.00")
 
-        total_payout = numeric_df["Total Payout"].sum()
+        # Remove Penalty Waybills and Penalty Parcels from display (keep in numeric_df for details section)
+        if "Penalty Waybills" in display_df.columns:
+            display_df = display_df.drop(columns=["Penalty Waybills"])
+        if "Penalty Parcels" in display_df.columns:
+            display_df = display_df.drop(columns=["Penalty Parcels"])
 
+        total_payout = numeric_df["Total Payout"].sum() + pickup_fee  # <-- Inclusive of pickup_fee
         st.success(f"✅ Processed {len(df_unique)} unique parcels from {len(grouped)} dispatchers")
-        st.info(f"💰 Total Payout: {currency_symbol} {total_payout:,.2f}")
+        st.info(f"💰 Total Payout: {currency_symbol} {total_payout:,.2f} (inclusive of pickup fee: {currency_symbol} {pickup_fee:,.2f})")
 
         return display_df, numeric_df, total_payout
 
@@ -353,14 +501,12 @@ class PayoutCalculator:
     def get_daily_trend(df: pd.DataFrame) -> pd.DataFrame:
         """Get daily parcel delivery trend."""
         date_col = find_column(df, 'date')
-
         if date_col:
             df_copy = df.copy()
             df_copy[date_col] = pd.to_datetime(df_copy[date_col], errors="coerce")
             daily_df = df_copy.groupby(df_copy[date_col].dt.date).size().reset_index(name='total_parcels')
             daily_df = daily_df.rename(columns={date_col: 'signature_date'})
             return daily_df.sort_values('signature_date')
-
         return pd.DataFrame()
 
 # =============================================================================
@@ -434,18 +580,19 @@ class InvoiceGenerator:
 
     @staticmethod
     def build_invoice_html(display_df: pd.DataFrame, numeric_df: pd.DataFrame,
-                          total_payout: float, currency_symbol: str) -> str:
+                          total_payout: float, currency_symbol: str,
+                          penalty_rate: float = 100.0, pickup_fee: float = 0.0) -> str:
         """Build management summary invoice HTML with original layout."""
         try:
             total_parcels = int(numeric_df["Parcels Delivered"].sum())
             total_dispatchers = len(numeric_df)
             total_weight = numeric_df["Total Weight (kg)"].sum()
+            total_penalty = numeric_df["Penalty"].sum()
             top_3 = display_df.head(3)
 
             table_columns = ["Dispatcher ID", "Dispatcher Name", "Parcels Delivered",
-                           "Total Payout", "Total Weight (kg)"]
+                           "Total Payout", "Penalty", "Total Weight (kg)"]
 
-            # Build HTML with original styling
             html = f"""
             <html>
             <head>
@@ -595,30 +742,8 @@ class InvoiceGenerator:
                             <div class="idline">Period: {(datetime.now().replace(day=1) - pd.Timedelta(days=1)).strftime('%B %Y')}</div>
                         </div>
                         <div class="total-badge">
-                            <div class="label">Total Payout</div>
+                            <div class="label">Total Payout (Inclusive)</div>
                             <div class="value">{currency_symbol} {total_payout:,.2f}</div>
-                        </div>
-                    </div>
-
-                    <div class="tier-info">
-                        <h3>Weight-Based Payout Tiers</h3>
-                        <div class="tier-grid">
-                            <div class="tier-item">
-                                <div class="range">0 - 5 kg</div>
-                                <div class="rate">{currency_symbol}1.50 per parcel</div>
-                            </div>
-                            <div class="tier-item">
-                                <div class="range">5 - 10 kg</div>
-                                <div class="rate">{currency_symbol}1.60 per parcel</div>
-                            </div>
-                            <div class="tier-item">
-                                <div class="range">10 - 30 kg</div>
-                                <div class="rate">{currency_symbol}2.70 per parcel</div>
-                            </div>
-                            <div class="tier-item">
-                                <div class="range">30+ kg</div>
-                                <div class="rate">{currency_symbol}4.00 per parcel</div>
-                            </div>
                         </div>
                     </div>
 
@@ -635,17 +760,22 @@ class InvoiceGenerator:
                             <div class="label">Total Weight</div>
                             <div class="value">{total_weight:,.2f} kg</div>
                         </div>
+                        <div class="chip">
+                            <div class="label">Total Penalty</div>
+                            <div class="value">-{currency_symbol} {total_penalty:,.2f}</div>
+                        </div>
+                        <div class="chip">
+                            <div class="label">Pickup Fee</div>
+                            <div class="value">{currency_symbol} {pickup_fee:,.2f}</div>
+                        </div>
                     </div>
 
                     <table>
                         <thead><tr>"""
-
-            # Add table headers
             for col in table_columns:
                 html += f"<th>{col}</th>"
             html += "</tr></thead><tbody>"
 
-            # Add table rows
             for _, row in display_df.iterrows():
                 html += "<tr>"
                 for col in table_columns:
@@ -653,30 +783,16 @@ class InvoiceGenerator:
                 html += "</tr>"
 
             html += "</tbody></table>"
-
-            # Add top performers section
-            if len(top_3) > 0:
-                html += """
-                    <div class="top-performers">
-                        <h3>Top Performers</h3>
-                        <div class="performers-grid">
-                """
-
-                for idx, row in top_3.iterrows():
-                    html += f"""
-                        <div class="performer-card">
-                            <div class="name">{row['Dispatcher Name']}</div>
-                            <div class="stats">
-                                <div>{row['Parcels Delivered']} parcels</div>
-                                <div>{row['Total Weight (kg)']} kg total</div>
-                                <div>{row['Total Payout']}</div>
-                            </div>
-                        </div>
-                    """
-
-                html += "</div></div>"
-
             html += f"""
+                    <div style="margin-top:3rem">
+                        <table style="width:100%; background:var(--surface); border-radius:8px; margin-top:2rem; border:1px solid var(--border)">
+                            <tr><th style="background:var(--primary);color:white;text-align:left;">Summary</th><th style="background:var(--primary);color:white;text-align:right;">Amount</th></tr>
+                            <tr><td>Total Base Payout</td><td style="text-align:right;">{currency_symbol} {total_payout+total_penalty-pickup_fee:,.2f}</td></tr>
+                            <tr><td>Total Penalty</td><td style="text-align:right;">-{currency_symbol} {total_penalty:,.2f}</td></tr>
+                            <tr><td>Pickup Fee</td><td style="text-align:right;">{currency_symbol} {pickup_fee:,.2f}</td></tr>
+                            <tr><td><strong>Total Payout</strong></td><td style="text-align:right;"><strong>{currency_symbol} {total_payout:,.2f}</strong></td></tr>
+                        </table>
+                    </div>
                     <div class="note">
                         Generated on {datetime.now().strftime('%Y-%m-%d at %H:%M')} • JMR Management Dashboard<br>
                         <em>Payout calculated using tier-based weight system</em>
@@ -739,6 +855,8 @@ def main():
 
     # Load config and data
     config = Config.load()
+    pickup_fee = config.get("pickup_fee", 0.0)
+
     with st.spinner("📄 Loading data from Google Sheets..."):
         df = DataSource.load_data(config)
 
@@ -747,9 +865,8 @@ def main():
         add_footer()
         return
 
-    # Sidebar
     st.sidebar.header("⚙️ Configuration")
-    st.sidebar.info("**💰 Weight-Based Payout:**\n- 0-5kg: RM1.50\n- 5-10kg: RM1.60\n- 10-30kg: RM2.70\n- 30kg+: RM4.00")
+    st.sidebar.info("**💰 Weight-Based Payout:**\n- 0-5kg: RM1.50\n- 5-10kg: RM1.60\n- 10-30kg: RM2.70\n- 30kg+: RM4.00\n\n**Pickup Fee:**\n- RM{:.2f}".format(pickup_fee))
 
     # Date filter
     date_col = find_column(df, 'date')
@@ -764,7 +881,11 @@ def main():
 
     # Calculate payouts
     currency = config.get("currency_symbol", "RM")
-    display_df, numeric_df, total_payout = PayoutCalculator.calculate_payout(df, currency)
+
+    penalty_df = DataSource.load_penalty_data(config, "Sheet2")
+    penalty_rate = config.get("penalty_rate", 100.0)  # Default RM100 per parcel
+
+    display_df, numeric_df, total_payout = PayoutCalculator.calculate_payout(df, currency, penalty_df, penalty_rate, pickup_fee)
 
     if numeric_df.empty:
         st.warning("No data after filtering.")
@@ -773,13 +894,16 @@ def main():
 
     # Metrics
     st.subheader("📈 Performance Overview")
-    col1, col2, col3, col4, col5, col6 = st.columns(6)
+    col1, col2, col3, col4 = st.columns(4)
+    col5, col6, col7, col8 = st.columns(4)
     col1.metric("Dispatchers", f"{len(display_df):,}")
     col2.metric("Parcels", f"{int(numeric_df['Parcels Delivered'].sum()):,}")
     col3.metric("Total Weight", f"{numeric_df['Total Weight (kg)'].sum():,.2f} kg")
     col4.metric("Total Payout", f"{currency} {total_payout:,.2f}")
-    col5.metric("Avg Weight", f"{numeric_df['Avg Weight (kg)'].mean():.2f} kg")
-    col6.metric("Avg Payout", f"{currency} {total_payout/len(numeric_df):.2f}")
+    col5.metric("Total Penalty", f"-{currency} {numeric_df['Penalty'].sum():,.2f}")
+    col6.metric("Avg Weight", f"{numeric_df['Avg Weight (kg)'].mean():.2f} kg")
+    col7.metric("Avg Payout", f"{currency} {total_payout/len(numeric_df):.2f}")
+    col8.metric("Pickup Fee", f"{currency} {pickup_fee:,.2f}")
 
     # Charts
     st.markdown("---")
@@ -814,10 +938,34 @@ def main():
     st.subheader("👥 Dispatcher Performance Details")
     st.dataframe(display_df, use_container_width=True, hide_index=True)
 
-    # Invoice generation
+    if 'Penalty Parcels' in numeric_df.columns and numeric_df['Penalty Parcels'].sum() > 0:
+        st.markdown("---")
+        st.subheader("⚠️ Penalty Details")
+
+        # Build flat penalty details (one row per penalized waybill)
+        penalty_rows = []
+        penalty_dispatchers = numeric_df[numeric_df['Penalty Parcels'] > 0]
+        for _, row in penalty_dispatchers.iterrows():
+            dispatcher_id = row['Dispatcher ID']
+            dispatcher_name = row['Dispatcher Name']
+            waybills_str = row.get('Penalty Waybills', '')
+            waybills_list = [w.strip() for w in waybills_str.split(',') if w.strip()] if waybills_str else []
+            for waybill_number in waybills_list:
+                penalty_rows.append({
+                    'Dispatcher ID': dispatcher_id,
+                    'Dispatcher Name': dispatcher_name,
+                    'Waybill Number': waybill_number,
+                    'Penalty Amount': f"{currency}{penalty_rate:.2f}"
+                })
+
+        if penalty_rows:
+            penalty_table = pd.DataFrame(penalty_rows)
+            st.dataframe(penalty_table, use_container_width=True, hide_index=True)
+        else:
+            st.info("No penalty waybill numbers available")
     st.markdown("---")
     st.subheader("📄 Invoice Generation")
-    invoice_html = InvoiceGenerator.build_invoice_html(display_df, numeric_df, total_payout, currency)
+    invoice_html = InvoiceGenerator.build_invoice_html(display_df, numeric_df, total_payout, currency, penalty_rate, pickup_fee)
     st.download_button(
         label="📥 Download Invoice (HTML)",
         data=invoice_html.encode("utf-8"),
@@ -825,7 +973,6 @@ def main():
         mime="text/html"
     )
 
-    # Export options
     st.markdown("---")
     st.subheader("📥 Export Data")
     col1, col2 = st.columns(2)
