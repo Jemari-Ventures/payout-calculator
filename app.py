@@ -1013,6 +1013,19 @@ def main():
         add_footer()
         return
 
+    # Restrict to current month's data
+    df["Delivery Signature"] = pd.to_datetime(df["Delivery Signature"], errors="coerce")
+    current_period = pd.Timestamp(datetime.now().date()).to_period("M")
+    monthly_mask = df["Delivery Signature"].dt.to_period("M") == current_period
+    df = df[monthly_mask].copy()
+
+    if df.empty:
+        st.warning("No records found for the current month. Please update the data source.")
+        add_footer()
+        return
+
+    st.caption(f"Showing deliveries for {datetime.now():%B %Y}.")
+
     st.subheader("👤 Dispatcher Selection")
     dispatcher_mapping = {}
     for candidate_col in ["Dispatcher Name", "Name", "Rider Name"]:

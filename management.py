@@ -869,15 +869,52 @@ def main():
     st.sidebar.info("**💰 Weight-Based Payout:**\n- 0-5kg: RM1.50\n- 5-10kg: RM1.60\n- 10-30kg: RM2.70\n- 30kg+: RM4.00\n\n**Pickup Fee:**\n- RM{:.2f}".format(pickup_fee))
 
     # Date filter
-    date_col = find_column(df, 'date')
-    if date_col:
-        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-        min_date, max_date = df[date_col].min().date(), df[date_col].max().date()
-        date_range = st.sidebar.date_input("Select Date Range", value=(min_date, max_date),
-                                          min_value=min_date, max_value=max_date)
-        if len(date_range) == 2:
-            start_date, end_date = date_range
-            df = df[(df[date_col].dt.date >= start_date) & (df[date_col].dt.date <= end_date)]
+    auto_date_col = find_column(df, 'date')
+    date_candidates = {
+        col for col in df.columns
+        if any(keyword in str(col).lower() for keyword in ["date", "signature", "scan"])
+    }
+    if auto_date_col:
+        date_candidates.add(auto_date_col)
+    date_candidates = sorted(date_candidates)
+    date_options = ["-- None --"] + date_candidates
+    default_index = date_options.index(auto_date_col) if auto_date_col and auto_date_col in date_options else 0
+    selected_date_col = st.sidebar.selectbox(
+        "Date Column",
+        date_options,
+        index=default_index,
+        help="Choose which column should be used for date filtering."
+    )
+
+    if selected_date_col != "-- None --":
+        df[selected_date_col] = pd.to_datetime(df[selected_date_col], errors="coerce")
+        valid_dates = df[selected_date_col].dropna()
+        if not valid_dates.empty:
+            min_date, max_date = valid_dates.min().date(), valid_dates.max().date()
+            default_start = max(min_date, max_date.replace(day=1))
+            selected_range = st.sidebar.date_input(
+                "Select Date Range",
+                value=(default_start, max_date),
+                min_value=min_date,
+                max_value=max_date
+            )
+
+            if isinstance(selected_range, tuple) and len(selected_range) == 2:
+                start_date, end_date = selected_range
+            else:
+                start_date = end_date = selected_range
+
+            df = df[
+                (df[selected_date_col].dt.date >= start_date) &
+                (df[selected_date_col].dt.date <= end_date)
+            ]
+
+            if df.empty:
+                st.warning("No records found for the selected date range.")
+                add_footer()
+                return
+        else:
+            st.sidebar.warning("Selected date column has no valid date values; showing all data.")
 
     # Calculate payouts
     currency = config.get("currency_symbol", "RM")
