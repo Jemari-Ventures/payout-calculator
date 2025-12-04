@@ -1,43 +1,91 @@
 {
-    "data_source": {
-      "type": "gsheet",
-      "gsheet_url": "https://docs.google.com/spreadsheets/d/1BR4IZAIeabTuX6kPdUkRoAfY1mnFlmF5/edit?gid=855591540#gid=855591540",
-      "sheet_name": null
+  "data_source": {
+    "type": "gsheet",
+    "gsheet_url": "https://docs.google.com/spreadsheets/d/1f-oIqIapeGqq4IROyrJ3Gi37smfDzUgz/edit?gid=1989473758#gid=1989473758",
+    "sheet_name": null,
+    "postgres_table": "dispatcher",
+    "penalty_table": "penalty"
+  },
+  "database": {
+    "table_name": "dispatcher"
+  },
+  "currency_symbol": "RM",
+  "pickup_fee": 17.5,
+  "payout_rate": 1.5,
+  "penalty_rate": 100.0,
+  "tiers": [
+    {
+      "Tier": "Tier 3",
+      "Min Parcels": 0,
+      "Max Parcels": 60,
+      "Rate (RM)": 0.95
     },
-    "database": {
-      "table_name": "dispatcher_raw_data"
+    {
+      "Tier": "Tier 2",
+      "Min Parcels": 61,
+      "Max Parcels": 120,
+      "Rate (RM)": 1.0
     },
-    "currency_symbol": "RM",
-    "pickup_fee": 17.50,
-    "payout_rate": 1.5,
-    "tiers": [
-      {"Tier": "Tier 3", "Min Parcels": 0, "Max Parcels": 60, "Rate (RM)": 0.95},
-      {"Tier": "Tier 2", "Min Parcels": 61, "Max Parcels": 120, "Rate (RM)": 1.00},
-      {"Tier": "Tier 1", "Min Parcels": 121, "Max Parcels": null, "Rate (RM)": 1.10}
-    ],
-    "kpi_incentives": [
-      {"parcels": 3000, "bonus": 100.00, "description": "3000 Parcel/month"},
-      {"parcels": 4000, "bonus": 150.00, "description": "4000 Parcel/month"}
-    ],
-      "special_rates": [
-        {
-          "start_date": "2025-10-10",
-          "end_date": "2025-10-15",
-          "rate": 1.15,
-          "description": "October Sale Week",
-          "min_parcels": 160
-        }
-      ],
-    "attendance_incentive": {
-        "enabled": true,
-        "required_days": 26,
-        "min_parcels_per_day": 30,
-        "bonus": 100.00,
-        "description": "26 Days Attendance Bonus"
-    },
-    "advance_payout": {
-        "enabled": true,
-        "percentage": 40.0,
-        "description": "Advance Payout"
+    {
+      "Tier": "Tier 1",
+      "Min Parcels": 121,
+      "Max Parcels": null,
+      "Rate (RM)": 1.1
     }
+  ],
+  "kpi_incentives": [
+    {
+      "parcels": 3000,
+      "bonus": 100.0,
+      "description": "3000 Parcel/month"
+    },
+    {
+      "parcels": 4000,
+      "bonus": 150.0,
+      "description": "4000 Parcel/month"
+    }
+  ],
+  "special_rates": [
+    {
+      "start_date": "2025-10-10",
+      "end_date": "2025-10-15",
+      "rate": 1.15,
+      "description": "October Sale Week",
+      "min_parcels": 160
+    }
+  ],
+  "attendance_incentive": {
+    "enabled": true,
+    "required_days": 26,
+    "min_parcels_per_day": 30,
+    "bonus": 100.0,
+    "description": "26 Days Attendance Bonus"
+  },
+  "advance_payout": {
+    "enabled": true,
+    "percentage": 40.0,
+    "description": "Advance Payout"
+  },
+  "weight_tiers": [
+    {
+      "min": 0,
+      "max": 5,
+      "rate": 1.5
+    },
+    {
+      "min": 5,
+      "max": 10,
+      "rate": 1.6
+    },
+    {
+      "min": 10,
+      "max": 30,
+      "rate": 2.7
+    },
+    {
+      "min": 30,
+      "max": 999999,
+      "rate": 4.0
+    }
+  ]
 }
