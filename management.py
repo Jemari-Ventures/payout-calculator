@@ -14,6 +14,7 @@ import pandas as pd
 import streamlit as st
 import altair as alt
 import requests
+from sqlalchemy import create_engine
 
 # =============================================================================
 # CONSTANTS
@@ -42,7 +43,7 @@ class ColorScheme:
 # Centralized column mappings
 COLUMN_MAPPINGS = {
     'waybill': ['Waybill Number', 'Waybill', 'waybill_number', 'waybill'],
-    'date': ['Delivery Signature', 'Delivery Date', 'Date', 'signature_date', 'delivery_date'],
+    'date': ['Delivery Signature', 'Delivery Date', 'Date', 'signature_date', 'delivery_date', 'delivery_signature'],
     'dispatcher_id': ['Dispatcher ID', 'Dispatcher Id', 'dispatcher_id'],
     'dispatcher_name': ['Dispatcher Name', 'Dispatcher', 'dispatcher_name'],
     'weight': ['Billing Weight', 'Weight', 'weight', 'billing_weight']
@@ -61,18 +62,21 @@ class Config:
     DEFAULT_CONFIG = {
         "data_source": {
             "type": "gsheet",
-            "gsheet_url": "https://docs.google.com/spreadsheets/d/1Ivm-ORxdAyG3g-z0ZJuea6eXu0Smvzcf/edit?gid=1939981789#gid=1939981789",
-            "sheet_name": None
+            "gsheet_url": "https://docs.google.com/spreadsheets/d/1f-oIqIapeGqq4IROyrJ3Gi37smfDzUgz/edit?gid=1989473758#gid=1989473758",
+            "sheet_name": None,
+            "postgres_table": "dispatcher",
+            "penalty_table": "penalty"
         },
-        "database": {"table_name": "dispatcher_raw_data"},
+        "database": {"table_name": "dispatcher"},
         "weight_tiers": [
-            {"min": 0, "max": 5, "rate": 1.50},       # w <= 5
-            {"min": 5, "max": 10, "rate": 1.60},      # 5 < w <= 10
-            {"min": 10, "max": 30, "rate": 2.70},     # 10 < w <= 30
-            {"min": 30, "max": float('inf'), "rate": 4.00}  # w > 30
+            {"min": 0, "max": 5, "rate": 1.50},
+            {"min": 5, "max": 10, "rate": 1.60},
+            {"min": 10, "max": 30, "rate": 2.70},
+            {"min": 30, "max": float('inf'), "rate": 4.00}
         ],
         "pickup_fee": 17.50,
-        "currency_symbol": "RM"
+        "currency_symbol": "RM",
+        "penalty_rate": 100.0
     }
 
     _cache = None
@@ -86,7 +90,15 @@ class Config:
         if os.path.exists(cls.CONFIG_FILE):
             try:
                 with open(cls.CONFIG_FILE, 'r') as f:
-                    cls._cache = json.load(f)
+                    config = json.load(f)
+                    # Ensure new fields exist
+                    if "postgres_table" not in config.get("data_source", {}):
+                        config["data_source"]["postgres_table"] = "dispatcher"
+                    if "penalty_table" not in config.get("data_source", {}):
+                        config["data_source"]["penalty_table"] = "penalty"
+                    if "penalty_rate" not in config:
+                        config["penalty_rate"] = 100.0
+                    cls._cache = config
                     return cls._cache
             except Exception as e:
                 st.error(f"Error loading config: {e}")
@@ -142,7 +154,64 @@ def normalize_weight(series: pd.Series) -> pd.Series:
 # =============================================================================
 
 class DataSource:
-    """Handle data loading from Google Sheets."""
+    """Handle data loading from Google Sheets and PostgreSQL."""
+
+    @staticmethod
+    def _get_postgres_connection():
+        """Get PostgreSQL connection from Streamlit secrets."""
+        try:
+            if "postgres" in st.secrets and "connection_string" in st.secrets["postgres"]:
+                return st.secrets["postgres"]["connection_string"]
+            else:
+                st.error("PostgreSQL connection string not found in secrets.toml")
+                return None
+        except Exception as e:
+            st.error(f"Error reading PostgreSQL secrets: {e}")
+            return None
+
+    @staticmethod
+    @st.cache_resource
+    def get_postgres_engine():
+        """Create and cache PostgreSQL engine."""
+        conn_str = DataSource._get_postgres_connection()
+        if conn_str:
+            try:
+                engine = create_engine(conn_str)
+                return engine
+            except Exception as e:
+                st.error(f"Error creating PostgreSQL engine: {e}")
+                return None
+        return None
+
+    @staticmethod
+    @st.cache_data(ttl=300)
+    def read_postgres_table(_engine, table_name: str) -> pd.DataFrame:
+        """Read data from PostgreSQL table with column mapping."""
+        try:
+            query = f"SELECT * FROM {table_name}"
+            df = pd.read_sql(query, _engine)
+
+            # Map database columns to expected application columns
+            column_mapping = {
+                'waybill': 'Waybill Number',
+                'delivery_signature': 'Delivery Signature',
+                'dispatcher_id': 'Dispatcher ID',
+                'dispatcher_name': 'Dispatcher Name',
+                'billing_weight': 'Billing Weight',
+                'date_|_pick_up': 'Pick Up Date',
+                'pick_up_dp': 'Pick Up DP',
+                'pick_up_dispatcher_id': 'Pick Up Dispatcher ID',
+                'pick_up_dispatcher_name': 'Pick Up Dispatcher Name'
+            }
+
+            # Rename columns that exist in the dataframe
+            rename_dict = {old: new for old, new in column_mapping.items() if old in df.columns}
+            df = df.rename(columns=rename_dict)
+
+            return df
+        except Exception as e:
+            st.error(f"Error reading from PostgreSQL table '{table_name}': {e}")
+            raise
 
     @staticmethod
     def _extract_gsheet_id_and_gid(url_or_id: str) -> Tuple[Optional[str], Optional[str]]:
@@ -202,7 +271,31 @@ class DataSource:
     def load_data(config: dict) -> Optional[pd.DataFrame]:
         """Load data based on configuration."""
         data_source = config["data_source"]
-        if data_source["type"] == "gsheet" and data_source["gsheet_url"]:
+
+        if data_source["type"] == "postgres":
+            engine = DataSource.get_postgres_engine()
+            if engine:
+                try:
+                    table_name = data_source.get("postgres_table", "dispatcher")
+                    df = DataSource.read_postgres_table(engine, table_name)
+
+                    # Verify required columns exist after mapping
+                    required = ["Dispatcher ID", "Waybill Number", "Delivery Signature"]
+                    missing = [col for col in required if col not in df.columns]
+                    if missing:
+                        st.error(f"Missing required columns after mapping: {', '.join(missing)}")
+                        st.info("Available columns: " + ", ".join(df.columns.tolist()))
+                        return None
+
+                    return df
+                except Exception as exc:
+                    st.error(f"Error reading from PostgreSQL: {exc}")
+                    return None
+            else:
+                st.error("PostgreSQL engine not available")
+                return None
+
+        elif data_source["type"] == "gsheet" and data_source["gsheet_url"]:
             try:
                 return DataSource.read_google_sheet(
                     data_source["gsheet_url"],
@@ -214,10 +307,33 @@ class DataSource:
 
     @staticmethod
     def load_penalty_data(config: dict, sheet_name: str = "Sheet2") -> Optional[pd.DataFrame]:
-        """Load penalty data from Sheet2 based on configuration."""
+        """Load penalty data from penalty table or Sheet2 based on configuration."""
         data_source = config["data_source"]
 
-        if data_source["type"] == "gsheet" and data_source["gsheet_url"]:
+        if data_source["type"] == "postgres":
+            engine = DataSource.get_postgres_engine()
+            if engine:
+                try:
+                    penalty_table = data_source.get("penalty_table", "penalty")
+                    df = DataSource.read_postgres_table(engine, penalty_table)
+
+                    # Map penalty table columns
+                    penalty_mapping = {
+                        'waybill': 'Waybill Number',
+                        'responsible': 'RESPONSIBLE',
+                        'penalty_amount_actual': 'Penalty Amount'
+                    }
+
+                    rename_dict = {old: new for old, new in penalty_mapping.items() if old in df.columns}
+                    df = df.rename(columns=rename_dict)
+
+                    return df
+                except Exception as exc:
+                    st.warning(f"Could not load penalty data from PostgreSQL table '{penalty_table}': {exc}")
+                    return None
+            return None
+
+        elif data_source["type"] == "gsheet" and data_source["gsheet_url"]:
             try:
                 return DataSource.read_google_sheet(data_source["gsheet_url"], sheet_name)
             except Exception as exc:
@@ -269,7 +385,6 @@ class DataProcessor:
             initial_count = len(df)
             df_to_dedup = df.copy()
             if date_col and date_col in df_to_dedup.columns:
-                # Use latest record by delivery/signature date
                 df_to_dedup[date_col] = pd.to_datetime(df_to_dedup[date_col], errors='coerce')
                 df_to_dedup = df_to_dedup.sort_values(by=[date_col, waybill_col])
                 df_dedup = df_to_dedup.drop_duplicates(subset=[waybill_col], keep='last')
@@ -321,28 +436,26 @@ class PayoutCalculator:
     @staticmethod
     def calculate_penalty(dispatcher_id: str, penalty_df: Optional[pd.DataFrame], penalty_rate: float = 100.0) -> Tuple[float, int, List[str]]:
         """
-        Calculate penalty for a dispatcher based on penalty data from Sheet2.
+        Calculate penalty for a dispatcher based on penalty data.
 
         Returns: (penalty_amount, penalty_count, waybill_numbers)
         """
         if penalty_df is None or penalty_df.empty or not dispatcher_id:
             return 0.0, 0, []
 
-        # Find 'RESPONSIBLE' column, case and space insensitive
+        # Find 'RESPONSIBLE' column (mapped from 'responsible')
         responsible_col = None
         for col in penalty_df.columns:
-            if col.strip().replace(' ', '').lower() == "responsible":
+            if col.strip().replace(' ', '').upper() == "RESPONSIBLE":
                 responsible_col = col
                 break
         if responsible_col is None:
             return 0.0, 0, []
 
-        # Find waybill column by keywords
-        waybill_keywords = ["运单号", "airway bill", "waybill number", "waybill", "airway"]
+        # Find waybill column
         waybill_col = None
         for col in penalty_df.columns:
-            col_clean = col.strip().lower()
-            if any(keyword in col_clean for keyword in waybill_keywords):
+            if 'waybill' in col.lower() or 'Waybill Number' in col:
                 waybill_col = col
                 break
 
@@ -351,7 +464,13 @@ class PayoutCalculator:
 
         penalty_records = penalty_df[responsible_series == dispatcher_id_clean]
         penalty_count = len(penalty_records)
-        penalty_amount = penalty_count * penalty_rate
+
+        # Use actual penalty amount if available
+        penalty_amount = 0.0
+        if 'Penalty Amount' in penalty_df.columns:
+            penalty_amount = penalty_records['Penalty Amount'].sum()
+        else:
+            penalty_amount = penalty_count * penalty_rate
 
         waybill_numbers = []
         if waybill_col and penalty_count > 0:
@@ -378,7 +497,7 @@ class PayoutCalculator:
         )
         df_clean['payout'] = df_clean['payout_rate']
 
-        # Deduplicate by dispatcher & waybill (keep latest by date when available)
+        # Deduplicate by dispatcher & waybill
         waybill_col = find_column(df_clean, 'waybill') or 'waybill'
         date_col = find_column(df_clean, 'date')
         df_for_unique = df_clean.copy()
@@ -395,8 +514,7 @@ class PayoutCalculator:
         duplicates = len(df_clean) - len(df_unique)
         st.info(f"Weight totals – Raw: {raw_weight:,.2f} kg | Deduplicated: {dedup_weight:,.2f} kg | Duplicate rows: {duplicates}")
 
-        # 🆕 ADD TIER COLUMNS TO df_unique for groupby aggregation
-        # Derive tier buckets directly from payout_rate to ensure exact consistency
+        # Add tier columns
         tiers = Config.load().get("weight_tiers", Config.DEFAULT_CONFIG["weight_tiers"])
         rate_tier1 = next(t['rate'] for t in tiers if t['min'] == 0)
         rate_tier2 = next(t['rate'] for t in tiers if t['min'] == 5)
@@ -415,22 +533,14 @@ class PayoutCalculator:
             total_weight=('weight', 'sum'),
             avg_weight=('weight', 'mean'),
             total_payout=('payout', 'sum'),
-            # 🆕 ADD TIER COUNTS
             tier1_parcels=('tier1_count', 'sum'),
             tier2_parcels=('tier2_count', 'sum'),
             tier3_parcels=('tier3_count', 'sum'),
             tier4_parcels=('tier4_count', 'sum')
         ).reset_index()
 
-        # Recompute total payout from tier counts to ensure exact consistency with DELIVERY(RM)
-        tiers = Config.load().get("weight_tiers", Config.DEFAULT_CONFIG["weight_tiers"])
-        tier_rates = [
-            next(t['rate'] for t in tiers if t['min'] == 0),
-            next(t['rate'] for t in tiers if t['min'] == 5),
-            next(t['rate'] for t in tiers if t['min'] == 10),
-            next(t['rate'] for t in tiers if t['min'] == 30),
-        ]
-
+        # Recompute total payout from tier counts
+        tier_rates = [rate_tier1, rate_tier2, rate_tier3, rate_tier4]
         grouped['total_payout'] = (
             grouped['tier1_parcels'] * tier_rates[0]
             + grouped['tier2_parcels'] * tier_rates[1]
@@ -440,25 +550,21 @@ class PayoutCalculator:
 
         grouped['avg_rate'] = grouped['total_payout'] / grouped['parcel_count']
 
-        # Calculate penalties for each dispatcher
+        # Calculate penalties
         grouped['penalty_amount'] = 0.0
         grouped['penalty_count'] = 0
         grouped['penalty_waybills'] = ''
 
         if penalty_df is not None and not penalty_df.empty:
             for i, row in grouped.iterrows():
-                dispatcher_id = row['dispatcher_id']  # <-- Use dispatcher_id from the row!
+                dispatcher_id = row['dispatcher_id']
                 penalty_amount, penalty_count, penalty_waybills = PayoutCalculator.calculate_penalty(
                     str(dispatcher_id), penalty_df, penalty_rate
                 )
                 grouped.at[i, 'penalty_amount'] = penalty_amount
                 grouped.at[i, 'penalty_count'] = penalty_count
                 grouped.at[i, 'penalty_waybills'] = ', '.join(penalty_waybills) if penalty_waybills else ''
-                # Deduct penalty from total payout
                 grouped.at[i, 'total_payout'] = row['total_payout'] - penalty_amount
-
-        # Add pickup fee to each dispatcher if desired (for global only, don't add per dispatcher)
-        # grouped['total_payout'] = grouped['total_payout'] + pickup_fee
 
         # Create display and numeric dataframes
         numeric_df = grouped.rename(columns={
@@ -485,13 +591,12 @@ class PayoutCalculator:
         display_df["Total Payout"] = display_df["Total Payout"].apply(lambda x: f"{currency_symbol}{x:,.2f}")
         display_df["Penalty"] = display_df["Penalty"].apply(lambda x: f"-{currency_symbol}{x:,.2f}" if x > 0 else f"{currency_symbol}0.00")
 
-        # Remove Penalty Waybills and Penalty Parcels from display (keep in numeric_df for details section)
         if "Penalty Waybills" in display_df.columns:
             display_df = display_df.drop(columns=["Penalty Waybills"])
         if "Penalty Parcels" in display_df.columns:
             display_df = display_df.drop(columns=["Penalty Parcels"])
 
-        total_payout = numeric_df["Total Payout"].sum() + pickup_fee  # <-- Inclusive of pickup_fee
+        total_payout = numeric_df["Total Payout"].sum() + pickup_fee
         st.success(f"✅ Processed {len(df_unique)} unique parcels from {len(grouped)} dispatchers")
         st.info(f"💰 Total Payout: {currency_symbol} {total_payout:,.2f} (inclusive of pickup fee: {currency_symbol} {pickup_fee:,.2f})")
 
@@ -631,29 +736,6 @@ class InvoiceGenerator:
                 }}
                 .total-badge .label {{ font-size: 12px; opacity: 0.9; margin-bottom: 4px; }}
                 .total-badge .value {{ font-size: 28px; font-weight: 800; }}
-                .tier-info {{
-                  margin-top: 24px;
-                  background: var(--surface);
-                  border: 1px solid var(--border);
-                  border-radius: 12px;
-                  padding: 20px;
-                  box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-                }}
-                .tier-info h3 {{ margin: 0 0 12px 0; color: var(--primary); }}
-                .tier-grid {{
-                  display: grid;
-                  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-                  gap: 12px;
-                  margin-top: 12px;
-                }}
-                .tier-item {{
-                  background: var(--background);
-                  padding: 12px;
-                  border-radius: 8px;
-                  border: 1px solid var(--border);
-                }}
-                .tier-item .range {{ font-weight: 600; color: var(--text-primary); }}
-                .tier-item .rate {{ color: var(--primary); font-weight: 700; margin-top: 4px; }}
                 .summary {{
                   margin-top: 24px; display: flex; gap: 12px; flex-wrap: wrap; justify-content: center;
                 }}
@@ -688,36 +770,6 @@ class InvoiceGenerator:
                 }}
                 tbody tr:nth-child(even) {{ background: var(--background); }}
                 tbody tr:hover {{ background: rgba(79, 70, 229, 0.05); }}
-                .top-performers {{
-                  margin-top: 32px;
-                }}
-                .top-performers h3 {{
-                  color: var(--text-primary);
-                  border-bottom: 2px solid var(--primary);
-                  padding-bottom: 8px;
-                  margin-bottom: 16px;
-                }}
-                .performers-grid {{
-                  display: grid;
-                  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-                  gap: 16px;
-                }}
-                .performer-card {{
-                  background: var(--surface);
-                  padding: 16px;
-                  border-radius: 8px;
-                  border: 1px solid var(--border);
-                }}
-                .performer-card .name {{
-                  font-weight: 700;
-                  color: var(--primary);
-                  margin-bottom: 8px;
-                }}
-                .performer-card .stats {{
-                  color: var(--text-secondary);
-                  font-size: 14px;
-                }}
-                .performer-card .stats div {{ margin: 4px 0; }}
                 .note {{
                   margin-top: 24px;
                   color: var(--text-secondary);
@@ -853,20 +905,42 @@ def main():
     </div>
     """, unsafe_allow_html=True)
 
-    # Load config and data
+    # Sidebar for data source selection
+    st.sidebar.header("⚙️ Data Source Configuration")
     config = Config.load()
-    pickup_fee = config.get("pickup_fee", 0.0)
 
-    with st.spinner("📄 Loading data from Google Sheets..."):
+    data_source_type = st.sidebar.radio(
+        "Select Data Source",
+        ["Google Sheets", "PostgreSQL"],
+        index=0 if config["data_source"]["type"] == "gsheet" else 1,
+        help="Choose between Google Sheets or PostgreSQL database"
+    )
+
+    # Update config based on selection
+    if data_source_type == "PostgreSQL":
+        config["data_source"]["type"] = "postgres"
+        st.sidebar.success("✅ Using PostgreSQL Database")
+        st.sidebar.info(f"📊 Table: `{config['data_source'].get('postgres_table', 'dispatcher')}`")
+        st.sidebar.info(f"⚠️ Penalty Table: `{config['data_source'].get('penalty_table', 'penalty')}`")
+    else:
+        config["data_source"]["type"] = "gsheet"
+        st.sidebar.success("✅ Using Google Sheets")
+
+    Config.save(config)
+
+    with st.spinner(f"📄 Loading data from {data_source_type}..."):
         df = DataSource.load_data(config)
 
     if df is None or df.empty:
-        st.error("❌ No data loaded. Check your Google Sheet configuration.")
+        st.error(f"❌ No data loaded from {data_source_type}. Check your configuration.")
         add_footer()
         return
 
     st.sidebar.header("⚙️ Configuration")
-    st.sidebar.info("**💰 Weight-Based Payout:**\n- 0-5kg: RM1.50\n- 5-10kg: RM1.60\n- 10-30kg: RM2.70\n- 30kg+: RM4.00\n\n**Pickup Fee:**\n- RM{:.2f}".format(pickup_fee))
+    st.sidebar.info("**💰 Weight-Based Payout:**\n- 0-5kg: RM1.50\n- 5-10kg: RM1.60\n- 10-30kg: RM2.70\n- 30kg+: RM4.00\n\n**Pickup Fee:**\n- RM{:.2f}".format(config.get("pickup_fee", 0.0)))
+
+    # Load configuration
+    pickup_fee = config.get("pickup_fee", 0.0)
 
     # Date filter
     auto_date_col = find_column(df, 'date')
@@ -920,9 +994,40 @@ def main():
     currency = config.get("currency_symbol", "RM")
 
     penalty_df = DataSource.load_penalty_data(config, "Sheet2")
-    penalty_rate = config.get("penalty_rate", 100.0)  # Default RM100 per parcel
+    penalty_rate = config.get("penalty_rate", 100.0)
 
-    display_df, numeric_df, total_payout = PayoutCalculator.calculate_payout(df, currency, penalty_df, penalty_rate, pickup_fee)
+
+    # Calculate payouts
+    currency = config.get("currency_symbol", "RM")
+    penalty_df = DataSource.load_penalty_data(config, "Sheet2")
+    penalty_rate = config.get("penalty_rate", 100.0)
+
+    # 🔹 NEW: filter penalty_df by selected month/date range (same as main df)
+    if penalty_df is not None and not penalty_df.empty:
+        # Try to auto-detect a date column in penalty_df
+        penalty_date_col = find_column(penalty_df, "date")
+        if penalty_date_col is None:
+            # Fallback: look for common date-like column names
+            for col in penalty_df.columns:
+                if any(k in str(col).lower() for k in ["date", "created", "signature", "scan"]):
+                    penalty_date_col = col
+                    break
+
+        if penalty_date_col is not None:
+            penalty_df[penalty_date_col] = pd.to_datetime(penalty_df[penalty_date_col], errors="coerce")
+            penalty_df = penalty_df[
+                (penalty_df[penalty_date_col].dt.date >= start_date) &
+                (penalty_df[penalty_date_col].dt.date <= end_date)
+            ]
+        else:
+            st.warning("Penalty table has no detectable date column; penalties are not filtered by month.")
+
+    display_df, numeric_df, total_payout = PayoutCalculator.calculate_payout(
+        df, currency, penalty_df, penalty_rate, pickup_fee
+    )
+
+
+   # display_df, numeric_df, total_payout = PayoutCalculator.calculate_payout(df, currency, penalty_df, penalty_rate, pickup_fee)
 
     if numeric_df.empty:
         st.warning("No data after filtering.")
@@ -979,7 +1084,6 @@ def main():
         st.markdown("---")
         st.subheader("⚠️ Penalty Details")
 
-        # Build flat penalty details (one row per penalized waybill)
         penalty_rows = []
         penalty_dispatchers = numeric_df[numeric_df['Penalty Parcels'] > 0]
         for _, row in penalty_dispatchers.iterrows():
@@ -1000,6 +1104,7 @@ def main():
             st.dataframe(penalty_table, use_container_width=True, hide_index=True)
         else:
             st.info("No penalty waybill numbers available")
+
     st.markdown("---")
     st.subheader("📄 Invoice Generation")
     invoice_html = InvoiceGenerator.build_invoice_html(display_df, numeric_df, total_payout, currency, penalty_rate, pickup_fee)

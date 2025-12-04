@@ -1014,17 +1014,24 @@ def main():
         return
 
     # Restrict to current month's data
+    # Convert to datetime
     df["Delivery Signature"] = pd.to_datetime(df["Delivery Signature"], errors="coerce")
-    current_period = pd.Timestamp(datetime.now().date()).to_period("M")
-    monthly_mask = df["Delivery Signature"].dt.to_period("M") == current_period
+
+    # Determine LAST MONTH period
+    today = datetime.now()
+    last_month_period = (today - pd.DateOffset(months=1)).to_period("M")
+
+    # Filter rows where Delivery Signature is last month
+    monthly_mask = df["Delivery Signature"].dt.to_period("M") == last_month_period
     df = df[monthly_mask].copy()
 
     if df.empty:
-        st.warning("No records found for the current month. Please update the data source.")
+        st.warning("No records found for last month. Please update the data source.")
         add_footer()
         return
 
-    st.caption(f"Showing deliveries for {datetime.now():%B %Y}.")
+    st.caption(f"Showing deliveries for {last_month_period.start_time:%B %Y}.")
+
 
     st.subheader("👤 Dispatcher Selection")
     dispatcher_mapping = {}
