@@ -61,7 +61,7 @@ class Config:
     CONFIG_FILE = "config.json"
     DEFAULT_CONFIG = {
         "data_source": {
-            "type": "gsheet",
+            "type": "postgres",
             "gsheet_url": "https://docs.google.com/spreadsheets/d/1f-oIqIapeGqq4IROyrJ3Gi37smfDzUgz/edit?gid=1989473758#gid=1989473758",
             "sheet_name": None,
             "postgres_table": "dispatcher",
