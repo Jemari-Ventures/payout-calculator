@@ -212,6 +212,17 @@ class DataSource:
                 return None
         return None
 
+    @staticmethod
+    def load_pickup_data(config: dict, sheet_name: str = "Sheet3") -> Optional[pd.DataFrame]:
+        """Load pickup data from Sheet3 based on configuration."""
+        data_source = config["data_source"]
+        if data_source["type"] == "gsheet" and data_source["gsheet_url"]:
+            try:
+                return DataSource.read_google_sheet(data_source["gsheet_url"], sheet_name)
+            except Exception as exc:
+                st.warning(f"Could not load pickup data from {sheet_name}: {exc}")
+                return None
+        return None
 
 # =============================================================================
 # PAYOUT CALCULATIONS
@@ -332,6 +343,40 @@ class PayoutCalculator:
             waybill_numbers = [wb for wb in waybill_numbers if wb and wb.lower() != 'nan']
 
         return float(penalty_amount), penalty_count, waybill_numbers
+
+    @staticmethod
+    def calculate_pickup(pickup_df: pd.DataFrame, dispatcher_id: str, rate: float = 1.00) -> Tuple[int, float]:
+        """
+        Counts unique Waybill Numbers for selected dispatcher in Sheet3
+        based on Pick Up Dispatcher ID matching the dispatcher_id.
+        """
+        if pickup_df is None or pickup_df.empty or not dispatcher_id:
+            return 0, 0.0
+
+        # Make sure columns exist
+        if "Pick Up Dispatcher ID" not in pickup_df.columns or "Waybill Number" not in pickup_df.columns:
+            return 0, 0.0
+
+        # Convert dispatcher_id to string for comparison
+        dispatcher_id_str = str(dispatcher_id).strip()
+
+        # Clean and prepare the Pick Up Dispatcher ID column
+        pickup_df = pickup_df.copy()  # Work on a copy to avoid modifying original
+        pickup_df["Pick Up Dispatcher ID"] = pickup_df["Pick Up Dispatcher ID"].astype(str).str.strip()
+
+        # Debug: Show matching records
+        matched_records = pickup_df[pickup_df["Pick Up Dispatcher ID"] == dispatcher_id_str]
+
+        if matched_records.empty:
+            return 0, 0.0
+
+        # Count unique waybill numbers for this dispatcher
+        # Some waybills might be duplicates (same waybill picked up multiple times)
+        unique_waybills = matched_records["Waybill Number"].dropna().astype(str).str.strip()
+        parcel_count = len(unique_waybills)
+        payout = parcel_count * rate
+
+        return parcel_count, payout
 
     @staticmethod
     def calculate_tiered_daily(filtered_df: pd.DataFrame, tiers_config: List,
@@ -545,7 +590,9 @@ class InvoiceGenerator:
         attendance_description: str, name: str, dpid: str, currency_symbol: str,
         advance_payout: float, advance_payout_desc: str,
         penalty_amount: float = 0.0, penalty_count: int = 0, penalty_rate: float = 100.0,
-        penalty_waybills: List[str] = None
+        penalty_waybills: List[str] = None,
+        pickup_payout: float = 0.0,  # NEW: Add pickup payout
+        pickup_parcels: int = 0      # NEW: Add pickup parcel count
     ) -> str:
         total_parcels = df_disp['Total Parcel'].sum() if 'Total Parcel' in df_disp.columns else 0
         total_days = len(df_disp) if 'Date' in df_disp.columns else 0
@@ -722,6 +769,10 @@ class InvoiceGenerator:
                         <div class="value">{total_parcels:,}</div>
                     </div>
                     <div class="chip">
+                        <div class="label">Pickup Parcels</div>
+                        <div class="value">{pickup_parcels:,}</div>
+                    </div>
+                    <div class="chip">
                         <div class="label">Advance Payout</div>
                         <div class="value">{currency_symbol} {(advance_payout):,.2f}</div>
                     </div>
@@ -784,6 +835,10 @@ class InvoiceGenerator:
                 <div class="payout-row">
                     <span>Base Payout (Daily Rates):</span>
                     <span>{currency_symbol} {base_payout:,.2f}</span>
+                </div>
+                <div class="payout-row">
+                    <span>Pickup Payout ({pickup_parcels} parcel(s) × {currency_symbol}1.00):</span>
+                    <span>+ {currency_symbol} {pickup_payout:,.2f}</span>
                 </div>
                 <div class="payout-row">
                     <span>KPI Incentive Bonus:</span>
@@ -1085,22 +1140,37 @@ def main():
     penalty_df = DataSource.load_penalty_data(config, "Sheet2")
     penalty_rate = config.get("penalty_rate", 100.0)  # Default RM100 per parcel
 
+    # Load pickup data from Sheet3
+    pickup_df = DataSource.load_pickup_data(config, "Sheet3")
+
+    # Calculate pickup parcels & payout for the selected dispatcher_id
+    pickup_parcels, pickup_payout = PayoutCalculator.calculate_pickup(
+        pickup_df, selected_dispatcher, rate=1.00
+    )
+
+    # Display pickup metrics
+    col_pickup1, col_pickup2 = st.columns(2)
+    with col_pickup1:
+        st.metric(label="Pickup Parcels", value=f"{pickup_parcels}")
+    with col_pickup2:
+        st.metric(label="Pickup Payout", value=f"{currency_symbol}{pickup_payout:.2f}")
+
+    # Optionally: add these to summary chips, invoice, or payout breakdown as needed.
+
     display_df, total_payout, kpi_bonus, kpi_description, attendance_bonus, attendance_desc, qualified_days, per_day, penalty_amount, penalty_count, penalty_waybills = PayoutCalculator.calculate_tiered_daily(
         filtered, config["tiers"], config.get("kpi_incentives", []),
         config.get("special_rates", []), config.get("attendance_incentive", {}), currency_symbol,
         penalty_df, penalty_rate
     )
-    base_payout = total_payout - kpi_bonus - attendance_bonus + penalty_amount  # Add penalty back to get base
-
-    # Calculate advance payout BEFORE penalty deduction
+    base_payout = total_payout - kpi_bonus - attendance_bonus + penalty_amount # Add penalty back to get base
+    total_payout = total_payout + pickup_payout
     advance_payout_config = config.get("advance_payout", {})
     advance_payout_enabled = advance_payout_config.get("enabled", False)
     advance_payout_percentage = advance_payout_config.get("percentage", 0.0)
     advance_payout_desc = advance_payout_config.get("description", "Advance Payout")
     advance_payout = 0.0
-    payout_before_penalty = base_payout + kpi_bonus + attendance_bonus  # Calculate advance on this amount
     if advance_payout_enabled and advance_payout_percentage > 0:
-        advance_payout = round(payout_before_penalty * (advance_payout_percentage / 100.0), 2)
+        advance_payout = round(base_payout * (advance_payout_percentage / 100.0), 2)
 
     col1, col2, col3, col4, col5, col6 = st.columns(6)
     with col1:
@@ -1127,7 +1197,7 @@ def main():
         st.metric(label="Total Payout", value=f"{currency_symbol}{total_payout:,.2f}")
     with col6:
         st.metric(label=advance_payout_desc, value=f"{currency_symbol}{advance_payout:,.2f}",
-                 help=f"{advance_payout_percentage}% of Payout Before Penalty ({currency_symbol}{payout_before_penalty:,.2f})")
+                 help=f"{advance_payout_percentage}% of Base Payout ({currency_symbol}{base_payout:,.2f})")
 
     if kpi_bonus > 0:
         st.success(f"🎯 **KPI Incentive Achieved!** +{currency_symbol}{kpi_bonus:,.2f} ({kpi_description})")
@@ -1152,6 +1222,16 @@ def main():
 
     st.dataframe(display_df, use_container_width=True)
 
+        # Clean the dispatcher ID column
+    pickup_df["Pick Up Dispatcher ID"] = pickup_df["Pick Up Dispatcher ID"].astype(str).str.strip()
+
+    # Show matching records for the selected dispatcher
+    matched_records = pickup_df[pickup_df["Pick Up Dispatcher ID"] == str(selected_dispatcher).strip()]
+
+    if not matched_records.empty:
+        st.write("**Parcel Pickup Records:**")
+        st.dataframe(matched_records[["Waybill Number", "Date | Pick Up", "Pick Up Dispatcher ID", "Pick Up Dispatcher Name"]].head(10))
+
     with st.expander("📊 Payout Breakdown", expanded=False):
         breakdown_col1, breakdown_col2, breakdown_col3, breakdown_col4, breakdown_col5, breakdown_col6 = st.columns(6)
         with breakdown_col1:
@@ -1169,10 +1249,10 @@ def main():
                 waybill_info += f"\nWaybills: {waybill_preview}"
             st.metric("Penalty", f"-{currency_symbol}{penalty_amount:,.2f}", help=waybill_info)
         with breakdown_col5:
-            st.metric("Total Payout", f"{currency_symbol}{total_payout:,.2f}", help="Base + KPI + Attendance - Penalty")
+            st.metric("Total Payout", f"{currency_symbol}{total_payout:,.2f}", help="Base + Pickup + KPI + Attendance - Penalty")
         with breakdown_col6:
             st.metric(advance_payout_desc, f"{currency_symbol}{advance_payout:,.2f}",
-                     help=f"{advance_payout_percentage}% of Payout Before Penalty ({currency_symbol}{payout_before_penalty:,.2f})")
+                     help=f"{advance_payout_percentage}% of Base Payout ({currency_symbol}{base_payout:,.2f})")
 
     st.subheader("📊 Performance Visualization")
     charts = DataVisualizer.create_performance_charts(per_day, currency_symbol)
@@ -1244,7 +1324,8 @@ def main():
     invoice_html = InvoiceGenerator.build_invoice_html(
         display_df, base_payout, kpi_bonus, attendance_bonus, total_payout,
         kpi_description, attendance_desc, inv_name, inv_id, currency_symbol,
-        advance_payout, advance_payout_desc, penalty_amount, penalty_count, penalty_rate, penalty_waybills
+        advance_payout, advance_payout_desc, penalty_amount, penalty_count,
+        penalty_rate, penalty_waybills, pickup_payout, pickup_parcels
     )
 
     st.download_button(
