@@ -74,7 +74,7 @@ class Config:
             {"min": 10, "max": 30, "rate": 2.70},
             {"min": 30, "max": float('inf'), "rate": 4.00}
         ],
-        "pickup_fee": 0.00,
+        "pickup_fee": 151.00,
         "currency_symbol": "RM",
         "penalty_rate": 100.0
     }
