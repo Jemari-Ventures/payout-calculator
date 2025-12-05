@@ -10,7 +10,7 @@
     "table_name": "dispatcher"
   },
   "currency_symbol": "RM",
-  "pickup_fee": 17.5,
+  "pickup_fee": 0.0,
   "payout_rate": 1.5,
   "penalty_rate": 100.0,
   "tiers": [
