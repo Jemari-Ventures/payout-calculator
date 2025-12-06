@@ -7,19 +7,23 @@ import re
 import json
 import os
 from typing import Optional, Tuple, Dict, List
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import urlparse, parse_qs
 
 import pandas as pd
+import numpy as np
 import streamlit as st
 import altair as alt
 import requests
 from sqlalchemy import create_engine
+from prophet import Prophet
+from prophet.plot import plot_plotly
+import plotly.graph_objs as go
 
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-
+PROPHET_AVAILABLE = True
 class ColorScheme:
     """Consistent color scheme for the entire application."""
     PRIMARY = "#4f46e5"
@@ -62,10 +66,9 @@ class Config:
     DEFAULT_CONFIG = {
         "data_source": {
             "type": "postgres",
-            "gsheet_url": "https://docs.google.com/spreadsheets/d/1f-oIqIapeGqq4IROyrJ3Gi37smfDzUgz/edit?gid=1989473758#gid=1989473758",
-            "sheet_name": None,
             "postgres_table": "dispatcher",
-            "penalty_table": "penalty"
+            "penalty_table": "penalty",
+            "pickup_table": "pickup"
         },
         "database": {"table_name": "dispatcher"},
         "weight_tiers": [
@@ -76,7 +79,8 @@ class Config:
         ],
         "pickup_fee": 151.00,
         "currency_symbol": "RM",
-        "penalty_rate": 100.0
+        "penalty_rate": 100.0,
+        "forecast_days": 30
     }
 
     _cache = None
@@ -96,8 +100,14 @@ class Config:
                         config["data_source"]["postgres_table"] = "dispatcher"
                     if "penalty_table" not in config.get("data_source", {}):
                         config["data_source"]["penalty_table"] = "penalty"
+                    if "pickup_table" not in config.get("data_source", {}):
+                        config["data_source"]["pickup_table"] = "pickup"
                     if "penalty_rate" not in config:
                         config["penalty_rate"] = 100.0
+                    if "pickup_payout_per_parcel" not in config:
+                        config["pickup_payout_per_parcel"] = 1.50
+                    if "forecast_days" not in config:
+                        config["forecast_days"] = 30
                     cls._cache = config
                     return cls._cache
             except Exception as e:
@@ -154,7 +164,7 @@ def normalize_weight(series: pd.Series) -> pd.Series:
 # =============================================================================
 
 class DataSource:
-    """Handle data loading from Google Sheets and PostgreSQL."""
+    """Handle data loading from PostgreSQL."""
 
     @staticmethod
     def _get_postgres_connection():
@@ -191,18 +201,49 @@ class DataSource:
             query = f"SELECT * FROM {table_name}"
             df = pd.read_sql(query, _engine)
 
-            # Map database columns to expected application columns
-            column_mapping = {
-                'waybill': 'Waybill Number',
-                'delivery_signature': 'Delivery Signature',
-                'dispatcher_id': 'Dispatcher ID',
-                'dispatcher_name': 'Dispatcher Name',
-                'billing_weight': 'Billing Weight',
-                'date_|_pick_up': 'Pick Up Date',
-                'pick_up_dp': 'Pick Up DP',
-                'pick_up_dispatcher_id': 'Pick Up Dispatcher ID',
-                'pick_up_dispatcher_name': 'Pick Up Dispatcher Name'
-            }
+            # Define column mappings for different tables
+            if table_name == 'dispatcher' or table_name.endswith('dispatcher'):
+                column_mapping = {
+                    'waybill': 'Waybill Number',
+                    'delivery_signature': 'Delivery Signature',
+                    'dispatcher_id': 'Dispatcher ID',
+                    'dispatcher_name': 'Dispatcher Name',
+                    'billing_weight': 'Billing Weight',
+                    'date_|_pick_up': 'Pick Up Date',
+                    'pick_up_dp': 'Pick Up DP',
+                    'pick_up_dispatcher_id': 'Pick Up Dispatcher ID',
+                    'pick_up_dispatcher_name': 'Pick Up Dispatcher Name'
+                }
+            elif table_name == 'pickup' or table_name.endswith('pickup'):
+                column_mapping = {
+                    'waybill_number': 'Waybill Number',
+                    'date_|_pick_up': 'Pick Up Date',
+                    'pickup_dp': 'Pickup DP',
+                    'responsible_department': 'Responsible Department',
+                    'pickup_dispatcher_id': 'Pickup Dispatcher ID',
+                    'pickup_dispatcher_name': 'Pickup Dispatcher Name',
+                    'vip_code': 'VIP Code',
+                    'domestic___international': 'Domestic/International',
+                    'order_source': 'Order Source',
+                    'product_type': 'Product Type',
+                    'dp_|_signing': 'DP Signing',
+                    'delivery_signature': 'Delivery Signature',
+                    'dispatcher_id': 'Dispatcher ID',
+                    'dispatcher_name': 'Dispatcher Name',
+                    'arrival_time': 'Arrival Time',
+                    'arriving_dp': 'Arriving DP',
+                    'billing_weight': 'Billing Weight',
+                    'item_type': 'Item Type',
+                    'cod_amount': 'COD Amount'
+                }
+            elif table_name == 'penalty' or table_name.endswith('penalty'):
+                column_mapping = {
+                    'waybill': 'Waybill Number',
+                    'responsible': 'RESPONSIBLE',
+                    'penalty_amount_actual': 'Penalty Amount'
+                }
+            else:
+                column_mapping = {}
 
             # Rename columns that exist in the dataframe
             rename_dict = {old: new for old, new in column_mapping.items() if old in df.columns}
@@ -214,132 +255,76 @@ class DataSource:
             raise
 
     @staticmethod
-    def _extract_gsheet_id_and_gid(url_or_id: str) -> Tuple[Optional[str], Optional[str]]:
-        """Extract spreadsheet ID and GID from Google Sheets URL."""
-        if not url_or_id:
-            return None, None
-
-        if re.fullmatch(r"[A-Za-z0-9_-]{20,}", url_or_id):
-            return url_or_id, None
-
-        try:
-            parsed = urlparse(url_or_id)
-            path_parts = [p for p in parsed.path.split('/') if p]
-
-            spreadsheet_id = None
-            if 'spreadsheets' in path_parts and 'd' in path_parts:
-                idx = path_parts.index('d')
-                if idx + 1 < len(path_parts):
-                    spreadsheet_id = path_parts[idx + 1]
-
-            query_gid = parse_qs(parsed.query).get('gid', [None])[0]
-            frag_gid_match = re.search(r"gid=(\d+)", parsed.fragment or "")
-            gid = query_gid or (frag_gid_match.group(1) if frag_gid_match else None)
-
-            return spreadsheet_id, gid
-        except Exception:
-            return None, None
-
-    @staticmethod
-    def _build_csv_url(spreadsheet_id: str, sheet_name: Optional[str], gid: Optional[str]) -> str:
-        """Construct CSV export URL."""
-        base = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}"
-        if sheet_name:
-            return f"{base}/gviz/tq?tqx=out:csv&sheet={sheet_name}"
-        if gid:
-            return f"{base}/export?format=csv&gid={gid}"
-        return f"{base}/export?format=csv"
-
-    @staticmethod
-    @st.cache_data(ttl=300)
-    def read_google_sheet(url_or_id: str, sheet_name: Optional[str] = None) -> pd.DataFrame:
-        """Fetch Google Sheet as DataFrame."""
-        spreadsheet_id, gid = DataSource._extract_gsheet_id_and_gid(url_or_id)
-        if not spreadsheet_id:
-            raise ValueError("Invalid Google Sheet URL or ID.")
-
-        csv_url = DataSource._build_csv_url(spreadsheet_id, sheet_name, gid)
-        try:
-            resp = requests.get(csv_url, timeout=30)
-            resp.raise_for_status()
-            return pd.read_csv(io.BytesIO(resp.content))
-        except Exception as exc:
-            st.error(f"Failed to fetch Google Sheet: {exc}")
-            raise
-
-    @staticmethod
     def load_data(config: dict) -> Optional[pd.DataFrame]:
         """Load data based on configuration."""
         data_source = config["data_source"]
 
-        if data_source["type"] == "postgres":
-            engine = DataSource.get_postgres_engine()
-            if engine:
-                try:
-                    table_name = data_source.get("postgres_table", "dispatcher")
-                    df = DataSource.read_postgres_table(engine, table_name)
-
-                    # Verify required columns exist after mapping
-                    required = ["Dispatcher ID", "Waybill Number", "Delivery Signature"]
-                    missing = [col for col in required if col not in df.columns]
-                    if missing:
-                        st.error(f"Missing required columns after mapping: {', '.join(missing)}")
-                        st.info("Available columns: " + ", ".join(df.columns.tolist()))
-                        return None
-
-                    return df
-                except Exception as exc:
-                    st.error(f"Error reading from PostgreSQL: {exc}")
-                    return None
-            else:
-                st.error("PostgreSQL engine not available")
-                return None
-
-        elif data_source["type"] == "gsheet" and data_source["gsheet_url"]:
-            try:
-                return DataSource.read_google_sheet(
-                    data_source["gsheet_url"],
-                    data_source["sheet_name"]
-                )
-            except Exception as exc:
-                st.error(f"Error reading Google Sheet: {exc}")
-        return None
-
-    @staticmethod
-    def load_penalty_data(config: dict, sheet_name: str = "Sheet2") -> Optional[pd.DataFrame]:
-        """Load penalty data from penalty table or Sheet2 based on configuration."""
-        data_source = config["data_source"]
-
-        if data_source["type"] == "postgres":
-            engine = DataSource.get_postgres_engine()
-            if engine:
-                try:
-                    penalty_table = data_source.get("penalty_table", "penalty")
-                    df = DataSource.read_postgres_table(engine, penalty_table)
-
-                    # Map penalty table columns
-                    penalty_mapping = {
-                        'waybill': 'Waybill Number',
-                        'responsible': 'RESPONSIBLE',
-                        'penalty_amount_actual': 'Penalty Amount'
-                    }
-
-                    rename_dict = {old: new for old, new in penalty_mapping.items() if old in df.columns}
-                    df = df.rename(columns=rename_dict)
-
-                    return df
-                except Exception as exc:
-                    st.warning(f"Could not load penalty data from PostgreSQL table '{penalty_table}': {exc}")
-                    return None
+        engine = DataSource.get_postgres_engine()
+        if not engine:
+            st.error("PostgreSQL engine not available")
             return None
 
-        elif data_source["type"] == "gsheet" and data_source["gsheet_url"]:
-            try:
-                return DataSource.read_google_sheet(data_source["gsheet_url"], sheet_name)
-            except Exception as exc:
-                st.warning(f"Could not load penalty data from {sheet_name}: {exc}")
+        try:
+            table_name = data_source.get("postgres_table", "dispatcher")
+            df = DataSource.read_postgres_table(engine, table_name)
+
+            # Verify required columns exist after mapping
+            required = ["Dispatcher ID", "Waybill Number", "Delivery Signature"]
+            missing = [col for col in required if col not in df.columns]
+            if missing:
+                st.error(f"Missing required columns after mapping: {', '.join(missing)}")
+                st.info("Available columns: " + ", ".join(df.columns.tolist()))
                 return None
-        return None
+
+            return df
+        except Exception as exc:
+            st.error(f"Error reading from PostgreSQL: {exc}")
+            return None
+
+    @staticmethod
+    def load_penalty_data(config: dict) -> Optional[pd.DataFrame]:
+        """Load penalty data from penalty table."""
+        data_source = config["data_source"]
+        engine = DataSource.get_postgres_engine()
+
+        if not engine:
+            return None
+
+        try:
+            penalty_table = data_source.get("penalty_table", "penalty")
+            df = DataSource.read_postgres_table(engine, penalty_table)
+
+            # Map penalty table columns
+            penalty_mapping = {
+                'waybill': 'Waybill Number',
+                'responsible': 'RESPONSIBLE',
+                'penalty_amount_actual': 'Penalty Amount'
+            }
+
+            rename_dict = {old: new for old, new in penalty_mapping.items() if old in df.columns}
+            df = df.rename(columns=rename_dict)
+
+            return df
+        except Exception as exc:
+            st.warning(f"Could not load penalty data from PostgreSQL table '{penalty_table}': {exc}")
+            return None
+
+    @staticmethod
+    def load_pickup_data(config: dict) -> Optional[pd.DataFrame]:
+        """Load pickup data from pickup table."""
+        data_source = config["data_source"]
+        engine = DataSource.get_postgres_engine()
+
+        if not engine:
+            return None
+
+        try:
+            pickup_table = data_source.get("pickup_table", "pickup")
+            df = DataSource.read_postgres_table(engine, pickup_table)
+            return df
+        except Exception as exc:
+            st.warning(f"Could not load pickup data from PostgreSQL table '{pickup_table}': {exc}")
+            return None
 
 # =============================================================================
 # DATA PROCESSING
@@ -480,7 +465,80 @@ class PayoutCalculator:
         return float(penalty_amount), penalty_count, waybill_numbers
 
     @staticmethod
-    def calculate_payout(df: pd.DataFrame, currency_symbol: str, penalty_df: Optional[pd.DataFrame] = None, penalty_rate: float = 100.0, pickup_fee: float = 0.0) -> Tuple[pd.DataFrame, pd.DataFrame, float]:
+    def calculate_pickup_payout(pickup_df: pd.DataFrame, dispatcher_summary_df: pd.DataFrame, pickup_payout_per_parcel: float = 1.50) -> pd.DataFrame:
+        """
+        Calculate pickup payout based on pickup data.
+
+        Args:
+            pickup_df: DataFrame containing pickup data
+            dispatcher_summary_df: DataFrame containing dispatcher summary (must have 'Dispatcher ID' column)
+            pickup_payout_per_parcel: Payout per pickup parcel
+
+        Returns:
+            DataFrame with pickup payout added to dispatcher summary
+        """
+        if pickup_df is None or pickup_df.empty:
+            dispatcher_summary_df['pickup_parcels'] = 0
+            dispatcher_summary_df['pickup_payout'] = 0.0
+            return dispatcher_summary_df
+
+        # Find pickup dispatcher ID column
+        pickup_dispatcher_col = None
+        for col in pickup_df.columns:
+            if 'pickup_dispatcher_id' in col.lower() or 'Pickup Dispatcher ID' in col:
+                pickup_dispatcher_col = col
+                break
+
+        if not pickup_dispatcher_col:
+            st.warning("⚠️ No pickup dispatcher ID column found in pickup data")
+            dispatcher_summary_df['pickup_parcels'] = 0
+            dispatcher_summary_df['pickup_payout'] = 0.0
+            return dispatcher_summary_df
+
+        # Find waybill column in pickup data
+        waybill_col = None
+        for col in pickup_df.columns:
+            if 'waybill' in col.lower() or 'Waybill Number' in col:
+                waybill_col = col
+                break
+
+        if not waybill_col:
+            st.warning("⚠️ No waybill column found in pickup data")
+            dispatcher_summary_df['pickup_parcels'] = 0
+            dispatcher_summary_df['pickup_payout'] = 0.0
+            return dispatcher_summary_df
+
+        # Clean pickup dispatcher IDs
+        pickup_df['clean_pickup_dispatcher_id'] = pickup_df[pickup_dispatcher_col].astype(str).str.strip()
+
+        # Group by pickup dispatcher ID to count unique waybills
+        pickup_summary = pickup_df.groupby('clean_pickup_dispatcher_id').agg(
+            pickup_parcels=(waybill_col, 'nunique')
+        ).reset_index()
+
+        # Calculate pickup payout
+        pickup_summary['pickup_payout'] = pickup_summary['pickup_parcels'] * pickup_payout_per_parcel
+
+        # Rename column for merging
+        pickup_summary = pickup_summary.rename(columns={'clean_pickup_dispatcher_id': 'dispatcher_id'})
+
+        # Merge with dispatcher summary
+        dispatcher_summary_df = dispatcher_summary_df.merge(
+            pickup_summary[['dispatcher_id', 'pickup_parcels', 'pickup_payout']],
+            on='dispatcher_id',
+            how='left'
+        )
+
+        # Fill NaN values
+        dispatcher_summary_df['pickup_parcels'] = dispatcher_summary_df['pickup_parcels'].fillna(0)
+        dispatcher_summary_df['pickup_payout'] = dispatcher_summary_df['pickup_payout'].fillna(0.0)
+
+        return dispatcher_summary_df
+
+    @staticmethod
+    def calculate_payout(df: pd.DataFrame, currency_symbol: str, penalty_df: Optional[pd.DataFrame] = None,
+                        penalty_rate: float = 100.0, pickup_df: Optional[pd.DataFrame] = None,
+                        pickup_payout_per_parcel: float = 1.50) -> Tuple[pd.DataFrame, pd.DataFrame, float]:
         """Calculate payout using tier-based weight calculation."""
         # Prepare data
         df_clean = DataProcessor.prepare_dataframe(df)
@@ -541,14 +599,14 @@ class PayoutCalculator:
 
         # Recompute total payout from tier counts
         tier_rates = [rate_tier1, rate_tier2, rate_tier3, rate_tier4]
-        grouped['total_payout'] = (
+        grouped['dispatch_payout'] = (
             grouped['tier1_parcels'] * tier_rates[0]
             + grouped['tier2_parcels'] * tier_rates[1]
             + grouped['tier3_parcels'] * tier_rates[2]
             + grouped['tier4_parcels'] * tier_rates[3]
         )
 
-        grouped['avg_rate'] = grouped['total_payout'] / grouped['parcel_count']
+        grouped['avg_rate'] = grouped['dispatch_payout'] / grouped['parcel_count']
 
         # Calculate penalties
         grouped['penalty_amount'] = 0.0
@@ -564,7 +622,12 @@ class PayoutCalculator:
                 grouped.at[i, 'penalty_amount'] = penalty_amount
                 grouped.at[i, 'penalty_count'] = penalty_count
                 grouped.at[i, 'penalty_waybills'] = ', '.join(penalty_waybills) if penalty_waybills else ''
-                grouped.at[i, 'total_payout'] = row['total_payout'] - penalty_amount
+
+        # Calculate pickup payout
+        grouped = PayoutCalculator.calculate_pickup_payout(pickup_df, grouped, pickup_payout_per_parcel)
+
+        # Calculate total payout: dispatch payout - penalty + pickup payout
+        grouped['total_payout'] = grouped['dispatch_payout'] - grouped['penalty_amount'] + grouped['pickup_payout']
 
         # Create display and numeric dataframes
         numeric_df = grouped.rename(columns={
@@ -574,10 +637,13 @@ class PayoutCalculator:
             "total_weight": "Total Weight (kg)",
             "avg_weight": "Avg Weight (kg)",
             "avg_rate": "Avg Rate per Parcel",
+            "dispatch_payout": "Dispatch Payout",
             "total_payout": "Total Payout",
             "penalty_amount": "Penalty",
             "penalty_count": "Penalty Parcels",
             "penalty_waybills": "Penalty Waybills",
+            "pickup_parcels": "Pickup Parcels",
+            "pickup_payout": "Pickup Payout",
             "tier1_parcels": "Parcels 0-5kg",
             "tier2_parcels": "Parcels 5.01-10kg",
             "tier3_parcels": "Parcels 10.01-30kg",
@@ -588,17 +654,31 @@ class PayoutCalculator:
         display_df["Total Weight (kg)"] = display_df["Total Weight (kg)"].apply(lambda x: f"{x:.2f}")
         display_df["Avg Weight (kg)"] = display_df["Avg Weight (kg)"].apply(lambda x: f"{x:.2f}")
         display_df["Avg Rate per Parcel"] = display_df["Avg Rate per Parcel"].apply(lambda x: f"{currency_symbol}{x:.2f}")
+        display_df["Dispatch Payout"] = display_df["Dispatch Payout"].apply(lambda x: f"{currency_symbol}{x:,.2f}")
         display_df["Total Payout"] = display_df["Total Payout"].apply(lambda x: f"{currency_symbol}{x:,.2f}")
         display_df["Penalty"] = display_df["Penalty"].apply(lambda x: f"-{currency_symbol}{x:,.2f}" if x > 0 else f"{currency_symbol}0.00")
+        display_df["Pickup Payout"] = display_df["Pickup Payout"].apply(lambda x: f"{currency_symbol}{x:,.2f}")
 
         if "Penalty Waybills" in display_df.columns:
             display_df = display_df.drop(columns=["Penalty Waybills"])
         if "Penalty Parcels" in display_df.columns:
             display_df = display_df.drop(columns=["Penalty Parcels"])
 
-        total_payout = numeric_df["Total Payout"].sum() + pickup_fee
+        total_payout = numeric_df["Total Payout"].sum()
         st.success(f"✅ Processed {len(df_unique)} unique parcels from {len(grouped)} dispatchers")
-        st.info(f"💰 Total Payout: {currency_symbol} {total_payout:,.2f} (inclusive of pickup fee: {currency_symbol} {pickup_fee:,.2f})")
+
+        # Calculate breakdown for info message
+        total_dispatch_payout = numeric_df["Dispatch Payout"].sum()
+        total_pickup_payout = numeric_df["Pickup Payout"].sum()
+        total_penalty = numeric_df["Penalty"].sum()
+
+        st.info(f"""
+        💰 **Payout Breakdown:**
+        - Dispatch Payout: {currency_symbol} {total_dispatch_payout:,.2f}
+        + Pickup Payout: {currency_symbol} {total_pickup_payout:,.2f}
+        - Penalties: {currency_symbol} {total_penalty:,.2f}
+        **Total Payout: {currency_symbol} {total_payout:,.2f}**
+        """)
 
         return display_df, numeric_df, total_payout
 
@@ -613,6 +693,163 @@ class PayoutCalculator:
             daily_df = daily_df.rename(columns={date_col: 'signature_date'})
             return daily_df.sort_values('signature_date')
         return pd.DataFrame()
+
+    @staticmethod
+    def get_daily_payout_trend(df: pd.DataFrame) -> pd.DataFrame:
+        """Get daily payout trend."""
+        date_col = find_column(df, 'date')
+        if date_col:
+            df_copy = df.copy()
+            df_copy[date_col] = pd.to_datetime(df_copy[date_col], errors="coerce")
+
+            # Calculate total payout per day (sum of all payouts)
+            daily_df = df_copy.groupby(df_copy[date_col].dt.date).agg(
+                total_payout=('payout', 'sum'),
+                parcel_count=(date_col, 'size')
+            ).reset_index()
+            daily_df = daily_df.rename(columns={date_col: 'signature_date'})
+            return daily_df.sort_values('signature_date')
+        return pd.DataFrame()
+
+# =============================================================================
+# FORECASTING
+# =============================================================================
+
+class ForecastGenerator:
+    """Generate forecasts using Prophet."""
+
+    @staticmethod
+    def prepare_forecast_data(daily_df: pd.DataFrame, value_column: str = 'total_parcels') -> pd.DataFrame:
+        """Prepare daily data for forecasting."""
+        if daily_df.empty:
+            return pd.DataFrame()
+
+        # Ensure we have a proper datetime column
+        forecast_df = daily_df.copy()
+        forecast_df['ds'] = pd.to_datetime(forecast_df['signature_date'])
+        forecast_df['y'] = forecast_df[value_column]
+
+        return forecast_df[['ds', 'y']]
+
+    @staticmethod
+    def generate_forecast(daily_df: pd.DataFrame, periods: int = 30, value_column: str = 'total_parcels') -> Optional[tuple]:
+        """Generate forecast using Prophet."""
+        if not PROPHET_AVAILABLE or daily_df.empty or len(daily_df) < 7:
+            return None
+
+        try:
+            # Prepare data
+            df = ForecastGenerator.prepare_forecast_data(daily_df, value_column)
+
+            # Initialize and fit Prophet model
+            model = Prophet(
+                daily_seasonality=False,
+                weekly_seasonality=True,
+                yearly_seasonality=False,
+                changepoint_prior_scale=0.05
+            )
+            model.fit(df)
+
+            # Make future dataframe
+            future = model.make_future_dataframe(periods=periods)
+
+            # Make predictions
+            forecast = model.predict(future)
+
+            # Get forecast components
+            forecast_summary = forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].tail(periods)
+
+            return model, forecast, forecast_summary
+
+        except Exception as e:
+            st.warning(f"Forecast generation failed: {e}")
+            return None
+
+    @staticmethod
+    def calculate_forecast_metrics(historical: pd.DataFrame, forecast_summary: pd.DataFrame, value_column: str = 'total_parcels') -> Dict:
+        """Calculate forecast accuracy metrics."""
+        if historical.empty or forecast_summary.empty:
+            return {}
+
+        # Get last N days of historical data for comparison
+        recent_history = historical.tail(min(7, len(historical)))
+        avg_historical = recent_history[value_column].mean()
+
+        # Forecast metrics
+        avg_forecast = forecast_summary['yhat'].mean()
+        forecast_std = forecast_summary['yhat'].std()
+        max_forecast = forecast_summary['yhat'].max()
+        min_forecast = forecast_summary['yhat'].min()
+
+        # Calculate change percentage
+        if avg_historical > 0:
+            change_pct = ((avg_forecast - avg_historical) / avg_historical) * 100
+        else:
+            change_pct = 0
+
+        return {
+            'avg_historical': avg_historical,
+            'avg_forecast': avg_forecast,
+            'forecast_std': forecast_std,
+            'max_forecast': max_forecast,
+            'min_forecast': min_forecast,
+            'change_pct': change_pct,
+            'total_forecast': forecast_summary['yhat'].sum()
+        }
+
+    @staticmethod
+    def create_forecast_chart(historical: pd.DataFrame, forecast_summary: pd.DataFrame, title: str = '30-Day Parcel Delivery Forecast',
+                             value_column: str = 'total_parcels', y_title: str = 'Parcels') -> alt.Chart:
+        """Create forecast visualization using Altair."""
+        # Prepare historical data
+        hist_df = historical.copy()
+        hist_df['type'] = 'Historical'
+        hist_df = hist_df.rename(columns={'signature_date': 'ds', value_column: 'y'})
+
+        # Prepare forecast data
+        forecast_plot = forecast_summary.copy()
+        forecast_plot['type'] = 'Forecast'
+
+        # Combine data
+        combined = pd.concat([
+            hist_df[['ds', 'y', 'type']],
+            forecast_plot[['ds', 'yhat', 'type']].rename(columns={'yhat': 'y'})
+        ])
+
+        # Create chart
+        base = alt.Chart(combined).encode(
+            x=alt.X('ds:T', title='Date'),
+            y=alt.Y('y:Q', title=y_title),
+            color=alt.Color('type:N', scale=alt.Scale(
+                domain=['Historical', 'Forecast'],
+                range=[ColorScheme.PRIMARY, ColorScheme.ACCENT]
+            ), legend=alt.Legend(title="Data Type"))
+        )
+
+        line = base.mark_line(point=True).encode(
+            opacity=alt.value(0.8)
+        )
+
+        # Add confidence interval for forecast
+        if 'yhat_lower' in forecast_summary.columns and 'yhat_upper' in forecast_summary.columns:
+            forecast_area = alt.Chart(forecast_plot).mark_area(
+                opacity=0.3,
+                color=ColorScheme.ACCENT
+            ).encode(
+                x='ds:T',
+                y='yhat_lower:Q',
+                y2='yhat_upper:Q'
+            )
+
+            return (line + forecast_area).properties(
+                title=title,
+                height=400
+            )
+
+        return line.properties(
+            title=title,
+            height=400
+        )
 
 # =============================================================================
 # VISUALIZATION
@@ -686,17 +923,21 @@ class InvoiceGenerator:
     @staticmethod
     def build_invoice_html(display_df: pd.DataFrame, numeric_df: pd.DataFrame,
                           total_payout: float, currency_symbol: str,
-                          penalty_rate: float = 100.0, pickup_fee: float = 0.0) -> str:
+                          penalty_rate: float = 100.0, pickup_payout_per_parcel: float = 1.50) -> str:
         """Build management summary invoice HTML with original layout."""
         try:
             total_parcels = int(numeric_df["Parcels Delivered"].sum())
             total_dispatchers = len(numeric_df)
             total_weight = numeric_df["Total Weight (kg)"].sum()
             total_penalty = numeric_df["Penalty"].sum()
+            total_dispatch_payout = numeric_df["Dispatch Payout"].sum() if "Dispatch Payout" in numeric_df.columns else 0.0
+            total_pickup_payout = numeric_df["Pickup Payout"].sum() if "Pickup Payout" in numeric_df.columns else 0.0
+            total_pickup_parcels = int(numeric_df["Pickup Parcels"].sum()) if "Pickup Parcels" in numeric_df.columns else 0
             top_3 = display_df.head(3)
 
             table_columns = ["Dispatcher ID", "Dispatcher Name", "Parcels Delivered",
-                           "Total Payout", "Penalty", "Total Weight (kg)"]
+                           "Dispatch Payout", "Pickup Parcels", "Pickup Payout",
+                           "Penalty", "Total Payout"]
 
             html = f"""
             <html>
@@ -809,16 +1050,24 @@ class InvoiceGenerator:
                             <div class="value">{total_parcels:,}</div>
                         </div>
                         <div class="chip">
-                            <div class="label">Total Weight</div>
-                            <div class="value">{total_weight:,.2f} kg</div>
+                            <div class="label">Dispatch Payout</div>
+                            <div class="value">{currency_symbol} {total_dispatch_payout:,.2f}</div>
+                        </div>
+                        <div class="chip">
+                            <div class="label">Pickup Parcels</div>
+                            <div class="value">{total_pickup_parcels:,}</div>
+                        </div>
+                        <div class="chip">
+                            <div class="label">Pickup Rate</div>
+                            <div class="value">{currency_symbol} {pickup_payout_per_parcel:.2f}</div>
+                        </div>
+                        <div class="chip">
+                            <div class="label">Pickup Payout</div>
+                            <div class="value">{currency_symbol} {total_pickup_payout:,.2f}</div>
                         </div>
                         <div class="chip">
                             <div class="label">Total Penalty</div>
                             <div class="value">-{currency_symbol} {total_penalty:,.2f}</div>
-                        </div>
-                        <div class="chip">
-                            <div class="label">Pickup Fee</div>
-                            <div class="value">{currency_symbol} {pickup_fee:,.2f}</div>
                         </div>
                     </div>
 
@@ -835,19 +1084,20 @@ class InvoiceGenerator:
                 html += "</tr>"
 
             html += "</tbody></table>"
+
             html += f"""
                     <div style="margin-top:3rem">
                         <table style="width:100%; background:var(--surface); border-radius:8px; margin-top:2rem; border:1px solid var(--border)">
                             <tr><th style="background:var(--primary);color:white;text-align:left;">Summary</th><th style="background:var(--primary);color:white;text-align:right;">Amount</th></tr>
-                            <tr><td>Total Base Payout</td><td style="text-align:right;">{currency_symbol} {total_payout+total_penalty-pickup_fee:,.2f}</td></tr>
+                            <tr><td>Total Dispatch Payout</td><td style="text-align:right;">{currency_symbol} {total_dispatch_payout:,.2f}</td></tr>
+                            <tr><td>Pickup Payout</td><td style="text-align:right;">{currency_symbol} {total_pickup_payout:,.2f}</td></tr>
                             <tr><td>Total Penalty</td><td style="text-align:right;">-{currency_symbol} {total_penalty:,.2f}</td></tr>
-                            <tr><td>Pickup Fee</td><td style="text-align:right;">{currency_symbol} {pickup_fee:,.2f}</td></tr>
                             <tr><td><strong>Total Payout</strong></td><td style="text-align:right;"><strong>{currency_symbol} {total_payout:,.2f}</strong></td></tr>
                         </table>
                     </div>
                     <div class="note">
-                        Generated on {datetime.now().strftime('%Y-%m-%d at %H:%M')} • JMR Management Dashboard<br>
-                        <em>Payout calculated using tier-based weight system</em>
+                        Generated on {datetime.now().strftime('%Y-%m-%d at %H:%M')} • JMR Management Dashboard v2.1<br>
+                        <em>Payout calculated using tier-based weight system + pickup parcel count</em>
                     </div>
                 </div>
             </body>
@@ -872,6 +1122,8 @@ def apply_custom_styles():
         [data-testid="stMetric"] {{ background: white; border: 1px solid {ColorScheme.BORDER};
                                     padding: 1rem; border-radius: 8px; }}
         [data-testid="stMetricValue"] {{ color: {ColorScheme.PRIMARY}; }}
+        .forecast-metric {{ background: linear-gradient(135deg, {ColorScheme.ACCENT}20, {ColorScheme.SECONDARY}20);
+                           border: 1px solid {ColorScheme.ACCENT}50; padding: 1rem; border-radius: 8px; }}
     </style>
     """, unsafe_allow_html=True)
 
@@ -881,7 +1133,7 @@ def add_footer():
     st.markdown(f"""
     <div style="margin-top: 3rem; padding: 1.5rem; background: linear-gradient(135deg, {ColorScheme.PRIMARY}, {ColorScheme.PRIMARY_LIGHT});
                 color: white; text-align: center; border-radius: 12px;">
-        © 2025 Jemari Ventures. All rights reserved. | JMR Management Dashboard v2.0
+        © 2025 Jemari Ventures. All rights reserved. | JMR Management Dashboard v2.1
     </div>
     """, unsafe_allow_html=True)
 
@@ -900,47 +1152,102 @@ def main():
                 padding: 2rem; border-radius: 12px; color: white; margin-bottom: 2rem; text-align: center;">
         <h1 style="color: white; margin: 0;">📊 JMR Management Dashboard</h1>
         <p style="color: rgba(255,255,255,0.9); margin: 0.5rem 0 0 0;">
-            Overview of dispatcher performance and payouts
+            Overview of dispatcher performance and payouts including pickup calculations
         </p>
     </div>
     """, unsafe_allow_html=True)
 
-    # Sidebar for data source selection
-    st.sidebar.header("⚙️ Data Source Configuration")
+    # Sidebar for configuration
+    st.sidebar.header("⚙️ Configuration")
     config = Config.load()
 
-    data_source_type = st.sidebar.radio(
-        "Select Data Source",
-        ["Google Sheets", "PostgreSQL"],
-        index=0 if config["data_source"]["type"] == "gsheet" else 1,
-        help="Choose between Google Sheets or PostgreSQL database"
-    )
+    # Show current database configuration
+    st.sidebar.success("✅ Using PostgreSQL Database")
+    st.sidebar.info(f"📊 Table: `{config['data_source'].get('postgres_table', 'dispatcher')}`")
+    st.sidebar.info(f"⚠️ Penalty Table: `{config['data_source'].get('penalty_table', 'penalty')}`")
+    st.sidebar.info(f"📦 Pickup Table: `{config['data_source'].get('pickup_table', 'pickup')}`")
 
-    # Update config based on selection
-    if data_source_type == "PostgreSQL":
-        config["data_source"]["type"] = "postgres"
-        st.sidebar.success("✅ Using PostgreSQL Database")
-        st.sidebar.info(f"📊 Table: `{config['data_source'].get('postgres_table', 'dispatcher')}`")
-        st.sidebar.info(f"⚠️ Penalty Table: `{config['data_source'].get('penalty_table', 'penalty')}`")
+    # Database connection status
+    engine = DataSource.get_postgres_engine()
+    if engine:
+        st.sidebar.success("✅ Database connection established")
     else:
-        config["data_source"]["type"] = "gsheet"
-        st.sidebar.success("✅ Using Google Sheets")
-
-    Config.save(config)
-
-    with st.spinner(f"📄 Loading data from {data_source_type}..."):
-        df = DataSource.load_data(config)
-
-    if df is None or df.empty:
-        st.error(f"❌ No data loaded from {data_source_type}. Check your configuration.")
+        st.sidebar.error("❌ Database connection failed")
+        st.error("Please check your PostgreSQL connection configuration in secrets.toml")
         add_footer()
         return
 
-    st.sidebar.header("⚙️ Configuration")
-    st.sidebar.info("**💰 Weight-Based Payout:**\n- 0-5kg: RM1.50\n- 5-10kg: RM1.60\n- 10-30kg: RM2.70\n- 30kg+: RM4.00\n\n**Pickup Fee:**\n- RM{:.2f}".format(config.get("pickup_fee", 0.0)))
+    with st.spinner("📄 Loading data from PostgreSQL..."):
+        df = DataSource.load_data(config)
 
-    # Load configuration
-    pickup_fee = config.get("pickup_fee", 0.0)
+    if df is None or df.empty:
+        st.error("❌ No data loaded from PostgreSQL. Check your configuration.")
+        add_footer()
+        return
+
+    st.sidebar.header("⚙️ Payout Settings")
+
+    # Add configuration for pickup payout per parcel
+    pickup_payout_per_parcel = st.sidebar.number_input(
+        "Pickup Payout per Parcel",
+        min_value=0.0,
+        max_value=100.0,
+        value=config.get("pickup_payout_per_parcel", 1.50),
+        step=0.10,
+        help="Payout amount per pickup parcel"
+    )
+
+    # Update config with new value
+    if pickup_payout_per_parcel != config.get("pickup_payout_per_parcel", 1.50):
+        config["pickup_payout_per_parcel"] = pickup_payout_per_parcel
+        Config.save(config)
+
+    # Add configuration for penalty rate
+    penalty_rate = st.sidebar.number_input(
+        "Penalty Rate per Incident",
+        min_value=0.0,
+        max_value=500.0,
+        value=config.get("penalty_rate", 100.0),
+        step=10.0,
+        help="Penalty amount per penalty incident"
+    )
+
+    # Update config with new value
+    if penalty_rate != config.get("penalty_rate", 100.0):
+        config["penalty_rate"] = penalty_rate
+        Config.save(config)
+
+    # Add configuration for forecast days
+    forecast_days = st.sidebar.number_input(
+        "Forecast Period (days)",
+        min_value=7,
+        max_value=90,
+        value=config.get("forecast_days", 30),
+        step=7,
+        help="Number of days to forecast"
+    )
+
+    # Update config with new value
+    if forecast_days != config.get("forecast_days", 30):
+        config["forecast_days"] = forecast_days
+        Config.save(config)
+
+    st.sidebar.info(f"""
+    **💰 Weight-Based Payout:**
+    - 0-5kg: RM1.50
+    - 5-10kg: RM1.60
+    - 10-30kg: RM2.70
+    - 30kg+: RM4.00
+
+    **📦 Pickup Payout:**
+    - RM{pickup_payout_per_parcel:.2f} per parcel
+
+    **⚠️ Penalty Rate:**
+    - RM{penalty_rate:.2f} per incident
+
+    **📈 Forecast Period:**
+    - {forecast_days} days
+    """)
 
     # Date filter
     auto_date_col = find_column(df, 'date')
@@ -990,24 +1297,14 @@ def main():
         else:
             st.sidebar.warning("Selected date column has no valid date values; showing all data.")
 
-    # Calculate payouts
-    currency = config.get("currency_symbol", "RM")
+    # Load penalty and pickup data
+    penalty_df = DataSource.load_penalty_data(config)
+    pickup_df = DataSource.load_pickup_data(config)
 
-    penalty_df = DataSource.load_penalty_data(config, "Sheet2")
-    penalty_rate = config.get("penalty_rate", 100.0)
-
-
-    # Calculate payouts
-    currency = config.get("currency_symbol", "RM")
-    penalty_df = DataSource.load_penalty_data(config, "Sheet2")
-    penalty_rate = config.get("penalty_rate", 100.0)
-
-    # 🔹 NEW: filter penalty_df by selected month/date range (same as main df)
-    if penalty_df is not None and not penalty_df.empty:
-        # Try to auto-detect a date column in penalty_df
+    # Filter penalty_df by selected month/date range (same as main df)
+    if penalty_df is not None and not penalty_df.empty and selected_date_col != "-- None --":
         penalty_date_col = find_column(penalty_df, "date")
         if penalty_date_col is None:
-            # Fallback: look for common date-like column names
             for col in penalty_df.columns:
                 if any(k in str(col).lower() for k in ["date", "created", "signature", "scan"]):
                     penalty_date_col = col
@@ -1022,36 +1319,73 @@ def main():
         else:
             st.warning("Penalty table has no detectable date column; penalties are not filtered by month.")
 
+    # Filter pickup_df by selected month/date range
+    if pickup_df is not None and not pickup_df.empty and selected_date_col != "-- None --":
+        pickup_date_col = None
+        for col in pickup_df.columns:
+            if any(k in str(col).lower() for k in ["date", "pick_up", "pickup", "signature"]):
+                pickup_date_col = col
+                break
+
+        if pickup_date_col is not None:
+            pickup_df[pickup_date_col] = pd.to_datetime(pickup_df[pickup_date_col], errors="coerce")
+            pickup_df = pickup_df[
+                (pickup_df[pickup_date_col].dt.date >= start_date) &
+                (pickup_df[pickup_date_col].dt.date <= end_date)
+            ]
+        else:
+            st.warning("Pickup table has no detectable date column; pickup parcels are not filtered by month.")
+
+    # Calculate payouts
+    currency = config.get("currency_symbol", "RM")
+
     display_df, numeric_df, total_payout = PayoutCalculator.calculate_payout(
-        df, currency, penalty_df, penalty_rate, pickup_fee
+        df, currency, penalty_df, penalty_rate, pickup_df, pickup_payout_per_parcel
     )
-
-
-   # display_df, numeric_df, total_payout = PayoutCalculator.calculate_payout(df, currency, penalty_df, penalty_rate, pickup_fee)
 
     if numeric_df.empty:
         st.warning("No data after filtering.")
         add_footer()
         return
 
-    # Metrics
+    # Get daily trends for forecasting
+    daily_parcel_df = PayoutCalculator.get_daily_trend(df)
+
+    # Calculate daily payout trend (requires additional processing)
+    df_clean = DataProcessor.prepare_dataframe(df)
+    df_clean = DataProcessor.remove_duplicates(df_clean)
+
+    if 'weight' in df_clean.columns:
+        tiers = Config.load().get("weight_tiers")
+        df_clean['payout_rate'] = df_clean['weight'].apply(
+            lambda w: PayoutCalculator.get_rate_by_weight(w, tiers)
+        )
+        df_clean['payout'] = df_clean['payout_rate']
+
+        daily_payout_df = PayoutCalculator.get_daily_payout_trend(df_clean)
+
+    # Metrics - Updated to include Pickup Payout per Parcel
     st.subheader("📈 Performance Overview")
     col1, col2, col3, col4 = st.columns(4)
     col5, col6, col7, col8 = st.columns(4)
+
+    total_pickup_parcels = int(numeric_df["Pickup Parcels"].sum()) if "Pickup Parcels" in numeric_df.columns else 0
+    total_pickup_payout = numeric_df["Pickup Payout"].sum() if "Pickup Payout" in numeric_df.columns else 0.0
+    total_dispatch_payout = numeric_df["Dispatch Payout"].sum() if "Dispatch Payout" in numeric_df.columns else 0.0
+
     col1.metric("Dispatchers", f"{len(display_df):,}")
-    col2.metric("Parcels", f"{int(numeric_df['Parcels Delivered'].sum()):,}")
-    col3.metric("Total Weight", f"{numeric_df['Total Weight (kg)'].sum():,.2f} kg")
+    col2.metric("Delivery Parcels", f"{int(numeric_df['Parcels Delivered'].sum()):,}")
+    col3.metric("Pickup Parcels", f"{total_pickup_parcels:,}")
     col4.metric("Total Payout", f"{currency} {total_payout:,.2f}")
-    col5.metric("Total Penalty", f"-{currency} {numeric_df['Penalty'].sum():,.2f}")
-    col6.metric("Avg Weight", f"{numeric_df['Avg Weight (kg)'].mean():.2f} kg")
-    col7.metric("Avg Payout", f"{currency} {total_payout/len(numeric_df):.2f}")
-    col8.metric("Pickup Fee", f"{currency} {pickup_fee:,.2f}")
+    col5.metric("Dispatch Payout", f"{currency} {total_dispatch_payout:,.2f}")
+    col6.metric("Pickup Payout", f"{currency} {total_pickup_payout:,.2f}")
+    col7.metric("Pickup Rate", f"{currency} {pickup_payout_per_parcel:.2f}")
+    col8.metric("Total Penalty", f"-{currency} {numeric_df['Penalty'].sum():,.2f}")
 
     # Charts
     st.markdown("---")
     st.subheader("📊 Performance Analytics")
-    daily_df = PayoutCalculator.get_daily_trend(df)
-    charts = DataVisualizer.create_all_charts(daily_df, numeric_df)
+    charts = DataVisualizer.create_all_charts(daily_parcel_df, numeric_df)
 
     col1, col2 = st.columns([1, 1])
     with col1:
@@ -1066,11 +1400,14 @@ def main():
 
         st.markdown("##### 🏆 Top Performers")
         for _, row in numeric_df.head(5).iterrows():
+            pickup_parcels = row.get('Pickup Parcels', 0)
+            pickup_payout = row.get('Pickup Payout', 0.0)
+            dispatch_payout = row.get('Dispatch Payout', 0.0)
             st.markdown(f"""
             <div style="background: white; padding: 12px; border-radius: 8px; border: 1px solid #e2e8f0; margin: 8px 0;">
                 <div style="font-weight: 600; color: {ColorScheme.PRIMARY};">{row['Dispatcher Name']}</div>
                 <div style="color: #64748b; font-size: 0.9rem;">
-                    {row['Parcels Delivered']} parcels • {row['Total Weight (kg)']:.2f} kg • {currency}{row['Total Payout']:,.2f}
+                    {row['Parcels Delivered']} parcels • {pickup_parcels} pickups • {currency}{dispatch_payout:,.2f} dispatch • {currency}{row['Total Payout']:,.2f} total
                 </div>
             </div>
             """, unsafe_allow_html=True)
@@ -1078,7 +1415,204 @@ def main():
     # Data table
     st.markdown("---")
     st.subheader("👥 Dispatcher Performance Details")
-    st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+    # Reorder columns for better readability
+    preferred_order = [
+        "Dispatcher ID", "Dispatcher Name", "Parcels Delivered",
+        "Dispatch Payout", "Pickup Parcels", "Pickup Payout",
+        "Penalty", "Total Payout", "Total Weight (kg)", "Avg Weight (kg)",
+        "Avg Rate per Parcel", "Parcels 0-5kg", "Parcels 5.01-10kg",
+        "Parcels 10.01-30kg", "Parcels 30+kg"
+    ]
+
+    # Filter to only include columns that exist in display_df
+    existing_columns = [col for col in preferred_order if col in display_df.columns]
+    remaining_columns = [col for col in display_df.columns if col not in existing_columns]
+
+    # Create final column order
+    final_columns = existing_columns + remaining_columns
+
+    # Reorder the display dataframe
+    display_df_reordered = display_df[final_columns]
+
+    st.dataframe(display_df_reordered, use_container_width=True, hide_index=True)
+
+    # Forecasting Section - PARCEL FORECAST
+    st.markdown("---")
+    st.subheader("📈 Delivery & Payout Forecast")
+
+    if not daily_parcel_df.empty and len(daily_parcel_df) >= 7:
+        if PROPHET_AVAILABLE:
+            # Parcel Forecast
+            st.markdown("##### 📦 Parcel Delivery Forecast")
+            with st.spinner("Generating parcel forecast..."):
+                forecast_result = ForecastGenerator.generate_forecast(daily_parcel_df, forecast_days, 'total_parcels')
+
+                if forecast_result:
+                    model, forecast, forecast_summary = forecast_result
+
+                    # Display forecast metrics
+                    metrics = ForecastGenerator.calculate_forecast_metrics(daily_parcel_df, forecast_summary, 'total_parcels')
+
+                    if metrics:
+                        col1, col2, col3, col4 = st.columns(4)
+                        with col1:
+                            st.metric(
+                                "Avg Historical Parcels",
+                                f"{metrics['avg_historical']:.0f}",
+                                f"{metrics['change_pct']:+.1f}%"
+                            )
+                        with col2:
+                            st.metric(
+                                "Avg Forecast Parcels",
+                                f"{metrics['avg_forecast']:.0f}",
+                                f"±{metrics['forecast_std']:.0f}"
+                            )
+                        with col3:
+                            st.metric(
+                                "Max Forecast",
+                                f"{metrics['max_forecast']:.0f}"
+                            )
+                        with col4:
+                            st.metric(
+                                "Total Forecast Parcels",
+                                f"{metrics['total_forecast']:.0f}"
+                            )
+
+                    # Display forecast chart
+                    forecast_chart = ForecastGenerator.create_forecast_chart(
+                        daily_parcel_df, forecast_summary,
+                        title='30-Day Parcel Delivery Forecast',
+                        value_column='total_parcels',
+                        y_title='Parcels'
+                    )
+                    st.altair_chart(forecast_chart, use_container_width=True)
+
+                else:
+                    st.warning("Could not generate parcel forecast.")
+
+            # Payout Forecast (if we have payout data)
+            if not daily_payout_df.empty and len(daily_payout_df) >= 7:
+                st.markdown("##### 💰 Payout Forecast")
+                with st.spinner("Generating payout forecast..."):
+                    payout_forecast_result = ForecastGenerator.generate_forecast(
+                        daily_payout_df, forecast_days, 'total_payout'
+                    )
+
+                    if payout_forecast_result:
+                        payout_model, payout_forecast, payout_forecast_summary = payout_forecast_result
+
+                        # Display payout forecast metrics
+                        payout_metrics = ForecastGenerator.calculate_forecast_metrics(
+                            daily_payout_df, payout_forecast_summary, 'total_payout'
+                        )
+
+                        if payout_metrics:
+                            col1, col2, col3, col4 = st.columns(4)
+                            with col1:
+                                st.metric(
+                                    "Avg Historical Payout",
+                                    f"{currency} {payout_metrics['avg_historical']:,.2f}",
+                                    f"{payout_metrics['change_pct']:+.1f}%"
+                                )
+                            with col2:
+                                st.metric(
+                                    "Avg Forecast Payout",
+                                    f"{currency} {payout_metrics['avg_forecast']:,.2f}",
+                                    f"±{currency} {payout_metrics['forecast_std']:,.2f}"
+                                )
+                            with col3:
+                                st.metric(
+                                    "Max Forecast Payout",
+                                    f"{currency} {payout_metrics['max_forecast']:,.2f}"
+                                )
+                            with col4:
+                                st.metric(
+                                    "Total Forecast Payout",
+                                    f"{currency} {payout_metrics['total_forecast']:,.2f}"
+                                )
+
+                        # Display payout forecast chart
+                        payout_forecast_chart = ForecastGenerator.create_forecast_chart(
+                            daily_payout_df, payout_forecast_summary,
+                            title='30-Day Payout Forecast',
+                            value_column='total_payout',
+                            y_title=f'Payout ({currency})'
+                        )
+                        st.altair_chart(payout_forecast_chart, use_container_width=True)
+
+                        # Combined forecast table
+                        st.markdown("##### 📅 Forecast Details")
+
+                        # Create combined forecast table
+                        if forecast_result and payout_forecast_result:
+                            combined_forecast = forecast_summary.copy()
+                            combined_forecast['Date'] = combined_forecast['ds'].dt.strftime('%Y-%m-%d')
+                            combined_forecast['Parcels Forecast'] = combined_forecast['yhat'].round(0).astype(int)
+                            combined_forecast['Parcels Lower'] = combined_forecast['yhat_lower'].round(0).astype(int)
+                            combined_forecast['Parcels Upper'] = combined_forecast['yhat_upper'].round(0).astype(int)
+
+                            # Merge with payout forecast
+                            payout_display = payout_forecast_summary.copy()
+                            payout_display['Date'] = payout_display['ds'].dt.strftime('%Y-%m-%d')
+                            payout_display['Payout Forecast'] = payout_display['yhat'].round(2)
+                            payout_display['Payout Lower'] = payout_display['yhat_lower'].round(2)
+                            payout_display['Payout Upper'] = payout_display['yhat_upper'].round(2)
+
+                            combined_forecast = pd.merge(
+                                combined_forecast[['Date', 'Parcels Forecast', 'Parcels Lower', 'Parcels Upper']],
+                                payout_display[['Date', 'Payout Forecast', 'Payout Lower', 'Payout Upper']],
+                                on='Date'
+                            )
+
+                            # Format currency
+                            combined_forecast['Payout Forecast'] = combined_forecast['Payout Forecast'].apply(
+                                lambda x: f"{currency} {x:,.2f}"
+                            )
+                            combined_forecast['Payout Lower'] = combined_forecast['Payout Lower'].apply(
+                                lambda x: f"{currency} {x:,.2f}"
+                            )
+                            combined_forecast['Payout Upper'] = combined_forecast['Payout Upper'].apply(
+                                lambda x: f"{currency} {x:,.2f}"
+                            )
+
+                            st.dataframe(combined_forecast, use_container_width=True, hide_index=True)
+
+                        # Forecast insights
+                        st.markdown("##### 🔮 Forecast Insights")
+
+                        if metrics['change_pct'] > 10:
+                            st.info(f"📈 **Growing Parcel Trend:** Forecast shows a {metrics['change_pct']:.1f}% increase in daily parcels.")
+                        elif metrics['change_pct'] < -10:
+                            st.warning(f"📉 **Declining Parcel Trend:** Forecast shows a {abs(metrics['change_pct']):.1f}% decrease in daily parcels.")
+                        else:
+                            st.success("📊 **Stable Parcel Trend:** Forecast shows relatively stable parcel delivery volumes.")
+
+                        if payout_metrics['change_pct'] > 10:
+                            st.info(f"💰 **Growing Payout Trend:** Forecast shows a {payout_metrics['change_pct']:.1f}% increase in daily payouts.")
+                        elif payout_metrics['change_pct'] < -10:
+                            st.warning(f"💸 **Declining Payout Trend:** Forecast shows a {abs(payout_metrics['change_pct']):.1f}% decrease in daily payouts.")
+                        else:
+                            st.success("💵 **Stable Payout Trend:** Forecast shows relatively stable payout volumes.")
+
+                    else:
+                        st.warning("Could not generate payout forecast.")
+            else:
+                st.info("Insufficient payout data for forecasting. Need at least 7 days of payout data.")
+
+        else:
+            st.warning("""
+            ⚠️ **Prophet forecasting library is not installed.**
+
+            To enable forecasting features, install Prophet:
+            ```
+            pip install prophet
+            ```
+
+            Alternatively, you can use the basic trend analysis shown above.
+            """)
+    else:
+        st.info("Insufficient historical data for forecasting. Need at least 7 days of data.")
 
     if 'Penalty Parcels' in numeric_df.columns and numeric_df['Penalty Parcels'].sum() > 0:
         st.markdown("---")
@@ -1107,7 +1641,7 @@ def main():
 
     st.markdown("---")
     st.subheader("📄 Invoice Generation")
-    invoice_html = InvoiceGenerator.build_invoice_html(display_df, numeric_df, total_payout, currency, penalty_rate, pickup_fee)
+    invoice_html = InvoiceGenerator.build_invoice_html(display_df, numeric_df, total_payout, currency, penalty_rate, pickup_payout_per_parcel)
     st.download_button(
         label="📥 Download Invoice (HTML)",
         data=invoice_html.encode("utf-8"),
@@ -1117,7 +1651,7 @@ def main():
 
     st.markdown("---")
     st.subheader("📥 Export Data")
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     with col1:
         st.download_button(
             label="📊 Download Summary CSV",
@@ -1132,6 +1666,14 @@ def main():
             file_name=f"raw_data_{datetime.now().strftime('%Y%m%d')}.csv",
             mime="text/csv"
         )
+    with col3:
+        if pickup_df is not None and not pickup_df.empty:
+            st.download_button(
+                label="📦 Download Pickup Data CSV",
+                data=pickup_df.to_csv(index=False),
+                file_name=f"pickup_data_{datetime.now().strftime('%Y%m%d')}.csv",
+                mime="text/csv"
+            )
 
     add_footer()
 
