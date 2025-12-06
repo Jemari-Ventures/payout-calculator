@@ -62,8 +62,6 @@ class Config:
     DEFAULT_CONFIG = {
         "data_source": {
             "type": "postgres",
-            "gsheet_url": "https://docs.google.com/spreadsheets/d/1f-oIqIapeGqq4IROyrJ3Gi37smfDzUgz/edit?gid=1989473758#gid=1989473758",
-            "sheet_name": None,
             "postgres_table": "dispatcher",
             "penalty_table": "penalty",
             "pickup_table": "pickup"
@@ -75,8 +73,8 @@ class Config:
             {"min": 10, "max": 30, "rate": 2.70},
             {"min": 30, "max": float('inf'), "rate": 4.00}
         ],
-        "pickup_fee": 1.00,
-        "pickup_payout_per_parcel": 1.00,  # Default pickup payout per parcel
+        "pickup_fee": 0.00,
+        "pickup_payout_per_parcel": 1.50,
         "currency_symbol": "RM",
         "penalty_rate": 100.0
     }
@@ -160,7 +158,7 @@ def normalize_weight(series: pd.Series) -> pd.Series:
 # =============================================================================
 
 class DataSource:
-    """Handle data loading from Google Sheets and PostgreSQL."""
+    """Handle data loading from PostgreSQL."""
 
     @staticmethod
     def _get_postgres_connection():
@@ -251,157 +249,76 @@ class DataSource:
             raise
 
     @staticmethod
-    def _extract_gsheet_id_and_gid(url_or_id: str) -> Tuple[Optional[str], Optional[str]]:
-        """Extract spreadsheet ID and GID from Google Sheets URL."""
-        if not url_or_id:
-            return None, None
-
-        if re.fullmatch(r"[A-Za-z0-9_-]{20,}", url_or_id):
-            return url_or_id, None
-
-        try:
-            parsed = urlparse(url_or_id)
-            path_parts = [p for p in parsed.path.split('/') if p]
-
-            spreadsheet_id = None
-            if 'spreadsheets' in path_parts and 'd' in path_parts:
-                idx = path_parts.index('d')
-                if idx + 1 < len(path_parts):
-                    spreadsheet_id = path_parts[idx + 1]
-
-            query_gid = parse_qs(parsed.query).get('gid', [None])[0]
-            frag_gid_match = re.search(r"gid=(\d+)", parsed.fragment or "")
-            gid = query_gid or (frag_gid_match.group(1) if frag_gid_match else None)
-
-            return spreadsheet_id, gid
-        except Exception:
-            return None, None
-
-    @staticmethod
-    def _build_csv_url(spreadsheet_id: str, sheet_name: Optional[str], gid: Optional[str]) -> str:
-        """Construct CSV export URL."""
-        base = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}"
-        if sheet_name:
-            return f"{base}/gviz/tq?tqx=out:csv&sheet={sheet_name}"
-        if gid:
-            return f"{base}/export?format=csv&gid={gid}"
-        return f"{base}/export?format=csv"
-
-    @staticmethod
-    @st.cache_data(ttl=300)
-    def read_google_sheet(url_or_id: str, sheet_name: Optional[str] = None) -> pd.DataFrame:
-        """Fetch Google Sheet as DataFrame."""
-        spreadsheet_id, gid = DataSource._extract_gsheet_id_and_gid(url_or_id)
-        if not spreadsheet_id:
-            raise ValueError("Invalid Google Sheet URL or ID.")
-
-        csv_url = DataSource._build_csv_url(spreadsheet_id, sheet_name, gid)
-        try:
-            resp = requests.get(csv_url, timeout=30)
-            resp.raise_for_status()
-            return pd.read_csv(io.BytesIO(resp.content))
-        except Exception as exc:
-            st.error(f"Failed to fetch Google Sheet: {exc}")
-            raise
-
-    @staticmethod
     def load_data(config: dict) -> Optional[pd.DataFrame]:
         """Load data based on configuration."""
         data_source = config["data_source"]
 
-        if data_source["type"] == "postgres":
-            engine = DataSource.get_postgres_engine()
-            if engine:
-                try:
-                    table_name = data_source.get("postgres_table", "dispatcher")
-                    df = DataSource.read_postgres_table(engine, table_name)
-
-                    # Verify required columns exist after mapping
-                    required = ["Dispatcher ID", "Waybill Number", "Delivery Signature"]
-                    missing = [col for col in required if col not in df.columns]
-                    if missing:
-                        st.error(f"Missing required columns after mapping: {', '.join(missing)}")
-                        st.info("Available columns: " + ", ".join(df.columns.tolist()))
-                        return None
-
-                    return df
-                except Exception as exc:
-                    st.error(f"Error reading from PostgreSQL: {exc}")
-                    return None
-            else:
-                st.error("PostgreSQL engine not available")
-                return None
-
-        elif data_source["type"] == "gsheet" and data_source["gsheet_url"]:
-            try:
-                return DataSource.read_google_sheet(
-                    data_source["gsheet_url"],
-                    data_source["sheet_name"]
-                )
-            except Exception as exc:
-                st.error(f"Error reading Google Sheet: {exc}")
-        return None
-
-    @staticmethod
-    def load_penalty_data(config: dict, sheet_name: str = "Sheet2") -> Optional[pd.DataFrame]:
-        """Load penalty data from penalty table or Sheet2 based on configuration."""
-        data_source = config["data_source"]
-
-        if data_source["type"] == "postgres":
-            engine = DataSource.get_postgres_engine()
-            if engine:
-                try:
-                    penalty_table = data_source.get("penalty_table", "penalty")
-                    df = DataSource.read_postgres_table(engine, penalty_table)
-
-                    # Map penalty table columns
-                    penalty_mapping = {
-                        'waybill': 'Waybill Number',
-                        'responsible': 'RESPONSIBLE',
-                        'penalty_amount_actual': 'Penalty Amount'
-                    }
-
-                    rename_dict = {old: new for old, new in penalty_mapping.items() if old in df.columns}
-                    df = df.rename(columns=rename_dict)
-
-                    return df
-                except Exception as exc:
-                    st.warning(f"Could not load penalty data from PostgreSQL table '{penalty_table}': {exc}")
-                    return None
+        engine = DataSource.get_postgres_engine()
+        if not engine:
+            st.error("PostgreSQL engine not available")
             return None
 
-        elif data_source["type"] == "gsheet" and data_source["gsheet_url"]:
-            try:
-                return DataSource.read_google_sheet(data_source["gsheet_url"], sheet_name)
-            except Exception as exc:
-                st.warning(f"Could not load penalty data from {sheet_name}: {exc}")
+        try:
+            table_name = data_source.get("postgres_table", "dispatcher")
+            df = DataSource.read_postgres_table(engine, table_name)
+
+            # Verify required columns exist after mapping
+            required = ["Dispatcher ID", "Waybill Number", "Delivery Signature"]
+            missing = [col for col in required if col not in df.columns]
+            if missing:
+                st.error(f"Missing required columns after mapping: {', '.join(missing)}")
+                st.info("Available columns: " + ", ".join(df.columns.tolist()))
                 return None
-        return None
 
-    @staticmethod
-    def load_pickup_data(config: dict, sheet_name: str = "Sheet3") -> Optional[pd.DataFrame]:
-        """Load pickup data from pickup table or Sheet3 based on configuration."""
-        data_source = config["data_source"]
-
-        if data_source["type"] == "postgres":
-            engine = DataSource.get_postgres_engine()
-            if engine:
-                try:
-                    pickup_table = data_source.get("pickup_table", "pickup")
-                    df = DataSource.read_postgres_table(engine, pickup_table)
-                    return df
-                except Exception as exc:
-                    st.warning(f"Could not load pickup data from PostgreSQL table '{pickup_table}': {exc}")
-                    return None
+            return df
+        except Exception as exc:
+            st.error(f"Error reading from PostgreSQL: {exc}")
             return None
 
-        elif data_source["type"] == "gsheet" and data_source["gsheet_url"]:
-            try:
-                return DataSource.read_google_sheet(data_source["gsheet_url"], sheet_name)
-            except Exception as exc:
-                st.warning(f"Could not load pickup data from {sheet_name}: {exc}")
-                return None
-        return None
+    @staticmethod
+    def load_penalty_data(config: dict) -> Optional[pd.DataFrame]:
+        """Load penalty data from penalty table."""
+        data_source = config["data_source"]
+        engine = DataSource.get_postgres_engine()
+
+        if not engine:
+            return None
+
+        try:
+            penalty_table = data_source.get("penalty_table", "penalty")
+            df = DataSource.read_postgres_table(engine, penalty_table)
+
+            # Map penalty table columns
+            penalty_mapping = {
+                'waybill': 'Waybill Number',
+                'responsible': 'RESPONSIBLE',
+                'penalty_amount_actual': 'Penalty Amount'
+            }
+
+            rename_dict = {old: new for old, new in penalty_mapping.items() if old in df.columns}
+            df = df.rename(columns=rename_dict)
+
+            return df
+        except Exception as exc:
+            st.warning(f"Could not load penalty data from PostgreSQL table '{penalty_table}': {exc}")
+            return None
+
+    @staticmethod
+    def load_pickup_data(config: dict) -> Optional[pd.DataFrame]:
+        """Load pickup data from pickup table."""
+        data_source = config["data_source"]
+        engine = DataSource.get_postgres_engine()
+
+        if not engine:
+            return None
+
+        try:
+            pickup_table = data_source.get("pickup_table", "pickup")
+            df = DataSource.read_postgres_table(engine, pickup_table)
+            return df
+        except Exception as exc:
+            st.warning(f"Could not load pickup data from PostgreSQL table '{pickup_table}': {exc}")
+            return None
 
 # =============================================================================
 # DATA PROCESSING
@@ -610,9 +527,6 @@ class PayoutCalculator:
         dispatcher_summary_df['pickup_parcels'] = dispatcher_summary_df['pickup_parcels'].fillna(0)
         dispatcher_summary_df['pickup_payout'] = dispatcher_summary_df['pickup_payout'].fillna(0.0)
 
-        # Update total payout to include pickup payout
-        dispatcher_summary_df['total_payout'] = dispatcher_summary_df['total_payout'] + dispatcher_summary_df['pickup_payout']
-
         return dispatcher_summary_df
 
     @staticmethod
@@ -679,14 +593,14 @@ class PayoutCalculator:
 
         # Recompute total payout from tier counts
         tier_rates = [rate_tier1, rate_tier2, rate_tier3, rate_tier4]
-        grouped['total_payout'] = (
+        grouped['dispatch_payout'] = (
             grouped['tier1_parcels'] * tier_rates[0]
             + grouped['tier2_parcels'] * tier_rates[1]
             + grouped['tier3_parcels'] * tier_rates[2]
             + grouped['tier4_parcels'] * tier_rates[3]
         )
 
-        grouped['avg_rate'] = grouped['total_payout'] / grouped['parcel_count']
+        grouped['avg_rate'] = grouped['dispatch_payout'] / grouped['parcel_count']
 
         # Calculate penalties
         grouped['penalty_amount'] = 0.0
@@ -702,10 +616,12 @@ class PayoutCalculator:
                 grouped.at[i, 'penalty_amount'] = penalty_amount
                 grouped.at[i, 'penalty_count'] = penalty_count
                 grouped.at[i, 'penalty_waybills'] = ', '.join(penalty_waybills) if penalty_waybills else ''
-                grouped.at[i, 'total_payout'] = row['total_payout'] - penalty_amount
 
         # Calculate pickup payout
         grouped = PayoutCalculator.calculate_pickup_payout(pickup_df, grouped, pickup_payout_per_parcel)
+
+        # Calculate total payout: dispatch payout - penalty + pickup payout
+        grouped['total_payout'] = grouped['dispatch_payout'] - grouped['penalty_amount'] + grouped['pickup_payout']
 
         # Create display and numeric dataframes
         numeric_df = grouped.rename(columns={
@@ -715,6 +631,7 @@ class PayoutCalculator:
             "total_weight": "Total Weight (kg)",
             "avg_weight": "Avg Weight (kg)",
             "avg_rate": "Avg Rate per Parcel",
+            "dispatch_payout": "Dispatch Payout",
             "total_payout": "Total Payout",
             "penalty_amount": "Penalty",
             "penalty_count": "Penalty Parcels",
@@ -731,6 +648,7 @@ class PayoutCalculator:
         display_df["Total Weight (kg)"] = display_df["Total Weight (kg)"].apply(lambda x: f"{x:.2f}")
         display_df["Avg Weight (kg)"] = display_df["Avg Weight (kg)"].apply(lambda x: f"{x:.2f}")
         display_df["Avg Rate per Parcel"] = display_df["Avg Rate per Parcel"].apply(lambda x: f"{currency_symbol}{x:.2f}")
+        display_df["Dispatch Payout"] = display_df["Dispatch Payout"].apply(lambda x: f"{currency_symbol}{x:,.2f}")
         display_df["Total Payout"] = display_df["Total Payout"].apply(lambda x: f"{currency_symbol}{x:,.2f}")
         display_df["Penalty"] = display_df["Penalty"].apply(lambda x: f"-{currency_symbol}{x:,.2f}" if x > 0 else f"{currency_symbol}0.00")
         display_df["Pickup Payout"] = display_df["Pickup Payout"].apply(lambda x: f"{currency_symbol}{x:,.2f}")
@@ -744,13 +662,13 @@ class PayoutCalculator:
         st.success(f"✅ Processed {len(df_unique)} unique parcels from {len(grouped)} dispatchers")
 
         # Calculate breakdown for info message
-        base_payout = numeric_df["Total Payout"].sum() - numeric_df["Pickup Payout"].sum() - numeric_df["Penalty"].sum()
+        total_dispatch_payout = numeric_df["Dispatch Payout"].sum()
         total_pickup_payout = numeric_df["Pickup Payout"].sum()
         total_penalty = numeric_df["Penalty"].sum()
 
         st.info(f"""
         💰 **Payout Breakdown:**
-        - Base Payout: {currency_symbol} {base_payout:,.2f}
+        - Dispatch Payout: {currency_symbol} {total_dispatch_payout:,.2f}
         + Pickup Payout: {currency_symbol} {total_pickup_payout:,.2f}
         - Penalties: {currency_symbol} {total_penalty:,.2f}
         + Pickup Fee: {currency_symbol} {pickup_fee:,.2f}
@@ -850,12 +768,14 @@ class InvoiceGenerator:
             total_dispatchers = len(numeric_df)
             total_weight = numeric_df["Total Weight (kg)"].sum()
             total_penalty = numeric_df["Penalty"].sum()
+            total_dispatch_payout = numeric_df["Dispatch Payout"].sum() if "Dispatch Payout" in numeric_df.columns else 0.0
             total_pickup_payout = numeric_df["Pickup Payout"].sum() if "Pickup Payout" in numeric_df.columns else 0.0
             total_pickup_parcels = int(numeric_df["Pickup Parcels"].sum()) if "Pickup Parcels" in numeric_df.columns else 0
             top_3 = display_df.head(3)
 
             table_columns = ["Dispatcher ID", "Dispatcher Name", "Parcels Delivered",
-                           "Pickup Parcels", "Total Payout", "Penalty", "Total Weight (kg)"]
+                           "Dispatch Payout", "Pickup Parcels", "Pickup Payout",
+                           "Penalty", "Total Payout"]
 
             html = f"""
             <html>
@@ -968,15 +888,15 @@ class InvoiceGenerator:
                             <div class="value">{total_parcels:,}</div>
                         </div>
                         <div class="chip">
-                            <div class="label">Total Pickup Parcels</div>
+                            <div class="label">Dispatch Payout</div>
+                            <div class="value">{currency_symbol} {total_dispatch_payout:,.2f}</div>
+                        </div>
+                        <div class="chip">
+                            <div class="label">Pickup Parcels</div>
                             <div class="value">{total_pickup_parcels:,}</div>
                         </div>
                         <div class="chip">
-                            <div class="label">Total Weight</div>
-                            <div class="value">{total_weight:,.2f} kg</div>
-                        </div>
-                        <div class="chip">
-                            <div class="label">Total Pickup Payout</div>
+                            <div class="label">Pickup Payout</div>
                             <div class="value">{currency_symbol} {total_pickup_payout:,.2f}</div>
                         </div>
                         <div class="chip">
@@ -1003,14 +923,11 @@ class InvoiceGenerator:
 
             html += "</tbody></table>"
 
-            # Calculate base payout (excluding pickup payout and penalty)
-            base_payout = total_payout + total_penalty - total_pickup_payout - pickup_fee
-
             html += f"""
                     <div style="margin-top:3rem">
                         <table style="width:100%; background:var(--surface); border-radius:8px; margin-top:2rem; border:1px solid var(--border)">
                             <tr><th style="background:var(--primary);color:white;text-align:left;">Summary</th><th style="background:var(--primary);color:white;text-align:right;">Amount</th></tr>
-                            <tr><td>Total Base Payout</td><td style="text-align:right;">{currency_symbol} {base_payout:,.2f}</td></tr>
+                            <tr><td>Total Dispatch Payout</td><td style="text-align:right;">{currency_symbol} {total_dispatch_payout:,.2f}</td></tr>
                             <tr><td>Pickup Payout</td><td style="text-align:right;">{currency_symbol} {total_pickup_payout:,.2f}</td></tr>
                             <tr><td>Total Penalty</td><td style="text-align:right;">-{currency_symbol} {total_penalty:,.2f}</td></tr>
                             <tr><td>Pickup Fee</td><td style="text-align:right;">{currency_symbol} {pickup_fee:,.2f}</td></tr>
@@ -1077,39 +994,35 @@ def main():
     </div>
     """, unsafe_allow_html=True)
 
-    # Sidebar for data source selection
-    st.sidebar.header("⚙️ Data Source Configuration")
+    # Sidebar for configuration
+    st.sidebar.header("⚙️ Configuration")
     config = Config.load()
 
-    data_source_type = st.sidebar.radio(
-        "Select Data Source",
-        ["Google Sheets", "PostgreSQL"],
-        index=0 if config["data_source"]["type"] == "gsheet" else 1,
-        help="Choose between Google Sheets or PostgreSQL database"
-    )
+    # Show current database configuration
+    st.sidebar.success("✅ Using PostgreSQL Database")
+    st.sidebar.info(f"📊 Table: `{config['data_source'].get('postgres_table', 'dispatcher')}`")
+    st.sidebar.info(f"⚠️ Penalty Table: `{config['data_source'].get('penalty_table', 'penalty')}`")
+    st.sidebar.info(f"📦 Pickup Table: `{config['data_source'].get('pickup_table', 'pickup')}`")
 
-    # Update config based on selection
-    if data_source_type == "PostgreSQL":
-        config["data_source"]["type"] = "postgres"
-        st.sidebar.success("✅ Using PostgreSQL Database")
-        st.sidebar.info(f"📊 Table: `{config['data_source'].get('postgres_table', 'dispatcher')}`")
-        st.sidebar.info(f"⚠️ Penalty Table: `{config['data_source'].get('penalty_table', 'penalty')}`")
-        st.sidebar.info(f"📦 Pickup Table: `{config['data_source'].get('pickup_table', 'pickup')}`")
+    # Database connection status
+    engine = DataSource.get_postgres_engine()
+    if engine:
+        st.sidebar.success("✅ Database connection established")
     else:
-        config["data_source"]["type"] = "gsheet"
-        st.sidebar.success("✅ Using Google Sheets")
-
-    Config.save(config)
-
-    with st.spinner(f"📄 Loading data from {data_source_type}..."):
-        df = DataSource.load_data(config)
-
-    if df is None or df.empty:
-        st.error(f"❌ No data loaded from {data_source_type}. Check your configuration.")
+        st.sidebar.error("❌ Database connection failed")
+        st.error("Please check your PostgreSQL connection configuration in secrets.toml")
         add_footer()
         return
 
-    st.sidebar.header("⚙️ Configuration")
+    with st.spinner("📄 Loading data from PostgreSQL..."):
+        df = DataSource.load_data(config)
+
+    if df is None or df.empty:
+        st.error("❌ No data loaded from PostgreSQL. Check your configuration.")
+        add_footer()
+        return
+
+    st.sidebar.header("⚙️ Payout Settings")
 
     # Add configuration for pickup payout per parcel
     pickup_payout_per_parcel = st.sidebar.number_input(
@@ -1126,6 +1039,36 @@ def main():
         config["pickup_payout_per_parcel"] = pickup_payout_per_parcel
         Config.save(config)
 
+    # Add configuration for penalty rate
+    penalty_rate = st.sidebar.number_input(
+        "Penalty Rate per Incident",
+        min_value=0.0,
+        max_value=500.0,
+        value=config.get("penalty_rate", 100.0),
+        step=10.0,
+        help="Penalty amount per penalty incident"
+    )
+
+    # Update config with new value
+    if penalty_rate != config.get("penalty_rate", 100.0):
+        config["penalty_rate"] = penalty_rate
+        Config.save(config)
+
+    # Add configuration for pickup fee
+    pickup_fee = st.sidebar.number_input(
+        "Pickup Fee",
+        min_value=0.0,
+        max_value=1000.0,
+        value=config.get("pickup_fee", 0.0),
+        step=10.0,
+        help="Fixed pickup fee"
+    )
+
+    # Update config with new value
+    if pickup_fee != config.get("pickup_fee", 0.0):
+        config["pickup_fee"] = pickup_fee
+        Config.save(config)
+
     st.sidebar.info(f"""
     **💰 Weight-Based Payout:**
     - 0-5kg: RM1.50
@@ -1136,8 +1079,11 @@ def main():
     **📦 Pickup Payout:**
     - RM{pickup_payout_per_parcel:.2f} per parcel
 
+    **⚠️ Penalty Rate:**
+    - RM{penalty_rate:.2f} per incident
+
     **🚚 Pickup Fee:**
-    - RM{config.get("pickup_fee", 0.0):.2f}
+    - RM{pickup_fee:.2f}
     """)
 
     # Date filter
@@ -1188,17 +1134,12 @@ def main():
         else:
             st.sidebar.warning("Selected date column has no valid date values; showing all data.")
 
-    # Calculate payouts
-    currency = config.get("currency_symbol", "RM")
-    pickup_fee = config.get("pickup_fee", 0.0)
-    penalty_rate = config.get("penalty_rate", 100.0)
-
     # Load penalty and pickup data
-    penalty_df = DataSource.load_penalty_data(config, "Sheet2")
-    pickup_df = DataSource.load_pickup_data(config, "Sheet3")
+    penalty_df = DataSource.load_penalty_data(config)
+    pickup_df = DataSource.load_pickup_data(config)
 
     # Filter penalty_df by selected month/date range (same as main df)
-    if penalty_df is not None and not penalty_df.empty:
+    if penalty_df is not None and not penalty_df.empty and selected_date_col != "-- None --":
         penalty_date_col = find_column(penalty_df, "date")
         if penalty_date_col is None:
             for col in penalty_df.columns:
@@ -1216,7 +1157,7 @@ def main():
             st.warning("Penalty table has no detectable date column; penalties are not filtered by month.")
 
     # Filter pickup_df by selected month/date range
-    if pickup_df is not None and not pickup_df.empty:
+    if pickup_df is not None and not pickup_df.empty and selected_date_col != "-- None --":
         pickup_date_col = None
         for col in pickup_df.columns:
             if any(k in str(col).lower() for k in ["date", "pick_up", "pickup", "signature"]):
@@ -1231,6 +1172,9 @@ def main():
             ]
         else:
             st.warning("Pickup table has no detectable date column; pickup parcels are not filtered by month.")
+
+    # Calculate payouts
+    currency = config.get("currency_symbol", "RM")
 
     display_df, numeric_df, total_payout = PayoutCalculator.calculate_payout(
         df, currency, penalty_df, penalty_rate, pickup_fee, pickup_df, pickup_payout_per_parcel
@@ -1248,14 +1192,15 @@ def main():
 
     total_pickup_parcels = int(numeric_df["Pickup Parcels"].sum()) if "Pickup Parcels" in numeric_df.columns else 0
     total_pickup_payout = numeric_df["Pickup Payout"].sum() if "Pickup Payout" in numeric_df.columns else 0.0
+    total_dispatch_payout = numeric_df["Dispatch Payout"].sum() if "Dispatch Payout" in numeric_df.columns else 0.0
 
     col1.metric("Dispatchers", f"{len(display_df):,}")
     col2.metric("Delivery Parcels", f"{int(numeric_df['Parcels Delivered'].sum()):,}")
     col3.metric("Pickup Parcels", f"{total_pickup_parcels:,}")
     col4.metric("Total Payout", f"{currency} {total_payout:,.2f}")
-    col5.metric("Total Penalty", f"-{currency} {numeric_df['Penalty'].sum():,.2f}")
+    col5.metric("Dispatch Payout", f"{currency} {total_dispatch_payout:,.2f}")
     col6.metric("Pickup Payout", f"{currency} {total_pickup_payout:,.2f}")
-    col7.metric("Avg Weight", f"{numeric_df['Avg Weight (kg)'].mean():.2f} kg")
+    col7.metric("Total Penalty", f"-{currency} {numeric_df['Penalty'].sum():,.2f}")
     col8.metric("Pickup Fee", f"{currency} {pickup_fee:,.2f}")
 
     # Charts
@@ -1279,19 +1224,40 @@ def main():
         for _, row in numeric_df.head(5).iterrows():
             pickup_parcels = row.get('Pickup Parcels', 0)
             pickup_payout = row.get('Pickup Payout', 0.0)
+            dispatch_payout = row.get('Dispatch Payout', 0.0)
             st.markdown(f"""
             <div style="background: white; padding: 12px; border-radius: 8px; border: 1px solid #e2e8f0; margin: 8px 0;">
                 <div style="font-weight: 600; color: {ColorScheme.PRIMARY};">{row['Dispatcher Name']}</div>
                 <div style="color: #64748b; font-size: 0.9rem;">
-                    {row['Parcels Delivered']} parcels • {pickup_parcels} pickups • {currency}{row['Total Payout']:,.2f}
+                    {row['Parcels Delivered']} parcels • {pickup_parcels} pickups • {currency}{dispatch_payout:,.2f} dispatch • {currency}{row['Total Payout']:,.2f} total
                 </div>
             </div>
             """, unsafe_allow_html=True)
 
-    # Data table
+    # Data table - Reorder columns to show Dispatch Payout first
     st.markdown("---")
     st.subheader("👥 Dispatcher Performance Details")
-    st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+    # Reorder columns for better readability
+    preferred_order = [
+        "Dispatcher ID", "Dispatcher Name", "Parcels Delivered",
+        "Dispatch Payout", "Pickup Parcels", "Pickup Payout",
+        "Penalty", "Total Payout", "Total Weight (kg)", "Avg Weight (kg)",
+        "Avg Rate per Parcel", "Parcels 0-5kg", "Parcels 5.01-10kg",
+        "Parcels 10.01-30kg", "Parcels 30+kg"
+    ]
+
+    # Filter to only include columns that exist in display_df
+    existing_columns = [col for col in preferred_order if col in display_df.columns]
+    remaining_columns = [col for col in display_df.columns if col not in existing_columns]
+
+    # Create final column order
+    final_columns = existing_columns + remaining_columns
+
+    # Reorder the display dataframe
+    display_df_reordered = display_df[final_columns]
+
+    st.dataframe(display_df_reordered, use_container_width=True, hide_index=True)
 
     if 'Penalty Parcels' in numeric_df.columns and numeric_df['Penalty Parcels'].sum() > 0:
         st.markdown("---")
@@ -1337,6 +1303,30 @@ def main():
                 <p style="margin: 0.25rem 0;">• Dispatchers with Pickups: <strong>{len(pickup_details)}</strong></p>
             </div>
             """, unsafe_allow_html=True)
+
+    # Dispatch payout summary
+    if 'Dispatch Payout' in numeric_df.columns:
+        st.markdown("---")
+        st.subheader("🚚 Dispatch Payout Summary")
+
+        dispatch_summary = numeric_df[['Dispatcher ID', 'Dispatcher Name', 'Parcels Delivered', 'Dispatch Payout']]
+        if not dispatch_summary.empty:
+            # Add a summary row
+            total_row = pd.DataFrame({
+                'Dispatcher ID': ['TOTAL'],
+                'Dispatcher Name': [''],
+                'Parcels Delivered': [int(numeric_df['Parcels Delivered'].sum())],
+                'Dispatch Payout': [total_dispatch_payout]
+            })
+            dispatch_summary_with_total = pd.concat([dispatch_summary, total_row], ignore_index=True)
+
+            # Format the display
+            dispatch_display = dispatch_summary_with_total.copy()
+            dispatch_display['Dispatch Payout'] = dispatch_display['Dispatch Payout'].apply(
+                lambda x: f"{currency}{x:,.2f}" if isinstance(x, (int, float)) else x
+            )
+
+            st.dataframe(dispatch_display, use_container_width=True, hide_index=True)
 
     st.markdown("---")
     st.subheader("📄 Invoice Generation")
