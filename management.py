@@ -65,7 +65,8 @@ class Config:
             "gsheet_url": "https://docs.google.com/spreadsheets/d/1f-oIqIapeGqq4IROyrJ3Gi37smfDzUgz/edit?gid=1989473758#gid=1989473758",
             "sheet_name": None,
             "postgres_table": "dispatcher",
-            "penalty_table": "penalty"
+            "penalty_table": "penalty",
+            "pickup_table": "pickup"
         },
         "database": {"table_name": "dispatcher"},
         "weight_tiers": [
@@ -74,7 +75,8 @@ class Config:
             {"min": 10, "max": 30, "rate": 2.70},
             {"min": 30, "max": float('inf'), "rate": 4.00}
         ],
-        "pickup_fee": 0.00,
+        "pickup_fee": 1.00,
+        "pickup_payout_per_parcel": 1.00,  # Default pickup payout per parcel
         "currency_symbol": "RM",
         "penalty_rate": 100.0
     }
@@ -96,8 +98,12 @@ class Config:
                         config["data_source"]["postgres_table"] = "dispatcher"
                     if "penalty_table" not in config.get("data_source", {}):
                         config["data_source"]["penalty_table"] = "penalty"
+                    if "pickup_table" not in config.get("data_source", {}):
+                        config["data_source"]["pickup_table"] = "pickup"
                     if "penalty_rate" not in config:
                         config["penalty_rate"] = 100.0
+                    if "pickup_payout_per_parcel" not in config:
+                        config["pickup_payout_per_parcel"] = 1.50
                     cls._cache = config
                     return cls._cache
             except Exception as e:
@@ -191,18 +197,49 @@ class DataSource:
             query = f"SELECT * FROM {table_name}"
             df = pd.read_sql(query, _engine)
 
-            # Map database columns to expected application columns
-            column_mapping = {
-                'waybill': 'Waybill Number',
-                'delivery_signature': 'Delivery Signature',
-                'dispatcher_id': 'Dispatcher ID',
-                'dispatcher_name': 'Dispatcher Name',
-                'billing_weight': 'Billing Weight',
-                'date_|_pick_up': 'Pick Up Date',
-                'pick_up_dp': 'Pick Up DP',
-                'pick_up_dispatcher_id': 'Pick Up Dispatcher ID',
-                'pick_up_dispatcher_name': 'Pick Up Dispatcher Name'
-            }
+            # Define column mappings for different tables
+            if table_name == 'dispatcher' or table_name.endswith('dispatcher'):
+                column_mapping = {
+                    'waybill': 'Waybill Number',
+                    'delivery_signature': 'Delivery Signature',
+                    'dispatcher_id': 'Dispatcher ID',
+                    'dispatcher_name': 'Dispatcher Name',
+                    'billing_weight': 'Billing Weight',
+                    'date_|_pick_up': 'Pick Up Date',
+                    'pick_up_dp': 'Pick Up DP',
+                    'pick_up_dispatcher_id': 'Pick Up Dispatcher ID',
+                    'pick_up_dispatcher_name': 'Pick Up Dispatcher Name'
+                }
+            elif table_name == 'pickup' or table_name.endswith('pickup'):
+                column_mapping = {
+                    'waybill_number': 'Waybill Number',
+                    'date_|_pick_up': 'Pick Up Date',
+                    'pickup_dp': 'Pickup DP',
+                    'responsible_department': 'Responsible Department',
+                    'pickup_dispatcher_id': 'Pickup Dispatcher ID',
+                    'pickup_dispatcher_name': 'Pickup Dispatcher Name',
+                    'vip_code': 'VIP Code',
+                    'domestic___international': 'Domestic/International',
+                    'order_source': 'Order Source',
+                    'product_type': 'Product Type',
+                    'dp_|_signing': 'DP Signing',
+                    'delivery_signature': 'Delivery Signature',
+                    'dispatcher_id': 'Dispatcher ID',
+                    'dispatcher_name': 'Dispatcher Name',
+                    'arrival_time': 'Arrival Time',
+                    'arriving_dp': 'Arriving DP',
+                    'billing_weight': 'Billing Weight',
+                    'item_type': 'Item Type',
+                    'cod_amount': 'COD Amount'
+                }
+            elif table_name == 'penalty' or table_name.endswith('penalty'):
+                column_mapping = {
+                    'waybill': 'Waybill Number',
+                    'responsible': 'RESPONSIBLE',
+                    'penalty_amount_actual': 'Penalty Amount'
+                }
+            else:
+                column_mapping = {}
 
             # Rename columns that exist in the dataframe
             rename_dict = {old: new for old, new in column_mapping.items() if old in df.columns}
@@ -338,6 +375,31 @@ class DataSource:
                 return DataSource.read_google_sheet(data_source["gsheet_url"], sheet_name)
             except Exception as exc:
                 st.warning(f"Could not load penalty data from {sheet_name}: {exc}")
+                return None
+        return None
+
+    @staticmethod
+    def load_pickup_data(config: dict, sheet_name: str = "Sheet3") -> Optional[pd.DataFrame]:
+        """Load pickup data from pickup table or Sheet3 based on configuration."""
+        data_source = config["data_source"]
+
+        if data_source["type"] == "postgres":
+            engine = DataSource.get_postgres_engine()
+            if engine:
+                try:
+                    pickup_table = data_source.get("pickup_table", "pickup")
+                    df = DataSource.read_postgres_table(engine, pickup_table)
+                    return df
+                except Exception as exc:
+                    st.warning(f"Could not load pickup data from PostgreSQL table '{pickup_table}': {exc}")
+                    return None
+            return None
+
+        elif data_source["type"] == "gsheet" and data_source["gsheet_url"]:
+            try:
+                return DataSource.read_google_sheet(data_source["gsheet_url"], sheet_name)
+            except Exception as exc:
+                st.warning(f"Could not load pickup data from {sheet_name}: {exc}")
                 return None
         return None
 
@@ -480,7 +542,83 @@ class PayoutCalculator:
         return float(penalty_amount), penalty_count, waybill_numbers
 
     @staticmethod
-    def calculate_payout(df: pd.DataFrame, currency_symbol: str, penalty_df: Optional[pd.DataFrame] = None, penalty_rate: float = 100.0, pickup_fee: float = 0.0) -> Tuple[pd.DataFrame, pd.DataFrame, float]:
+    def calculate_pickup_payout(pickup_df: pd.DataFrame, dispatcher_summary_df: pd.DataFrame, pickup_payout_per_parcel: float = 1.50) -> pd.DataFrame:
+        """
+        Calculate pickup payout based on pickup data.
+
+        Args:
+            pickup_df: DataFrame containing pickup data
+            dispatcher_summary_df: DataFrame containing dispatcher summary (must have 'Dispatcher ID' column)
+            pickup_payout_per_parcel: Payout per pickup parcel
+
+        Returns:
+            DataFrame with pickup payout added to dispatcher summary
+        """
+        if pickup_df is None or pickup_df.empty:
+            dispatcher_summary_df['pickup_parcels'] = 0
+            dispatcher_summary_df['pickup_payout'] = 0.0
+            return dispatcher_summary_df
+
+        # Find pickup dispatcher ID column
+        pickup_dispatcher_col = None
+        for col in pickup_df.columns:
+            if 'pickup_dispatcher_id' in col.lower() or 'Pickup Dispatcher ID' in col:
+                pickup_dispatcher_col = col
+                break
+
+        if not pickup_dispatcher_col:
+            st.warning("⚠️ No pickup dispatcher ID column found in pickup data")
+            dispatcher_summary_df['pickup_parcels'] = 0
+            dispatcher_summary_df['pickup_payout'] = 0.0
+            return dispatcher_summary_df
+
+        # Find waybill column in pickup data
+        waybill_col = None
+        for col in pickup_df.columns:
+            if 'waybill' in col.lower() or 'Waybill Number' in col:
+                waybill_col = col
+                break
+
+        if not waybill_col:
+            st.warning("⚠️ No waybill column found in pickup data")
+            dispatcher_summary_df['pickup_parcels'] = 0
+            dispatcher_summary_df['pickup_payout'] = 0.0
+            return dispatcher_summary_df
+
+        # Clean pickup dispatcher IDs
+        pickup_df['clean_pickup_dispatcher_id'] = pickup_df[pickup_dispatcher_col].astype(str).str.strip()
+
+        # Group by pickup dispatcher ID to count unique waybills
+        pickup_summary = pickup_df.groupby('clean_pickup_dispatcher_id').agg(
+            pickup_parcels=(waybill_col, 'nunique')
+        ).reset_index()
+
+        # Calculate pickup payout
+        pickup_summary['pickup_payout'] = pickup_summary['pickup_parcels'] * pickup_payout_per_parcel
+
+        # Rename column for merging
+        pickup_summary = pickup_summary.rename(columns={'clean_pickup_dispatcher_id': 'dispatcher_id'})
+
+        # Merge with dispatcher summary
+        dispatcher_summary_df = dispatcher_summary_df.merge(
+            pickup_summary[['dispatcher_id', 'pickup_parcels', 'pickup_payout']],
+            on='dispatcher_id',
+            how='left'
+        )
+
+        # Fill NaN values
+        dispatcher_summary_df['pickup_parcels'] = dispatcher_summary_df['pickup_parcels'].fillna(0)
+        dispatcher_summary_df['pickup_payout'] = dispatcher_summary_df['pickup_payout'].fillna(0.0)
+
+        # Update total payout to include pickup payout
+        dispatcher_summary_df['total_payout'] = dispatcher_summary_df['total_payout'] + dispatcher_summary_df['pickup_payout']
+
+        return dispatcher_summary_df
+
+    @staticmethod
+    def calculate_payout(df: pd.DataFrame, currency_symbol: str, penalty_df: Optional[pd.DataFrame] = None,
+                        penalty_rate: float = 100.0, pickup_fee: float = 0.0,
+                        pickup_df: Optional[pd.DataFrame] = None, pickup_payout_per_parcel: float = 1.50) -> Tuple[pd.DataFrame, pd.DataFrame, float]:
         """Calculate payout using tier-based weight calculation."""
         # Prepare data
         df_clean = DataProcessor.prepare_dataframe(df)
@@ -566,6 +704,9 @@ class PayoutCalculator:
                 grouped.at[i, 'penalty_waybills'] = ', '.join(penalty_waybills) if penalty_waybills else ''
                 grouped.at[i, 'total_payout'] = row['total_payout'] - penalty_amount
 
+        # Calculate pickup payout
+        grouped = PayoutCalculator.calculate_pickup_payout(pickup_df, grouped, pickup_payout_per_parcel)
+
         # Create display and numeric dataframes
         numeric_df = grouped.rename(columns={
             "dispatcher_id": "Dispatcher ID",
@@ -578,6 +719,8 @@ class PayoutCalculator:
             "penalty_amount": "Penalty",
             "penalty_count": "Penalty Parcels",
             "penalty_waybills": "Penalty Waybills",
+            "pickup_parcels": "Pickup Parcels",
+            "pickup_payout": "Pickup Payout",
             "tier1_parcels": "Parcels 0-5kg",
             "tier2_parcels": "Parcels 5.01-10kg",
             "tier3_parcels": "Parcels 10.01-30kg",
@@ -590,6 +733,7 @@ class PayoutCalculator:
         display_df["Avg Rate per Parcel"] = display_df["Avg Rate per Parcel"].apply(lambda x: f"{currency_symbol}{x:.2f}")
         display_df["Total Payout"] = display_df["Total Payout"].apply(lambda x: f"{currency_symbol}{x:,.2f}")
         display_df["Penalty"] = display_df["Penalty"].apply(lambda x: f"-{currency_symbol}{x:,.2f}" if x > 0 else f"{currency_symbol}0.00")
+        display_df["Pickup Payout"] = display_df["Pickup Payout"].apply(lambda x: f"{currency_symbol}{x:,.2f}")
 
         if "Penalty Waybills" in display_df.columns:
             display_df = display_df.drop(columns=["Penalty Waybills"])
@@ -598,7 +742,20 @@ class PayoutCalculator:
 
         total_payout = numeric_df["Total Payout"].sum() + pickup_fee
         st.success(f"✅ Processed {len(df_unique)} unique parcels from {len(grouped)} dispatchers")
-        st.info(f"💰 Total Payout: {currency_symbol} {total_payout:,.2f} (inclusive of pickup fee: {currency_symbol} {pickup_fee:,.2f})")
+
+        # Calculate breakdown for info message
+        base_payout = numeric_df["Total Payout"].sum() - numeric_df["Pickup Payout"].sum() - numeric_df["Penalty"].sum()
+        total_pickup_payout = numeric_df["Pickup Payout"].sum()
+        total_penalty = numeric_df["Penalty"].sum()
+
+        st.info(f"""
+        💰 **Payout Breakdown:**
+        - Base Payout: {currency_symbol} {base_payout:,.2f}
+        + Pickup Payout: {currency_symbol} {total_pickup_payout:,.2f}
+        - Penalties: {currency_symbol} {total_penalty:,.2f}
+        + Pickup Fee: {currency_symbol} {pickup_fee:,.2f}
+        **Total Payout: {currency_symbol} {total_payout:,.2f}**
+        """)
 
         return display_df, numeric_df, total_payout
 
@@ -693,10 +850,12 @@ class InvoiceGenerator:
             total_dispatchers = len(numeric_df)
             total_weight = numeric_df["Total Weight (kg)"].sum()
             total_penalty = numeric_df["Penalty"].sum()
+            total_pickup_payout = numeric_df["Pickup Payout"].sum() if "Pickup Payout" in numeric_df.columns else 0.0
+            total_pickup_parcels = int(numeric_df["Pickup Parcels"].sum()) if "Pickup Parcels" in numeric_df.columns else 0
             top_3 = display_df.head(3)
 
             table_columns = ["Dispatcher ID", "Dispatcher Name", "Parcels Delivered",
-                           "Total Payout", "Penalty", "Total Weight (kg)"]
+                           "Pickup Parcels", "Total Payout", "Penalty", "Total Weight (kg)"]
 
             html = f"""
             <html>
@@ -809,8 +968,16 @@ class InvoiceGenerator:
                             <div class="value">{total_parcels:,}</div>
                         </div>
                         <div class="chip">
+                            <div class="label">Total Pickup Parcels</div>
+                            <div class="value">{total_pickup_parcels:,}</div>
+                        </div>
+                        <div class="chip">
                             <div class="label">Total Weight</div>
                             <div class="value">{total_weight:,.2f} kg</div>
+                        </div>
+                        <div class="chip">
+                            <div class="label">Total Pickup Payout</div>
+                            <div class="value">{currency_symbol} {total_pickup_payout:,.2f}</div>
                         </div>
                         <div class="chip">
                             <div class="label">Total Penalty</div>
@@ -835,19 +1002,24 @@ class InvoiceGenerator:
                 html += "</tr>"
 
             html += "</tbody></table>"
+
+            # Calculate base payout (excluding pickup payout and penalty)
+            base_payout = total_payout + total_penalty - total_pickup_payout - pickup_fee
+
             html += f"""
                     <div style="margin-top:3rem">
                         <table style="width:100%; background:var(--surface); border-radius:8px; margin-top:2rem; border:1px solid var(--border)">
                             <tr><th style="background:var(--primary);color:white;text-align:left;">Summary</th><th style="background:var(--primary);color:white;text-align:right;">Amount</th></tr>
-                            <tr><td>Total Base Payout</td><td style="text-align:right;">{currency_symbol} {total_payout+total_penalty-pickup_fee:,.2f}</td></tr>
+                            <tr><td>Total Base Payout</td><td style="text-align:right;">{currency_symbol} {base_payout:,.2f}</td></tr>
+                            <tr><td>Pickup Payout</td><td style="text-align:right;">{currency_symbol} {total_pickup_payout:,.2f}</td></tr>
                             <tr><td>Total Penalty</td><td style="text-align:right;">-{currency_symbol} {total_penalty:,.2f}</td></tr>
                             <tr><td>Pickup Fee</td><td style="text-align:right;">{currency_symbol} {pickup_fee:,.2f}</td></tr>
                             <tr><td><strong>Total Payout</strong></td><td style="text-align:right;"><strong>{currency_symbol} {total_payout:,.2f}</strong></td></tr>
                         </table>
                     </div>
                     <div class="note">
-                        Generated on {datetime.now().strftime('%Y-%m-%d at %H:%M')} • JMR Management Dashboard<br>
-                        <em>Payout calculated using tier-based weight system</em>
+                        Generated on {datetime.now().strftime('%Y-%m-%d at %H:%M')} • JMR Management Dashboard v2.1<br>
+                        <em>Payout calculated using tier-based weight system + pickup parcel count</em>
                     </div>
                 </div>
             </body>
@@ -881,7 +1053,7 @@ def add_footer():
     st.markdown(f"""
     <div style="margin-top: 3rem; padding: 1.5rem; background: linear-gradient(135deg, {ColorScheme.PRIMARY}, {ColorScheme.PRIMARY_LIGHT});
                 color: white; text-align: center; border-radius: 12px;">
-        © 2025 Jemari Ventures. All rights reserved. | JMR Management Dashboard v2.0
+        © 2025 Jemari Ventures. All rights reserved. | JMR Management Dashboard v2.1
     </div>
     """, unsafe_allow_html=True)
 
@@ -900,7 +1072,7 @@ def main():
                 padding: 2rem; border-radius: 12px; color: white; margin-bottom: 2rem; text-align: center;">
         <h1 style="color: white; margin: 0;">📊 JMR Management Dashboard</h1>
         <p style="color: rgba(255,255,255,0.9); margin: 0.5rem 0 0 0;">
-            Overview of dispatcher performance and payouts
+            Overview of dispatcher performance and payouts including pickup calculations
         </p>
     </div>
     """, unsafe_allow_html=True)
@@ -922,6 +1094,7 @@ def main():
         st.sidebar.success("✅ Using PostgreSQL Database")
         st.sidebar.info(f"📊 Table: `{config['data_source'].get('postgres_table', 'dispatcher')}`")
         st.sidebar.info(f"⚠️ Penalty Table: `{config['data_source'].get('penalty_table', 'penalty')}`")
+        st.sidebar.info(f"📦 Pickup Table: `{config['data_source'].get('pickup_table', 'pickup')}`")
     else:
         config["data_source"]["type"] = "gsheet"
         st.sidebar.success("✅ Using Google Sheets")
@@ -937,10 +1110,35 @@ def main():
         return
 
     st.sidebar.header("⚙️ Configuration")
-    st.sidebar.info("**💰 Weight-Based Payout:**\n- 0-5kg: RM1.50\n- 5-10kg: RM1.60\n- 10-30kg: RM2.70\n- 30kg+: RM4.00\n\n**Pickup Fee:**\n- RM{:.2f}".format(config.get("pickup_fee", 0.0)))
 
-    # Load configuration
-    pickup_fee = config.get("pickup_fee", 0.0)
+    # Add configuration for pickup payout per parcel
+    pickup_payout_per_parcel = st.sidebar.number_input(
+        "Pickup Payout per Parcel",
+        min_value=0.0,
+        max_value=100.0,
+        value=config.get("pickup_payout_per_parcel", 1.50),
+        step=0.10,
+        help="Payout amount per pickup parcel"
+    )
+
+    # Update config with new value
+    if pickup_payout_per_parcel != config.get("pickup_payout_per_parcel", 1.50):
+        config["pickup_payout_per_parcel"] = pickup_payout_per_parcel
+        Config.save(config)
+
+    st.sidebar.info(f"""
+    **💰 Weight-Based Payout:**
+    - 0-5kg: RM1.50
+    - 5-10kg: RM1.60
+    - 10-30kg: RM2.70
+    - 30kg+: RM4.00
+
+    **📦 Pickup Payout:**
+    - RM{pickup_payout_per_parcel:.2f} per parcel
+
+    **🚚 Pickup Fee:**
+    - RM{config.get("pickup_fee", 0.0):.2f}
+    """)
 
     # Date filter
     auto_date_col = find_column(df, 'date')
@@ -992,22 +1190,17 @@ def main():
 
     # Calculate payouts
     currency = config.get("currency_symbol", "RM")
-
-    penalty_df = DataSource.load_penalty_data(config, "Sheet2")
+    pickup_fee = config.get("pickup_fee", 0.0)
     penalty_rate = config.get("penalty_rate", 100.0)
 
-
-    # Calculate payouts
-    currency = config.get("currency_symbol", "RM")
+    # Load penalty and pickup data
     penalty_df = DataSource.load_penalty_data(config, "Sheet2")
-    penalty_rate = config.get("penalty_rate", 100.0)
+    pickup_df = DataSource.load_pickup_data(config, "Sheet3")
 
-    # 🔹 NEW: filter penalty_df by selected month/date range (same as main df)
+    # Filter penalty_df by selected month/date range (same as main df)
     if penalty_df is not None and not penalty_df.empty:
-        # Try to auto-detect a date column in penalty_df
         penalty_date_col = find_column(penalty_df, "date")
         if penalty_date_col is None:
-            # Fallback: look for common date-like column names
             for col in penalty_df.columns:
                 if any(k in str(col).lower() for k in ["date", "created", "signature", "scan"]):
                     penalty_date_col = col
@@ -1022,12 +1215,26 @@ def main():
         else:
             st.warning("Penalty table has no detectable date column; penalties are not filtered by month.")
 
+    # Filter pickup_df by selected month/date range
+    if pickup_df is not None and not pickup_df.empty:
+        pickup_date_col = None
+        for col in pickup_df.columns:
+            if any(k in str(col).lower() for k in ["date", "pick_up", "pickup", "signature"]):
+                pickup_date_col = col
+                break
+
+        if pickup_date_col is not None:
+            pickup_df[pickup_date_col] = pd.to_datetime(pickup_df[pickup_date_col], errors="coerce")
+            pickup_df = pickup_df[
+                (pickup_df[pickup_date_col].dt.date >= start_date) &
+                (pickup_df[pickup_date_col].dt.date <= end_date)
+            ]
+        else:
+            st.warning("Pickup table has no detectable date column; pickup parcels are not filtered by month.")
+
     display_df, numeric_df, total_payout = PayoutCalculator.calculate_payout(
-        df, currency, penalty_df, penalty_rate, pickup_fee
+        df, currency, penalty_df, penalty_rate, pickup_fee, pickup_df, pickup_payout_per_parcel
     )
-
-
-   # display_df, numeric_df, total_payout = PayoutCalculator.calculate_payout(df, currency, penalty_df, penalty_rate, pickup_fee)
 
     if numeric_df.empty:
         st.warning("No data after filtering.")
@@ -1038,13 +1245,17 @@ def main():
     st.subheader("📈 Performance Overview")
     col1, col2, col3, col4 = st.columns(4)
     col5, col6, col7, col8 = st.columns(4)
+
+    total_pickup_parcels = int(numeric_df["Pickup Parcels"].sum()) if "Pickup Parcels" in numeric_df.columns else 0
+    total_pickup_payout = numeric_df["Pickup Payout"].sum() if "Pickup Payout" in numeric_df.columns else 0.0
+
     col1.metric("Dispatchers", f"{len(display_df):,}")
-    col2.metric("Parcels", f"{int(numeric_df['Parcels Delivered'].sum()):,}")
-    col3.metric("Total Weight", f"{numeric_df['Total Weight (kg)'].sum():,.2f} kg")
+    col2.metric("Delivery Parcels", f"{int(numeric_df['Parcels Delivered'].sum()):,}")
+    col3.metric("Pickup Parcels", f"{total_pickup_parcels:,}")
     col4.metric("Total Payout", f"{currency} {total_payout:,.2f}")
     col5.metric("Total Penalty", f"-{currency} {numeric_df['Penalty'].sum():,.2f}")
-    col6.metric("Avg Weight", f"{numeric_df['Avg Weight (kg)'].mean():.2f} kg")
-    col7.metric("Avg Payout", f"{currency} {total_payout/len(numeric_df):.2f}")
+    col6.metric("Pickup Payout", f"{currency} {total_pickup_payout:,.2f}")
+    col7.metric("Avg Weight", f"{numeric_df['Avg Weight (kg)'].mean():.2f} kg")
     col8.metric("Pickup Fee", f"{currency} {pickup_fee:,.2f}")
 
     # Charts
@@ -1066,11 +1277,13 @@ def main():
 
         st.markdown("##### 🏆 Top Performers")
         for _, row in numeric_df.head(5).iterrows():
+            pickup_parcels = row.get('Pickup Parcels', 0)
+            pickup_payout = row.get('Pickup Payout', 0.0)
             st.markdown(f"""
             <div style="background: white; padding: 12px; border-radius: 8px; border: 1px solid #e2e8f0; margin: 8px 0;">
                 <div style="font-weight: 600; color: {ColorScheme.PRIMARY};">{row['Dispatcher Name']}</div>
                 <div style="color: #64748b; font-size: 0.9rem;">
-                    {row['Parcels Delivered']} parcels • {row['Total Weight (kg)']:.2f} kg • {currency}{row['Total Payout']:,.2f}
+                    {row['Parcels Delivered']} parcels • {pickup_parcels} pickups • {currency}{row['Total Payout']:,.2f}
                 </div>
             </div>
             """, unsafe_allow_html=True)
@@ -1105,6 +1318,26 @@ def main():
         else:
             st.info("No penalty waybill numbers available")
 
+    # Pickup details
+    if 'Pickup Parcels' in numeric_df.columns and numeric_df['Pickup Parcels'].sum() > 0:
+        st.markdown("---")
+        st.subheader("📦 Pickup Details")
+
+        pickup_details = numeric_df[numeric_df['Pickup Parcels'] > 0][['Dispatcher ID', 'Dispatcher Name', 'Pickup Parcels', 'Pickup Payout']]
+        if not pickup_details.empty:
+            st.dataframe(pickup_details, use_container_width=True, hide_index=True)
+
+            # Show summary
+            st.markdown(f"""
+            <div style="background: {ColorScheme.BACKGROUND}; padding: 1rem; border-radius: 8px; border: 1px solid {ColorScheme.BORDER}; margin-top: 1rem;">
+                <h4 style="color: {ColorScheme.PRIMARY}; margin: 0 0 0.5rem 0;">📊 Pickup Summary</h4>
+                <p style="margin: 0.25rem 0;">• Total Pickup Parcels: <strong>{total_pickup_parcels:,}</strong></p>
+                <p style="margin: 0.25rem 0;">• Total Pickup Payout: <strong>{currency} {total_pickup_payout:,.2f}</strong></p>
+                <p style="margin: 0.25rem 0;">• Payout per Parcel: <strong>{currency} {pickup_payout_per_parcel:.2f}</strong></p>
+                <p style="margin: 0.25rem 0;">• Dispatchers with Pickups: <strong>{len(pickup_details)}</strong></p>
+            </div>
+            """, unsafe_allow_html=True)
+
     st.markdown("---")
     st.subheader("📄 Invoice Generation")
     invoice_html = InvoiceGenerator.build_invoice_html(display_df, numeric_df, total_payout, currency, penalty_rate, pickup_fee)
@@ -1117,7 +1350,7 @@ def main():
 
     st.markdown("---")
     st.subheader("📥 Export Data")
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     with col1:
         st.download_button(
             label="📊 Download Summary CSV",
@@ -1132,6 +1365,14 @@ def main():
             file_name=f"raw_data_{datetime.now().strftime('%Y%m%d')}.csv",
             mime="text/csv"
         )
+    with col3:
+        if pickup_df is not None and not pickup_df.empty:
+            st.download_button(
+                label="📦 Download Pickup Data CSV",
+                data=pickup_df.to_csv(index=False),
+                file_name=f"pickup_data_{datetime.now().strftime('%Y%m%d')}.csv",
+                mime="text/csv"
+            )
 
     add_footer()
 

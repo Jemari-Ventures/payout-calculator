@@ -1,10 +1,11 @@
 {
   "data_source": {
-    "type": "gsheet",
+    "type": "postgres",
     "gsheet_url": "https://docs.google.com/spreadsheets/d/1f-oIqIapeGqq4IROyrJ3Gi37smfDzUgz/edit?gid=1989473758#gid=1989473758",
     "sheet_name": null,
     "postgres_table": "dispatcher",
-    "penalty_table": "penalty"
+    "penalty_table": "penalty",
+    "pickup_table": "pickup"
   },
   "database": {
     "table_name": "dispatcher"
@@ -87,5 +88,6 @@
       "max": 999999,
       "rate": 4.0
     }
-  ]
+  ],
+  "pickup_payout_per_parcel": 1.0
 }
