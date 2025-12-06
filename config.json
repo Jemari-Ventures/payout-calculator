@@ -89,5 +89,6 @@
       "rate": 4.0
     }
   ],
-  "pickup_payout_per_parcel": 1.0
+  "pickup_payout_per_parcel": 1.0,
+  "forecast_days": 15
 }

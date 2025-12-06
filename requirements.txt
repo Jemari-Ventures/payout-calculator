@@ -5,3 +5,4 @@ requests
 sqlalchemy
 prophet
 psycopg2-binary
+plotly
