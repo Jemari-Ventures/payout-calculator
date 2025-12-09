@@ -4,7 +4,7 @@ import urllib3
 warnings.filterwarnings('ignore', category=urllib3.exceptions.NotOpenSSLWarning)
 
 import io
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 import re
 from urllib.parse import urlparse, parse_qs
 import json
@@ -53,7 +53,7 @@ class Config:
     DEFAULT_CONFIG = {
         "data_source": {
             "type": "gsheet",
-            "gsheet_url": "http://docs.google.com/spreadsheets/d/1f-oIqIapeGqq4IROyrJ3Gi37smfDzUgz/edit?gid=1989473758#gid=1989473758",
+            "gsheet_url": "https://docs.google.com/spreadsheets/d/1an9G3ryAuy8tEEyPW4j-7Hfhs7kTtYzvOyvEzwLgXzs/edit?gid=0#gid=0",
             "sheet_name": None
         },
         "tiers": [
@@ -85,7 +85,7 @@ class Config:
         "advance_payout": {
             "enabled": True,
             "percentage": 40.0,
-            "description": "Advance Payout"
+            "description": "Advance Payout (40% of Base Delivery)"
         }
     }
 
@@ -188,41 +188,65 @@ class DataSource:
 
     @staticmethod
     def load_data(config: dict) -> Optional[pd.DataFrame]:
-        """Load data based on configuration."""
+        """Load dispatcher delivery data from Sheet1."""
         data_source = config["data_source"]
 
         if data_source["type"] == "gsheet" and data_source["gsheet_url"]:
             try:
-                return DataSource.read_google_sheet(data_source["gsheet_url"], data_source["sheet_name"])
+                return DataSource.read_google_sheet(data_source["gsheet_url"], "Sheet1")
             except Exception as exc:
-                st.error(f"Error reading Google Sheet: {exc}")
+                st.error(f"Error reading dispatcher data from Sheet1: {exc}")
                 return None
         return None
 
     @staticmethod
-    def load_penalty_data(config: dict, sheet_name: str = "Sheet2") -> Optional[pd.DataFrame]:
-        """Load penalty data from Sheet2 based on configuration."""
+    def load_pickup_data(config: dict) -> Optional[pd.DataFrame]:
+        """Load pickup data from Sheet2."""
         data_source = config["data_source"]
-
         if data_source["type"] == "gsheet" and data_source["gsheet_url"]:
             try:
-                return DataSource.read_google_sheet(data_source["gsheet_url"], sheet_name)
+                return DataSource.read_google_sheet(data_source["gsheet_url"], sheet_name="Pickup")
             except Exception as exc:
-                st.warning(f"Could not load penalty data from {sheet_name}: {exc}")
+                st.warning(f"Could not load pickup data from Sheet2: {exc}")
                 return None
         return None
 
     @staticmethod
-    def load_pickup_data(config: dict, sheet_name: str = "Sheet3") -> Optional[pd.DataFrame]:
-        """Load pickup data from Sheet3 based on configuration."""
+    def load_duitnow_penalty_data(config: dict) -> Optional[pd.DataFrame]:
+        """Load DuitNow penalty data from Sheet3."""
         data_source = config["data_source"]
         if data_source["type"] == "gsheet" and data_source["gsheet_url"]:
             try:
-                return DataSource.read_google_sheet(data_source["gsheet_url"], sheet_name)
+                return DataSource.read_google_sheet(data_source["gsheet_url"], sheet_name="DuitNow")
             except Exception as exc:
-                st.warning(f"Could not load pickup data from {sheet_name}: {exc}")
+                st.warning(f"Could not load DuitNow penalty data from Sheet3: {exc}")
                 return None
         return None
+
+    @staticmethod
+    def load_ldr_penalty_data(config: dict) -> Optional[pd.DataFrame]:
+        """Load LD&R penalty data from Sheet4."""
+        data_source = config["data_source"]
+        if data_source["type"] == "gsheet" and data_source["gsheet_url"]:
+            try:
+                return DataSource.read_google_sheet(data_source["gsheet_url"], sheet_name="LDR")
+            except Exception as exc:
+                st.warning(f"Could not load LD&R penalty data from Sheet4: {exc}")
+                return None
+        return None
+
+    @staticmethod
+    def load_fake_attempt_penalty_data(config: dict) -> Optional[pd.DataFrame]:
+        """Load Fake Attempt penalty data from Sheet5."""
+        data_source = config["data_source"]
+        if data_source["type"] == "gsheet" and data_source["gsheet_url"]:
+            try:
+                return DataSource.read_google_sheet(data_source["gsheet_url"], sheet_name="Fake Attempt")
+            except Exception as exc:
+                st.warning(f"Could not load Fake Attempt penalty data from Sheet5: {exc}")
+                return None
+        return None
+
 
 # =============================================================================
 # PAYOUT CALCULATIONS
@@ -295,94 +319,177 @@ class PayoutCalculator:
         return None, ""
 
     @staticmethod
-    def calculate_penalty(dispatcher_id: str, penalty_df: Optional[pd.DataFrame], penalty_rate: float = 100.0) -> Tuple[float, int, List[str]]:
-        """Calculate penalty for a dispatcher based on penalty data from Sheet2.
+    def calculate_penalty(dispatcher_id: str,
+                         duitnow_df: Optional[pd.DataFrame] = None,
+                         ldr_df: Optional[pd.DataFrame] = None,
+                         fake_df: Optional[pd.DataFrame] = None) -> Dict:
+        """Calculate total penalty for a dispatcher from three penalty sheets.
 
         Args:
             dispatcher_id: The dispatcher ID to check
-            penalty_df: DataFrame containing penalty data with 'RESPONSIBLE' column
-            penalty_rate: Penalty amount per parcel (default RM100)
+            duitnow_df: DataFrame from Sheet3 (DuitNow penalty)
+            ldr_df: DataFrame from Sheet4 (LD&R penalty)
+            fake_df: DataFrame from Sheet5 (Fake attempt penalty)
 
         Returns:
-            Tuple of (total_penalty_amount, penalty_parcel_count, list_of_waybill_numbers)
+            Dictionary containing penalty breakdown by type
         """
-        if penalty_df is None or penalty_df.empty:
-            return 0.0, 0, []
+        penalty_breakdown = {
+            'duitnow': {'amount': 0.0, 'count': 0, 'waybills': []},
+            'ldr': {'amount': 0.0, 'count': 0, 'waybills': []},
+            'fake_attempt': {'amount': 0.0, 'count': 0, 'waybills': []},
+            'total_amount': 0.0,
+            'total_count': 0
+        }
 
-        # Find RESPONSIBLE column (case-insensitive)
-        responsible_col = None
-        for col in penalty_df.columns:
-            if col.upper().strip() == "RESPONSIBLE":
-                responsible_col = col
-                break
+        # 1. Process DuitNow penalty (Sheet3) - No waybills
+        if duitnow_df is not None and not duitnow_df.empty:
+            rider_col = None
+            for col in duitnow_df.columns:
+                if col.upper().strip() == "RIDER":
+                    rider_col = col
+                    break
 
-        if responsible_col is None:
-            return 0.0, 0, []
+            if rider_col is not None:
+                duitnow_rows = duitnow_df[
+                    duitnow_df[rider_col].astype(str).str.strip() == str(dispatcher_id).strip()
+                ]
 
-        # Find waybill column (check for 运单号, Airway Bill, Waybill Number, etc.)
-        waybill_col = None
-        waybill_keywords = ["运单号", "AIRWAY BILL", "WAYBILL NUMBER", "WAYBILL", "AIRWAY"]
-        for col in penalty_df.columns:
-            col_upper = col.upper().strip()
-            if any(keyword in col_upper for keyword in waybill_keywords):
-                waybill_col = col
-                break
+                if not duitnow_rows.empty:
+                    penalty_col = None
+                    for col in duitnow_df.columns:
+                        if "PENALTY" in col.upper():
+                            penalty_col = col
+                            break
 
-        # Count parcels where dispatcher ID matches RESPONSIBLE column
-        penalty_records = penalty_df[
-            penalty_df[responsible_col].astype(str).str.strip() == str(dispatcher_id).strip()
-        ]
+                    if penalty_col is not None:
+                        penalty_amount = duitnow_rows[penalty_col].fillna(0).astype(float).sum()
+                        penalty_breakdown['duitnow']['amount'] = float(penalty_amount)
+                        penalty_breakdown['duitnow']['count'] = len(duitnow_rows)
 
-        penalty_count = len(penalty_records)
-        penalty_amount = penalty_count * penalty_rate
+        # 2. Process LD&R penalty (Sheet4)
+        if ldr_df is not None and not ldr_df.empty:
+            emp_id_col = None
+            for col in ldr_df.columns:
+                if "EMPLOYEE ID" in col.upper() or "EMPLOYEEID" in col.upper().replace(" ", ""):
+                    emp_id_col = col
+                    break
 
-        # Extract waybill numbers if column exists
-        waybill_numbers = []
-        if waybill_col and penalty_count > 0:
-            waybill_numbers = penalty_records[waybill_col].astype(str).str.strip().tolist()
-            waybill_numbers = [wb for wb in waybill_numbers if wb and wb.lower() != 'nan']
+            if emp_id_col is not None:
+                ldr_rows = ldr_df[
+                    ldr_df[emp_id_col].astype(str).str.strip() == str(dispatcher_id).strip()
+                ]
 
-        return float(penalty_amount), penalty_count, waybill_numbers
+                if not ldr_rows.empty:
+                    amount_col = None
+                    for col in ldr_df.columns:
+                        if col.upper().strip() == "AMOUNT":
+                            amount_col = col
+                            break
+
+                    if amount_col is not None:
+                        penalty_amount = ldr_rows[amount_col].fillna(0).astype(float).sum()
+                        penalty_breakdown['ldr']['amount'] = float(penalty_amount)
+                        penalty_breakdown['ldr']['count'] = len(ldr_rows)
+
+                        # Get waybill numbers
+                        awb_col = None
+                        for col in ldr_df.columns:
+                            if "NO. AWB" in col.upper() or "AWB" in col.upper():
+                                awb_col = col
+                                break
+
+                        if awb_col is not None:
+                            waybills = ldr_rows[awb_col].dropna().astype(str).str.strip().tolist()
+                            penalty_breakdown['ldr']['waybills'] = [wb for wb in waybills if wb and wb.lower() != 'nan']
+
+        # 3. Process Fake attempt penalty (Sheet5)
+        if fake_df is not None and not fake_df.empty:
+            disp_id_col = None
+            for col in fake_df.columns:
+                if "DISPATCHER ID" in col.upper() or "DISPATCHERID" in col.upper().replace(" ", ""):
+                    disp_id_col = col
+                    break
+
+            if disp_id_col is not None:
+                fake_rows = fake_df[
+                    fake_df[disp_id_col].astype(str).str.strip() == str(dispatcher_id).strip()
+                ]
+
+                if not fake_rows.empty:
+                    # Fixed RM1.00 per fake attempt
+                    penalty_amount = len(fake_rows) * 1.00
+                    penalty_breakdown['fake_attempt']['amount'] = float(penalty_amount)
+                    penalty_breakdown['fake_attempt']['count'] = len(fake_rows)
+
+                    # Get waybill numbers
+                    waybill_col = None
+                    for col in fake_df.columns:
+                        if "WAYBILL NUMBER" in col.upper() or "WAYBILL" in col.upper():
+                            waybill_col = col
+                            break
+
+                    if waybill_col is not None:
+                        waybills = fake_rows[waybill_col].dropna().astype(str).str.strip().tolist()
+                        penalty_breakdown['fake_attempt']['waybills'] = [wb for wb in waybills if wb and wb.lower() != 'nan']
+
+        # Calculate totals
+        penalty_breakdown['total_amount'] = (
+            penalty_breakdown['duitnow']['amount'] +
+            penalty_breakdown['ldr']['amount'] +
+            penalty_breakdown['fake_attempt']['amount']
+        )
+        penalty_breakdown['total_count'] = (
+            penalty_breakdown['duitnow']['count'] +
+            penalty_breakdown['ldr']['count'] +
+            penalty_breakdown['fake_attempt']['count']
+        )
+
+        return penalty_breakdown
 
     @staticmethod
-    def calculate_pickup(pickup_df: pd.DataFrame, dispatcher_id: str, rate: float = 1.00) -> Tuple[int, float]:
+    def calculate_pickup(pickup_df: pd.DataFrame, dispatcher_id: str, rate: float = 1.00) -> Tuple[int, float, pd.DataFrame]:
         """
-        Counts unique Waybill Numbers for selected dispatcher in Sheet3
+        Counts unique Waybill Numbers for selected dispatcher in Sheet2
         based on Pick Up Dispatcher ID matching the dispatcher_id.
+
+        Returns:
+            Tuple of (parcel_count, payout, filtered_pickup_df)
         """
         if pickup_df is None or pickup_df.empty or not dispatcher_id:
-            return 0, 0.0
+            return 0, 0.0, pd.DataFrame()
 
         # Make sure columns exist
         if "Pick Up Dispatcher ID" not in pickup_df.columns or "Waybill Number" not in pickup_df.columns:
-            return 0, 0.0
+            return 0, 0.0, pd.DataFrame()
 
         # Convert dispatcher_id to string for comparison
         dispatcher_id_str = str(dispatcher_id).strip()
 
         # Clean and prepare the Pick Up Dispatcher ID column
-        pickup_df = pickup_df.copy()  # Work on a copy to avoid modifying original
+        pickup_df = pickup_df.copy()
         pickup_df["Pick Up Dispatcher ID"] = pickup_df["Pick Up Dispatcher ID"].astype(str).str.strip()
 
-        # Debug: Show matching records
+        # Filter records for this dispatcher
         matched_records = pickup_df[pickup_df["Pick Up Dispatcher ID"] == dispatcher_id_str]
 
         if matched_records.empty:
-            return 0, 0.0
+            return 0, 0.0, pd.DataFrame()
 
-        # Count unique waybill numbers for this dispatcher
-        # Some waybills might be duplicates (same waybill picked up multiple times)
+        # Count unique waybills
         unique_waybills = matched_records["Waybill Number"].dropna().astype(str).str.strip()
         parcel_count = len(unique_waybills)
         payout = parcel_count * rate
 
-        return parcel_count, payout
+        return parcel_count, payout, matched_records
 
     @staticmethod
     def calculate_tiered_daily(filtered_df: pd.DataFrame, tiers_config: List,
                               kpi_config: List, special_rates_config: List,
                               attendance_config: dict, currency_symbol: str,
-                              penalty_df: Optional[pd.DataFrame] = None, penalty_rate: float = 100.0) -> Tuple[pd.DataFrame, float, float, str, float, str, int, pd.DataFrame, float, int, List[str]]:
+                              duitnow_df: Optional[pd.DataFrame] = None,
+                              ldr_df: Optional[pd.DataFrame] = None,
+                              fake_df: Optional[pd.DataFrame] = None) -> Tuple:
         """Calculate payout for tiered daily mode with KPI bonus, attendance bonus, and special rates."""
         tiers = []
         for tier in tiers_config:
@@ -407,17 +514,14 @@ class PayoutCalculator:
         work["__date"] = pd.to_datetime(work["Delivery Signature"], errors="coerce").dt.date
         work["__waybill"] = work["Waybill Number"].astype(str).str.strip()
 
-        # Filter out invalid waybills (NaN, empty, or "nan" string)
         work = work[work["__waybill"].notna() & (work["__waybill"] != "") & (work["__waybill"].str.lower() != "nan")]
 
-        # Remove duplicate waybills per date, keeping the latest record
-        # This ensures accurate counting and prevents double-counting
         work = work.sort_values(by=["__date", "__waybill", "Delivery Signature"])
         work = work.drop_duplicates(subset=["__date", "__waybill"], keep="last")
 
         per_day = (
             work.groupby(["__date"], dropna=False)["__waybill"]
-            .nunique()  # No need for dropna since we already filtered invalid waybills
+            .nunique()
             .reset_index()
             .rename(columns={"__waybill": "daily_parcels"})
         )
@@ -453,24 +557,25 @@ class PayoutCalculator:
             per_day, attendance_config
         )
 
-        # Calculate penalty if penalty data is provided
-        penalty_amount = 0.0
-        penalty_count = 0
-        penalty_waybills = []
-        if penalty_df is not None and not penalty_df.empty:
-            # Get dispatcher ID from filtered data
-            dispatcher_id = None
-            for col in ["Dispatcher ID", "Dispatcher Id", "dispatcher_id"]:
-                if col in filtered_df.columns:
-                    dispatcher_id = filtered_df[col].iloc[0] if len(filtered_df) > 0 else None
-                    break
+        # Calculate penalty breakdown
+        penalty_breakdown = {'duitnow': {'amount': 0.0, 'count': 0, 'waybills': []},
+                           'ldr': {'amount': 0.0, 'count': 0, 'waybills': []},
+                           'fake_attempt': {'amount': 0.0, 'count': 0, 'waybills': []},
+                           'total_amount': 0.0, 'total_count': 0}
 
-            if dispatcher_id:
-                penalty_amount, penalty_count, penalty_waybills = PayoutCalculator.calculate_penalty(
-                    str(dispatcher_id), penalty_df, penalty_rate
-                )
+        dispatcher_id = None
+        for col in ["Dispatcher ID", "Dispatcher Id", "dispatcher_id"]:
+            if col in filtered_df.columns:
+                dispatcher_id = filtered_df[col].iloc[0] if len(filtered_df) > 0 else None
+                break
 
-        total_payout = base_payout + kpi_bonus + attendance_bonus - penalty_amount
+        if dispatcher_id:
+            penalty_breakdown = PayoutCalculator.calculate_penalty(
+                str(dispatcher_id), duitnow_df, ldr_df, fake_df
+            )
+
+        # Calculate gross payout (base + bonuses - penalties)
+        gross_payout = base_payout + kpi_bonus + attendance_bonus - penalty_breakdown['total_amount']
 
         display_df = per_day[["__date", "daily_parcels", "tier", "rate_per_parcel", "payout_per_day"]].copy()
         display_df = display_df.rename(columns={
@@ -484,7 +589,8 @@ class PayoutCalculator:
         display_df["Payout Rate"] = display_df["Payout Rate"].apply(lambda x: f"{currency_symbol}{x:.2f}")
         display_df["Payout"] = display_df["Payout"].apply(lambda x: f"{currency_symbol}{x:.2f}")
 
-        return display_df, total_payout, kpi_bonus, kpi_description, attendance_bonus, attendance_desc, qualified_days, per_day, penalty_amount, penalty_count, penalty_waybills
+        return (display_df, base_payout, gross_payout, kpi_bonus, kpi_description, attendance_bonus,
+                attendance_desc, qualified_days, per_day, penalty_breakdown)
 
 
 # =============================================================================
@@ -585,21 +691,20 @@ class InvoiceGenerator:
 
     @staticmethod
     def build_invoice_html(
-        df_disp: pd.DataFrame, base_payout: float, kpi_bonus: float,
-        attendance_bonus: float, total_payout: float, kpi_description: str,
-        attendance_description: str, name: str, dpid: str, currency_symbol: str,
-        advance_payout: float, advance_payout_desc: str,
-        penalty_amount: float = 0.0, penalty_count: int = 0, penalty_rate: float = 100.0,
-        penalty_waybills: List[str] = None,
-        pickup_payout: float = 0.0,  # NEW: Add pickup payout
-        pickup_parcels: int = 0      # NEW: Add pickup parcel count
+        df_disp: pd.DataFrame, base_payout: float, gross_payout: float, kpi_bonus: float,
+        attendance_bonus: float, advance_payout: float, advance_payout_desc: str,
+        penalty_breakdown: Dict, name: str, dpid: str, currency_symbol: str,
+        pickup_payout: float = 0.0,
+        pickup_parcels: int = 0,
+        kpi_description: str = "",
+        attendance_description: str = ""
     ) -> str:
         total_parcels = df_disp['Total Parcel'].sum() if 'Total Parcel' in df_disp.columns else 0
         total_days = len(df_disp) if 'Date' in df_disp.columns else 0
         cleaned_name = clean_dispatcher_name(name)
 
-        if penalty_waybills is None:
-            penalty_waybills = []
+        # Calculate final payout after advance
+        final_payout = gross_payout + pickup_payout - advance_payout
 
         html_content = f"""
         <html>
@@ -674,6 +779,22 @@ class InvoiceGenerator:
               color: white;
               box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
             }}
+            .penalty-detail {{
+              margin-top: 12px;
+              padding: 12px;
+              background: rgba(255, 255, 255, 0.1);
+              border-radius: 8px;
+              font-size: 13px;
+            }}
+            .penalty-item {{
+              display: flex;
+              justify-content: space-between;
+              padding: 6px 0;
+              border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+            }}
+            .penalty-item:last-child {{
+              border-bottom: none;
+            }}
             .bonus-title {{ font-size: 14px; opacity: 0.9; margin-bottom: 8px; }}
             .bonus-amount {{ font-size: 28px; font-weight: 800; }}
             .bonus-description {{ font-size: 12px; opacity: 0.9; margin-top: 4px; }}
@@ -715,6 +836,11 @@ class InvoiceGenerator:
               font-size: 20px;
               color: var(--primary);
             }}
+            .payout-row.penalty-detail-row {{
+              font-size: 14px;
+              color: var(--error);
+              padding-left: 20px;
+            }}
             .note {{
               margin-top: 8px;
               color: var(--text-secondary);
@@ -754,8 +880,8 @@ class InvoiceGenerator:
                         <div class="idline">From: JEMARI VENTURES &nbsp;&nbsp;|&nbsp;&nbsp; To: {cleaned_name}</div>
                     </div>
                     <div class="total-badge">
-                        <div class="label">Total Payout</div>
-                        <div class="value">{currency_symbol} {total_payout:,.2f}</div>
+                        <div class="label">Final Payout</div>
+                        <div class="value">{currency_symbol} {final_payout:,.2f}</div>
                     </div>
                 </div>
 
@@ -765,7 +891,7 @@ class InvoiceGenerator:
                         <div class="value">{dpid}</div>
                     </div>
                     <div class="chip">
-                        <div class="label">Total Parcels</div>
+                        <div class="label">Total Delivery Parcels</div>
                         <div class="value">{total_parcels:,}</div>
                     </div>
                     <div class="chip">
@@ -773,18 +899,18 @@ class InvoiceGenerator:
                         <div class="value">{pickup_parcels:,}</div>
                     </div>
                     <div class="chip">
-                        <div class="label">Advance Payout</div>
-                        <div class="value">{currency_symbol} {(advance_payout):,.2f}</div>
-                    </div>
-                    <div class="chip">
-                        <div class="label">Balance Payout</div>
-                        <div class="value">{currency_symbol} {(total_payout - advance_payout):,.2f}</div>
+                        <div class="label">Working Days</div>
+                        <div class="value">{total_days}</div>
                     </div>
                 </div>
         """
 
-        if kpi_bonus > 0 or attendance_bonus > 0 or penalty_amount > 0:
+        # Bonus and Penalty Section
+        has_bonuses_or_penalties = (kpi_bonus > 0 or attendance_bonus > 0 or penalty_breakdown['total_amount'] > 0)
+
+        if has_bonuses_or_penalties:
             html_content += '<div class="bonus-section">'
+
             if kpi_bonus > 0:
                 html_content += f"""
                     <div class="kpi-bonus">
@@ -793,6 +919,7 @@ class InvoiceGenerator:
                         <div class="bonus-description">{kpi_description}</div>
                     </div>
                 """
+
             if attendance_bonus > 0:
                 html_content += f"""
                     <div class="attendance-bonus">
@@ -801,21 +928,71 @@ class InvoiceGenerator:
                         <div class="bonus-description">{attendance_description}</div>
                     </div>
                 """
-            if penalty_amount > 0:
-                waybill_list = ", ".join(penalty_waybills) if penalty_waybills else "N/A"
+
+            if penalty_breakdown['total_amount'] > 0:
                 html_content += f"""
                     <div class="penalty-section">
                         <div class="bonus-title">Penalty Applied</div>
-                        <div class="bonus-amount">- {currency_symbol} {penalty_amount:,.2f}</div>
-                        <div class="bonus-description">{penalty_count} parcel(s) × {currency_symbol}{penalty_rate:.2f}</div>
-                        <div class="bonus-description" style="margin-top: 8px; font-size: 11px; opacity: 0.8;">
-                            <strong>Waybill Numbers:</strong><br>
-                            {waybill_list if len(waybill_list) < 200 else waybill_list[:200] + "..."}
+                        <div class="bonus-amount">- {currency_symbol} {penalty_breakdown['total_amount']:,.2f}</div>
+                        <div class="bonus-description">{penalty_breakdown['total_count']} parcel(s) affected</div>
+                        <div class="penalty-detail">
+                """
+
+                # DuitNow penalties
+                if penalty_breakdown['duitnow']['count'] > 0:
+                    html_content += f"""
+                        <div class="penalty-item">
+                            <span><strong>DuitNow:</strong> {penalty_breakdown['duitnow']['count']} parcel(s)</span>
+                            <span>- {currency_symbol} {penalty_breakdown['duitnow']['amount']:,.2f}</span>
+                        </div>
+                    """
+
+                # LD&R penalties
+                if penalty_breakdown['ldr']['count'] > 0:
+                    waybills_ldr = ", ".join(penalty_breakdown['ldr']['waybills'][:3])
+                    if len(penalty_breakdown['ldr']['waybills']) > 3:
+                        waybills_ldr += f" (+{len(penalty_breakdown['ldr']['waybills']) - 3} more)"
+
+                    html_content += f"""
+                        <div class="penalty-item">
+                            <span><strong>LD&R:</strong> {penalty_breakdown['ldr']['count']} parcel(s)</span>
+                            <span>- {currency_symbol} {penalty_breakdown['ldr']['amount']:,.2f}</span>
+                        </div>
+                    """
+                    if penalty_breakdown['ldr']['waybills']:
+                        html_content += f"""
+                        <div style="font-size: 11px; opacity: 0.8; padding: 4px 0;">
+                            Waybills: {waybills_ldr}
+                        </div>
+                        """
+
+                # Fake Attempt penalties
+                if penalty_breakdown['fake_attempt']['count'] > 0:
+                    waybills_fake = ", ".join(penalty_breakdown['fake_attempt']['waybills'][:3])
+                    if len(penalty_breakdown['fake_attempt']['waybills']) > 3:
+                        waybills_fake += f" (+{len(penalty_breakdown['fake_attempt']['waybills']) - 3} more)"
+
+                    html_content += f"""
+                        <div class="penalty-item">
+                            <span><strong>Fake Attempt:</strong> {penalty_breakdown['fake_attempt']['count']} parcel(s)</span>
+                            <span>- {currency_symbol} {penalty_breakdown['fake_attempt']['amount']:,.2f}</span>
+                        </div>
+                    """
+                    if penalty_breakdown['fake_attempt']['waybills']:
+                        html_content += f"""
+                        <div style="font-size: 11px; opacity: 0.8; padding: 4px 0;">
+                            Waybills: {waybills_fake}
+                        </div>
+                        """
+
+                html_content += """
                         </div>
                     </div>
                 """
+
             html_content += '</div>'
 
+        # Daily breakdown table
         if len(df_disp) > 0:
             html_content += "<table>"
             html_content += "<thead><tr>"
@@ -830,10 +1007,11 @@ class InvoiceGenerator:
                 html_content += "</tr>"
             html_content += "</tbody></table>"
 
+        # Payout summary
         html_content += f"""
             <div class="payout-summary">
                 <div class="payout-row">
-                    <span>Base Payout (Daily Rates):</span>
+                    <span>Base Delivery Payout:</span>
                     <span>{currency_symbol} {base_payout:,.2f}</span>
                 </div>
                 <div class="payout-row">
@@ -842,34 +1020,71 @@ class InvoiceGenerator:
                 </div>
                 <div class="payout-row">
                     <span>KPI Incentive Bonus:</span>
-                    <span>{currency_symbol} {kpi_bonus:,.2f}</span>
+                    <span>+ {currency_symbol} {kpi_bonus:,.2f}</span>
                 </div>
                 <div class="payout-row">
                     <span>Attendance Incentive Bonus:</span>
-                    <span>{currency_symbol} {attendance_bonus:,.2f}</span>
+                    <span>+ {currency_symbol} {attendance_bonus:,.2f}</span>
                 </div>"""
 
-        if penalty_amount > 0:
-            waybill_list = ", ".join(penalty_waybills) if penalty_waybills else "N/A"
+        # Penalty details
+        if penalty_breakdown['total_amount'] > 0:
             html_content += f"""
                 <div class="payout-row" style="color: var(--error);">
-                    <span>Penalty ({penalty_count} parcel(s) × {currency_symbol}{penalty_rate:.2f}):</span>
-                    <span>- {currency_symbol} {penalty_amount:,.2f}</span>
-                </div>"""
-            if penalty_waybills:
-                html_content += f"""
-                <div class="payout-row" style="font-size: 12px; color: var(--text-secondary); padding-left: 20px;">
-                    <span><strong>Waybill Numbers:</strong> {waybill_list}</span>
+                    <span>Total Penalty:</span>
+                    <span>- {currency_symbol} {penalty_breakdown['total_amount']:,.2f}</span>
                 </div>"""
 
+            if penalty_breakdown['duitnow']['count'] > 0:
+                html_content += f"""
+                <div class="payout-row penalty-detail-row">
+                    <span>↳ DuitNow ({penalty_breakdown['duitnow']['count']} parcel(s)):</span>
+                    <span>- {currency_symbol} {penalty_breakdown['duitnow']['amount']:,.2f}</span>
+                </div>"""
+
+            if penalty_breakdown['ldr']['count'] > 0:
+                html_content += f"""
+                <div class="payout-row penalty-detail-row">
+                    <span>↳ LD&R ({penalty_breakdown['ldr']['count']} parcel(s)):</span>
+                    <span>- {currency_symbol} {penalty_breakdown['ldr']['amount']:,.2f}</span>
+                </div>"""
+                if penalty_breakdown['ldr']['waybills']:
+                    waybills_display = ", ".join(penalty_breakdown['ldr']['waybills'][:5])
+                    if len(penalty_breakdown['ldr']['waybills']) > 5:
+                        waybills_display += f" (+{len(penalty_breakdown['ldr']['waybills']) - 5} more)"
+                    html_content += f"""
+                    <div class="payout-row penalty-detail-row" style="font-size: 12px; padding-left: 40px;">
+                        <span style="color: var(--text-secondary);">Waybills: {waybills_display}</span>
+                    </div>"""
+
+            if penalty_breakdown['fake_attempt']['count'] > 0:
+                html_content += f"""
+                <div class="payout-row penalty-detail-row">
+                    <span>↳ Fake Attempt ({penalty_breakdown['fake_attempt']['count']} parcel(s)):</span>
+                    <span>- {currency_symbol} {penalty_breakdown['fake_attempt']['amount']:,.2f}</span>
+                </div>"""
+                if penalty_breakdown['fake_attempt']['waybills']:
+                    waybills_display = ", ".join(penalty_breakdown['fake_attempt']['waybills'][:5])
+                    if len(penalty_breakdown['fake_attempt']['waybills']) > 5:
+                        waybills_display += f" (+{len(penalty_breakdown['fake_attempt']['waybills']) - 5} more)"
+                    html_content += f"""
+                    <div class="payout-row penalty-detail-row" style="font-size: 12px; padding-left: 40px;">
+                        <span style="color: var(--text-secondary);">Waybills: {waybills_display}</span>
+                    </div>"""
+
+        # Add gross payout calculation
         html_content += f"""
+                <div class="payout-row" style="border-top: 1px dashed var(--border); margin-top: 8px; padding-top: 8px;">
+                    <span><strong>Gross Payout (Delivery + Pickup + Bonuses - Penalties):</strong></span>
+                    <span><strong>{currency_symbol} {gross_payout + pickup_payout:,.2f}</strong></span>
+                </div>
                 <div class="payout-row">
                     <span>{advance_payout_desc}:</span>
                     <span>- {currency_symbol} {advance_payout:,.2f}</span>
                 </div>
                 <div class="payout-row total">
-                    <span>Balance Payout:</span>
-                    <span>{currency_symbol} {(total_payout - advance_payout):,.2f}</span>
+                    <span>Final Payout (Gross - Advance):</span>
+                    <span>{currency_symbol} {final_payout:,.2f}</span>
                 </div>
             </div>
         """
@@ -1047,37 +1262,37 @@ def main():
         <p style="color: rgba(255,255,255,0.9) !important; margin: 0.5rem 0 0 0; padding: 0;">Calculate dispatcher payout online</p>
     </div>
     """, unsafe_allow_html=True)
+
     config = Config.load()
     config["data_source"]["type"] = "gsheet"
+
     with st.spinner("Loading data from Google Sheets..."):
         df = DataSource.load_data(config)
+
     if df is None:
         st.error("❌ Failed to load data from Google Sheets.")
         st.info("Please check the configuration file or ensure the Google Sheet is accessible.")
         add_footer()
         return
+
     if df.empty:
         st.warning("No data found in the Google Sheet.")
         add_footer()
         return
+
     df = df.rename(columns={c: str(c).strip() for c in df.columns})
     required_columns = ["Dispatcher ID", "Waybill Number", "Delivery Signature"]
     missing_columns = [col for col in required_columns if col not in df.columns]
+
     if missing_columns:
         st.error(f"Missing required columns: {', '.join(missing_columns)}")
         st.info(f"Available columns: {', '.join(df.columns.tolist())}")
         add_footer()
         return
 
-    # Restrict to current month's data
-    # Convert to datetime
     df["Delivery Signature"] = pd.to_datetime(df["Delivery Signature"], errors="coerce")
-
-    # Determine LAST MONTH period
     today = datetime.now()
     last_month_period = (today - pd.DateOffset(months=1)).to_period("M")
-
-    # Filter rows where Delivery Signature is last month
     monthly_mask = df["Delivery Signature"].dt.to_period("M") == last_month_period
     df = df[monthly_mask].copy()
 
@@ -1087,7 +1302,6 @@ def main():
         return
 
     st.caption(f"Showing deliveries for {last_month_period.start_time:%B %Y}.")
-
 
     st.subheader("👤 Dispatcher Selection")
     dispatcher_mapping = {}
@@ -1103,241 +1317,492 @@ def main():
                     dispatcher_mapping[dispatcher_id] = dispatcher_name
             if dispatcher_mapping:
                 break
-    unique_dispatchers = sorted(df["Dispatcher ID"].dropna().astype(str).unique().tolist())
-    if not unique_dispatchers:
-        st.error("No dispatcher IDs found in the data.")
-        add_footer()
-        return
+    # Create a list of options for the dropdown with ID and cleaned name
     dispatcher_options = []
-    for dispatcher_id in unique_dispatchers:
-        dispatcher_name = dispatcher_mapping.get(dispatcher_id, "Unknown")
-        display_text = f"{dispatcher_name} ({dispatcher_id})"
-        dispatcher_options.append(display_text)
-    dispatcher_options.sort(key=lambda x: x.lower())
-    display_to_id = {
-        f"{dispatcher_mapping.get(did, 'Unknown')} ({did})": did
-        for did in unique_dispatchers
-    }
+    for dispatcher_id, dispatcher_name in dispatcher_mapping.items():
+        display_name = f"{dispatcher_id} - {dispatcher_name}" if dispatcher_name else dispatcher_id
+        dispatcher_options.append((dispatcher_id, display_name))
+
+    # Sort by dispatcher ID
+    dispatcher_options.sort(key=lambda x: x[0])
+
     selected_display = st.selectbox(
         "Select Dispatcher",
-        options=dispatcher_options,
+        options=[opt[1] for opt in dispatcher_options],
+        index=0 if dispatcher_options else None,
         help="Choose a dispatcher to view their payout details"
     )
-    selected_dispatcher = display_to_id[selected_display]
-    filtered = df[df["Dispatcher ID"].astype(str) == str(selected_dispatcher)].copy()
-    with st.expander("View Filtered Data", expanded=False):
-        st.dataframe(filtered.head(100), use_container_width=True)
-    st.subheader("💰 Payout Calculation")
-    dispatcher_name = ""
-    for candidate_col in ["Dispatcher Name", "Name", "Rider Name"]:
-        if candidate_col in filtered.columns:
-            values = filtered[candidate_col].dropna().astype(str).unique().tolist()
-            if values:
-                dispatcher_name = clean_dispatcher_name(values[0])
-                break
-    currency_symbol = config["currency_symbol"]
 
-    # Load penalty data from Sheet2
-    penalty_df = DataSource.load_penalty_data(config, "Sheet2")
-    penalty_rate = config.get("penalty_rate", 100.0)  # Default RM100 per parcel
+    # Extract selected dispatcher ID
+    selected_dispatcher_id = None
+    selected_dispatcher_name = None
+    for dispatcher_id, display_name in dispatcher_options:
+        if display_name == selected_display:
+            selected_dispatcher_id = dispatcher_id
+            selected_dispatcher_name = dispatcher_mapping.get(dispatcher_id, "")
+            break
 
-    # Load pickup data from Sheet3
-    pickup_df = DataSource.load_pickup_data(config, "Sheet3")
+    if not selected_dispatcher_id:
+        st.warning("No dispatcher selected.")
+        add_footer()
+        return
 
-    # Calculate pickup parcels & payout for the selected dispatcher_id
-    pickup_parcels, pickup_payout = PayoutCalculator.calculate_pickup(
-        pickup_df, selected_dispatcher, rate=1.00
-    )
+    # Filter data for selected dispatcher
+    dispatcher_df = df[df["Dispatcher ID"].astype(str) == selected_dispatcher_id].copy()
 
-    # Display pickup metrics
-    col_pickup1, col_pickup2 = st.columns(2)
-    with col_pickup1:
-        st.metric(label="Pickup Parcels", value=f"{pickup_parcels}")
-    with col_pickup2:
-        st.metric(label="Pickup Payout", value=f"{currency_symbol}{pickup_payout:.2f}")
+    if dispatcher_df.empty:
+        st.warning(f"No delivery records found for {selected_dispatcher_name or selected_dispatcher_id}.")
+        add_footer()
+        return
 
-    # Optionally: add these to summary chips, invoice, or payout breakdown as needed.
+    # Load additional data sheets
+    pickup_df = DataSource.load_pickup_data(config)
+    duitnow_df = DataSource.load_duitnow_penalty_data(config)
+    ldr_df = DataSource.load_ldr_penalty_data(config)
+    fake_attempt_df = DataSource.load_fake_attempt_penalty_data(config)
 
-    display_df, total_payout, kpi_bonus, kpi_description, attendance_bonus, attendance_desc, qualified_days, per_day, penalty_amount, penalty_count, penalty_waybills = PayoutCalculator.calculate_tiered_daily(
-        filtered, config["tiers"], config.get("kpi_incentives", []),
-        config.get("special_rates", []), config.get("attendance_incentive", {}), currency_symbol,
-        penalty_df, penalty_rate
-    )
-    base_payout = total_payout - kpi_bonus - attendance_bonus + penalty_amount # Add penalty back to get base
-    total_payout = total_payout + pickup_payout
-    advance_payout_config = config.get("advance_payout", {})
-    advance_payout_enabled = advance_payout_config.get("enabled", False)
-    advance_payout_percentage = advance_payout_config.get("percentage", 0.0)
-    advance_payout_desc = advance_payout_config.get("description", "Advance Payout")
-    advance_payout = 0.0
-    if advance_payout_enabled and advance_payout_percentage > 0:
-        advance_payout = round(base_payout * (advance_payout_percentage / 100.0), 2)
+    # Calculate payout
+    st.subheader(f"💰 Payout Calculation for {selected_dispatcher_name or selected_dispatcher_id}")
 
-    col1, col2, col3, col4, col5, col6 = st.columns(6)
-    with col1:
-        st.metric(label="Dispatcher", value=dispatcher_name)
-    with col2:
-        total_parcels = per_day["daily_parcels"].sum()
-        st.metric(label="Total Parcels", value=f"{total_parcels:,}")
-    with col3:
-        st.metric(label="Base Payout", value=f"{currency_symbol}{base_payout:,.2f}")
-    with col4:
-        if penalty_amount > 0:
-            # Format waybill numbers for display
-            if penalty_waybills:
-                waybill_display = ", ".join(penalty_waybills[:5])  # Show first 5 waybills
-                if len(penalty_waybills) > 5:
-                    waybill_display += f" ... (+{len(penalty_waybills) - 5} more)"
-                help_text = f"{penalty_count} parcel(s) × {currency_symbol}{penalty_rate:.2f}\n\nWaybill Numbers:\n{waybill_display}"
-            else:
-                help_text = f"{penalty_count} parcel(s) × {currency_symbol}{penalty_rate:.2f}"
-            st.metric(label="Penalty", value=f"-{currency_symbol}{penalty_amount:,.2f}", help=help_text)
-        else:
-            st.metric(label="Penalty", value=f"{currency_symbol}0.00")
-    with col5:
-        st.metric(label="Total Payout", value=f"{currency_symbol}{total_payout:,.2f}")
-    with col6:
-        st.metric(label=advance_payout_desc, value=f"{currency_symbol}{advance_payout:,.2f}",
-                 help=f"{advance_payout_percentage}% of Base Payout ({currency_symbol}{base_payout:,.2f})")
+    # Get advance payout configuration
+    advance_config = config.get("advance_payout", {"enabled": False, "percentage": 0.0, "description": "Advance Payout"})
+    advance_enabled = advance_config.get("enabled", False)
+    advance_percentage = advance_config.get("percentage", 0.0)
+    advance_description = advance_config.get("description", "Advance Payout (40% of Base Delivery)")
 
-    if kpi_bonus > 0:
-        st.success(f"🎯 **KPI Incentive Achieved!** +{currency_symbol}{kpi_bonus:,.2f} ({kpi_description})")
-    if attendance_bonus > 0:
-        st.success(f"📅 **Attendance Incentive Achieved!** +{currency_symbol}{attendance_bonus:,.2f} ({attendance_desc})")
-    else:
-        st.info(f"📅 Attendance Progress: {attendance_desc}")
-    if penalty_amount > 0:
-        st.error(f"⚠️ **Penalty Applied:** -{currency_symbol}{penalty_amount:,.2f} ({penalty_count} parcel(s) × {currency_symbol}{penalty_rate:.2f})")
-        # Show waybill numbers in a table format for better continuity
-        with st.expander(f"📋 View All Penalty Waybill Numbers ({penalty_count} parcel(s))", expanded=False):
-            if penalty_waybills:
-                # Create a DataFrame for table display
-                waybill_df = pd.DataFrame({
-                    'Waybill Number': penalty_waybills,
-                    'Penalty Amount': [f"{currency_symbol}{penalty_rate:.2f}"] * len(penalty_waybills)
-                })
-                waybill_df.index = waybill_df.index + 1  # Start index from 1
-                st.dataframe(waybill_df, use_container_width=True, hide_index=False)
-            else:
-                st.info("No waybill numbers available")
+    # Create tabs for different views
+    tab1, tab2, tab3 = st.tabs(["📊 Payout Details", "📈 Performance Charts", "🧾 Invoice"])
 
-    st.dataframe(display_df, use_container_width=True)
+    with tab1:
+        # Calculate tiered daily payout
+        try:
+            (display_df, base_delivery_payout, gross_delivery_payout, kpi_bonus, kpi_description,
+             attendance_bonus, attendance_desc, qualified_days,
+             per_day_df, penalty_breakdown) = PayoutCalculator.calculate_tiered_daily(
+                dispatcher_df,
+                config["tiers"],
+                config.get("kpi_incentives", []),
+                config.get("special_rates", []),
+                config.get("attendance_incentive", {}),
+                config["currency_symbol"],
+                duitnow_df,
+                ldr_df,
+                fake_attempt_df
+            )
 
-        # Clean the dispatcher ID column
-    pickup_df["Pick Up Dispatcher ID"] = pickup_df["Pick Up Dispatcher ID"].astype(str).str.strip()
+            # Calculate pickup payout (assuming RM1.00 per pickup parcel)
+            pickup_parcels, pickup_payout, pickup_filtered_df = PayoutCalculator.calculate_pickup(
+                pickup_df, selected_dispatcher_id, rate=1.00
+            )
 
-    # Show matching records for the selected dispatcher
-    matched_records = pickup_df[pickup_df["Pick Up Dispatcher ID"] == str(selected_dispatcher).strip()]
+            # Calculate gross total payout (delivery + pickup + bonuses - penalties)
+            gross_total_payout = gross_delivery_payout + pickup_payout
 
-    if not matched_records.empty:
-        st.write("**Parcel Pickup Records:**")
-        st.dataframe(matched_records[["Waybill Number", "Date | Pick Up", "Pick Up Dispatcher ID", "Pick Up Dispatcher Name"]].head(10))
+            # Calculate advance payout (40% of base delivery payout only, not including pickup, bonuses, penalties)
+            advance_payout = 0.0
+            if advance_enabled and advance_percentage > 0:
+                advance_payout = (base_delivery_payout * advance_percentage) / 100.0
 
-    with st.expander("📊 Payout Breakdown", expanded=False):
-        breakdown_col1, breakdown_col2, breakdown_col3, breakdown_col4, breakdown_col5, breakdown_col6 = st.columns(6)
-        with breakdown_col1:
-            st.metric("Base Payout", f"{currency_symbol}{base_payout:,.2f}", help="Daily rate payouts")
-        with breakdown_col2:
-            st.metric("KPI Bonus", f"{currency_symbol}{kpi_bonus:,.2f}", help=kpi_description)
-        with breakdown_col3:
-            st.metric("Attendance Bonus", f"{currency_symbol}{attendance_bonus:,.2f}", help=attendance_desc)
-        with breakdown_col4:
-            waybill_info = f"{penalty_count} parcel(s) × {currency_symbol}{penalty_rate:.2f}"
-            if penalty_waybills:
-                waybill_preview = ", ".join(penalty_waybills[:3])
-                if len(penalty_waybills) > 3:
-                    waybill_preview += f" (+{len(penalty_waybills) - 3} more)"
-                waybill_info += f"\nWaybills: {waybill_preview}"
-            st.metric("Penalty", f"-{currency_symbol}{penalty_amount:,.2f}", help=waybill_info)
-        with breakdown_col5:
-            st.metric("Total Payout", f"{currency_symbol}{total_payout:,.2f}", help="Base + Pickup + KPI + Attendance - Penalty")
-        with breakdown_col6:
-            st.metric(advance_payout_desc, f"{currency_symbol}{advance_payout:,.2f}",
-                     help=f"{advance_payout_percentage}% of Base Payout ({currency_symbol}{base_payout:,.2f})")
+            # Calculate final payout
+            final_payout = gross_total_payout - advance_payout
 
-    st.subheader("📊 Performance Visualization")
-    charts = DataVisualizer.create_performance_charts(per_day, currency_symbol)
-    if charts:
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            if 'parcels_payout' in charts:
-                st.altair_chart(charts['parcels_payout'], use_container_width=True)
-            else:
-                st.info("No parcels and payout data available")
-        with col2:
-            if 'performance_scatter' in charts:
-                st.altair_chart(charts['performance_scatter'], use_container_width=True)
-            else:
-                st.info("No performance scatter data available")
-        with col3:
-            if 'payout_trend' in charts:
-                st.altair_chart(charts['payout_trend'], use_container_width=True)
-            else:
-                st.info("No payout trend data available")
+            # Display metrics in columns
+            col1, col2, col3, col4, col5, col6 = st.columns(6)
 
-        st.markdown("---")
-        st.subheader("📈 Performance Summary")
-        if per_day is not None and not per_day.empty:
-            col1, col2, col3, col4 = st.columns(4)
             with col1:
-                avg_parcels = per_day["daily_parcels"].mean()
-                st.metric("Average Daily Parcels", f"{avg_parcels:.1f}")
+                st.metric(
+                    "Total Delivery Parcels",
+                    f"{display_df['Total Parcel'].sum():,}",
+                    help="Total parcels delivered in the month"
+                )
+
             with col2:
-                max_parcels = per_day["daily_parcels"].max()
-                st.metric("Maximum Daily Parcels", f"{max_parcels:.0f}")
+                st.metric(
+                    "Working Days",
+                    f"{len(display_df)}",
+                    help="Number of days worked"
+                )
+
             with col3:
-                avg_payout = per_day["payout_per_day"].mean()
-                st.metric("Average Daily Payout", f"{currency_symbol}{avg_payout:.2f}")
+                st.metric(
+                    "Base Delivery Payout",
+                    f"{config['currency_symbol']}{base_delivery_payout:,.2f}",
+                    help="Total base payout from daily deliveries"
+                )
+
             with col4:
-                total_days = len(per_day)
-                st.metric("Total Working Days", f"{total_days}")
-            st.markdown("---")
-            st.subheader("📅 Attendance Details")
-            att_col1, att_col2, att_col3 = st.columns(3)
-            with att_col1:
-                st.metric("Qualified Days", f"{qualified_days}",
-                         help=f"Days with ≥{config.get('attendance_incentive', {}).get('min_parcels_per_day', 30)} parcels")
-            with att_col2:
-                required_days = config.get('attendance_incentive', {}).get('required_days', 26)
-                st.metric("Required Days", f"{required_days}",
-                         help="Days needed for attendance bonus")
-            with att_col3:
-                if qualified_days >= required_days:
-                    st.metric("Status", "✅ Achieved", delta="Bonus Earned")
+                st.metric(
+                    "Gross Payout",
+                    f"{config['currency_symbol']}{gross_total_payout:,.2f}",
+                    help="Total gross payout including bonuses and penalties"
+                )
+
+            with col5:
+                st.metric(
+                    "Advance Payout",
+                    f"{config['currency_symbol']}{advance_payout:,.2f}",
+                    help="40% of base delivery payout"
+                )
+
+            with col6:
+                st.metric(
+                    "Final Payout",
+                    f"{config['currency_symbol']}{final_payout:,.2f}",
+                    help="Gross payout minus advance payout"
+                )
+
+            # Display daily breakdown
+            st.subheader("📅 Daily Delivery Breakdown")
+            st.dataframe(
+                display_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Date": st.column_config.DateColumn("Date", format="DD/MM/YYYY"),
+                    "Total Parcel": st.column_config.NumberColumn("Parcels", format="%d"),
+                    "Tier": "Tier",
+                    "Payout Rate": "Rate",
+                    "Payout": st.column_config.TextColumn("Payout")
+                }
+            )
+
+            # Display bonuses and penalties
+            st.subheader("🎯 Incentives & Penalties")
+
+            col1, col2, col3, col4 = st.columns(4)
+
+            with col1:
+                st.metric(
+                    "KPI Bonus",
+                    f"{config['currency_symbol']}{kpi_bonus:,.2f}",
+                    delta="Achieved" if kpi_bonus > 0 else "Not achieved",
+                    delta_color="normal" if kpi_bonus > 0 else "off"
+                )
+
+            with col2:
+                st.metric(
+                    "Attendance Bonus",
+                    f"{config['currency_symbol']}{attendance_bonus:,.2f}",
+                    delta=f"{qualified_days} days",
+                    delta_color="normal" if attendance_bonus > 0 else "off"
+                )
+
+            with col3:
+                if pickup_parcels > 0:
+                    st.metric(
+                        "Pickup Payout",
+                        f"{config['currency_symbol']}{pickup_payout:,.2f}",
+                        delta=f"{pickup_parcels} parcels",
+                        delta_color="normal"
+                    )
                 else:
-                    remaining = required_days - qualified_days
-                    st.metric("Status", f"❌ Not Yet", delta=f"{remaining} more days needed")
-    else:
-        st.info("No performance data available for visualization.")
+                    st.metric(
+                        "Pickup Payout",
+                        f"{config['currency_symbol']}0.00",
+                        delta="No pickups",
+                        delta_color="off"
+                    )
 
-    st.subheader("📄 Invoice Generation")
-    inv_name, inv_id = "", ""
-    for candidate_col in ["Dispatcher Name", "Name", "Rider Name"]:
-        if candidate_col in filtered.columns:
-            values = filtered[candidate_col].dropna().astype(str).unique().tolist()
-            if values:
-                inv_name = values[0]
-                break
-    if not inv_name:
-        inv_name = str(selected_dispatcher)
-    inv_id = str(selected_dispatcher)
+            with col4:
+                if penalty_breakdown['total_amount'] > 0:
+                    st.metric(
+                        "Total Penalty",
+                        f"-{config['currency_symbol']}{penalty_breakdown['total_amount']:,.2f}",
+                        delta=f"{penalty_breakdown['total_count']} parcels",
+                        delta_color="inverse"
+                    )
+                else:
+                    st.metric(
+                        "Total Penalty",
+                        f"{config['currency_symbol']}0.00",
+                        delta="No penalties",
+                        delta_color="off"
+                    )
 
-    invoice_html = InvoiceGenerator.build_invoice_html(
-        display_df, base_payout, kpi_bonus, attendance_bonus, total_payout,
-        kpi_description, attendance_desc, inv_name, inv_id, currency_symbol,
-        advance_payout, advance_payout_desc, penalty_amount, penalty_count,
-        penalty_rate, penalty_waybills, pickup_payout, pickup_parcels
-    )
+            # Display pickup details if available
+            if pickup_parcels > 0 and not pickup_filtered_df.empty:
+                with st.expander("📦 Pickup Details", expanded=False):
+                    st.info(f"**Total Pickup Parcels: {pickup_parcels}** | **Payout: {config['currency_symbol']}{pickup_payout:,.2f}** (RM1.00 per parcel)")
 
-    st.download_button(
-        label="📥 Download Invoice (HTML)",
-        data=invoice_html.encode("utf-8"),
-        file_name=f"invoice_{selected_dispatcher}_{datetime.now().strftime('%Y%m%d')}.html",
-        mime="text/html",
-    )
-    st.caption("Invoice generated based on current configuration and data.")
+                    # Clean up column names for display
+                    display_pickup_df = pickup_filtered_df.copy()
+                    display_pickup_df.columns = [str(col).title() for col in display_pickup_df.columns]
+
+                    # Display the filtered pickup dataframe
+                    st.dataframe(
+                        display_pickup_df,
+                        use_container_width=True,
+                        hide_index=True
+                    )
+            else:
+                with st.expander("📦 Pickup Details", expanded=False):
+                    st.info("No pickup records found for this dispatcher.")
+
+            # Display penalty details if any
+            if penalty_breakdown['total_amount'] > 0:
+                with st.expander("⚠️ Penalty Details"):
+                    penalty_col1, penalty_col2, penalty_col3 = st.columns(3)
+
+                    with penalty_col1:
+                        if penalty_breakdown['duitnow']['count'] > 0:
+                            st.error(f"**DuitNow:** {penalty_breakdown['duitnow']['count']} parcel(s) - {config['currency_symbol']}{penalty_breakdown['duitnow']['amount']:,.2f}")
+
+                    with penalty_col2:
+                        if penalty_breakdown['ldr']['count'] > 0:
+                            st.error(f"**LD&R:** {penalty_breakdown['ldr']['count']} parcel(s) - {config['currency_symbol']}{penalty_breakdown['ldr']['amount']:,.2f}")
+                            if penalty_breakdown['ldr']['waybills']:
+                                st.caption(f"Waybills: {', '.join(penalty_breakdown['ldr']['waybills'][:5])}")
+
+                    with penalty_col3:
+                        if penalty_breakdown['fake_attempt']['count'] > 0:
+                            st.error(f"**Fake Attempt:** {penalty_breakdown['fake_attempt']['count']} parcel(s) - {config['currency_symbol']}{penalty_breakdown['fake_attempt']['amount']:,.2f}")
+                            if penalty_breakdown['fake_attempt']['waybills']:
+                                st.caption(f"Waybills: {', '.join(penalty_breakdown['fake_attempt']['waybills'][:5])}")
+
+            # Display payout breakdown
+            st.subheader("💰 Payout Breakdown")
+
+            breakdown_col1, breakdown_col2, breakdown_col3 = st.columns(3)
+
+            with breakdown_col1:
+                st.info(f"""
+                **Delivery Earnings:**
+                - Base: {config['currency_symbol']}{base_delivery_payout:,.2f}
+                - KPI Bonus: +{config['currency_symbol']}{kpi_bonus:,.2f}
+                - Attendance Bonus: +{config['currency_symbol']}{attendance_bonus:,.2f}
+                - Penalties: -{config['currency_symbol']}{penalty_breakdown['total_amount']:,.2f}
+                """)
+
+            with breakdown_col2:
+                st.info(f"""
+                **Additional Earnings:**
+                - Pickup ({pickup_parcels} parcels): +{config['currency_symbol']}{pickup_payout:,.2f}
+                - Gross Total: {config['currency_symbol']}{gross_total_payout:,.2f}
+                """)
+
+            with breakdown_col3:
+                if advance_enabled:
+                    st.warning(f"""
+                    **Advance & Final:**
+                    - Advance (40% of Base Delivery): -{config['currency_symbol']}{advance_payout:,.2f}
+                    - **Final Payout:** {config['currency_symbol']}{final_payout:,.2f}
+                    """)
+                else:
+                    st.success(f"""
+                    **Final Payout:**
+                    - **Gross Total:** {config['currency_symbol']}{gross_total_payout:,.2f}
+                    """)
+
+        except Exception as e:
+            st.error(f"Error calculating payout: {str(e)}")
+            st.exception(e)
+
+    with tab2:
+        # Display performance charts
+        if 'per_day_df' in locals() and not per_day_df.empty:
+            charts = DataVisualizer.create_performance_charts(per_day_df, config["currency_symbol"])
+
+            if charts:
+                col1, col2 = st.columns(2)
+
+                with col1:
+                    st.altair_chart(charts.get('parcels_payout'), use_container_width=True)
+
+                with col2:
+                    st.altair_chart(charts.get('performance_scatter'), use_container_width=True)
+
+                st.altair_chart(charts.get('payout_trend'), use_container_width=True)
+
+                # Additional statistics
+                st.subheader("📊 Performance Statistics")
+
+                stats_col1, stats_col2, stats_col3, stats_col4 = st.columns(4)
+
+                with stats_col1:
+                    avg_parcels = per_day_df['daily_parcels'].mean()
+                    st.metric("Average Daily Parcels", f"{avg_parcels:.1f}")
+
+                with stats_col2:
+                    max_parcels = per_day_df['daily_parcels'].max()
+                    st.metric("Maximum Daily Parcels", f"{max_parcels:.0f}")
+
+                with stats_col3:
+                    avg_payout = per_day_df['payout_per_day'].mean()
+                    st.metric("Average Daily Payout", f"{config['currency_symbol']}{avg_payout:.2f}")
+
+                with stats_col4:
+                    best_day = per_day_df.loc[per_day_df['payout_per_day'].idxmax()]
+                    st.metric("Best Day Payout", f"{config['currency_symbol']}{best_day['payout_per_day']:.2f}")
+            else:
+                st.info("No chart data available for this dispatcher.")
+        else:
+            st.info("Performance data not available. Complete the calculation in the Payout Details tab first.")
+
+    with tab3:
+        # Generate and display invoice
+        if 'display_df' in locals() and not display_df.empty:
+            # Generate HTML invoice
+            invoice_html = InvoiceGenerator.build_invoice_html(
+                df_disp=display_df,
+                base_payout=base_delivery_payout,
+                gross_payout=gross_delivery_payout,
+                kpi_bonus=kpi_bonus,
+                attendance_bonus=attendance_bonus,
+                advance_payout=advance_payout,
+                advance_payout_desc=advance_description,
+                penalty_breakdown=penalty_breakdown,
+                name=selected_dispatcher_name or selected_dispatcher_id,
+                dpid=selected_dispatcher_id,
+                currency_symbol=config["currency_symbol"],
+                pickup_payout=pickup_payout,
+                pickup_parcels=pickup_parcels,
+                kpi_description=kpi_description,
+                attendance_description=attendance_desc
+            )
+
+            # Display invoice
+            st.components.v1.html(invoice_html, height=1200, scrolling=True)
+
+            # Download buttons
+            col1, col2, col3 = st.columns(3)
+
+            with col1:
+                # Download as HTML
+                st.download_button(
+                    label="📥 Download Invoice (HTML)",
+                    data=invoice_html,
+                    file_name=f"invoice_{selected_dispatcher_id}_{last_month_period.start_time:%Y%m}.html",
+                    mime="text/html",
+                    use_container_width=True
+                )
+
+            with col2:
+                # Download as CSV (daily breakdown)
+                csv_data = display_df.to_csv(index=False)
+                st.download_button(
+                    label="📊 Download Daily Breakdown (CSV)",
+                    data=csv_data,
+                    file_name=f"breakdown_{selected_dispatcher_id}_{last_month_period.start_time:%Y%m}.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+
+            with col3:
+                # Download summary as text
+                summary_text = f"""
+INVOICE SUMMARY
+===============
+Dispatcher: {selected_dispatcher_name or selected_dispatcher_id}
+Dispatcher ID: {selected_dispatcher_id}
+Period: {last_month_period.start_time:%B %Y}
+
+SUMMARY
+-------
+Total Delivery Parcels: {display_df['Total Parcel'].sum():,}
+Working Days: {len(display_df)}
+Pickup Parcels: {pickup_parcels:,}
+
+PAYOUT BREAKDOWN
+----------------
+Base Delivery Payout: {config['currency_symbol']}{base_delivery_payout:,.2f}
+Pickup Payout: +{config['currency_symbol']}{pickup_payout:,.2f}
+KPI Bonus: +{config['currency_symbol']}{kpi_bonus:,.2f}
+Attendance Bonus: +{config['currency_symbol']}{attendance_bonus:,.2f}
+Total Penalties: -{config['currency_symbol']}{penalty_breakdown['total_amount']:,.2f}
+
+GROSS TOTAL PAYOUT
+------------------
+Gross Payout: {config['currency_symbol']}{gross_total_payout:,.2f}
+
+ADVANCE PAYOUT
+--------------
+Advance (40% of Base Delivery): -{config['currency_symbol']}{advance_payout:,.2f}
+
+FINAL PAYOUT
+------------
+Final Payout (Gross - Advance): {config['currency_symbol']}{final_payout:,.2f}
+
+Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M')}
+                """
+                st.download_button(
+                    label="📝 Download Summary (TXT)",
+                    data=summary_text,
+                    file_name=f"summary_{selected_dispatcher_id}_{last_month_period.start_time:%Y%m}.txt",
+                    mime="text/plain",
+                    use_container_width=True
+                )
+        else:
+            st.info("No invoice data available. Complete the calculation in the Payout Details tab first.")
+
+    # # Configuration sidebar
+    # st.sidebar.title("⚙️ Configuration")
+
+    # if st.sidebar.button("🔄 Reload Data", use_container_width=True):
+    #     st.cache_data.clear()
+    #     st.rerun()
+
+    # # Display current configuration
+    # st.sidebar.subheader("Current Settings")
+
+    # with st.sidebar.expander("📋 View Configuration"):
+    #     st.json(config, expanded=False)
+
+    # # Configuration editor
+    # st.sidebar.subheader("⚙️ Edit Configuration")
+
+    # if st.sidebar.button("Edit Configuration", use_container_width=True):
+    #     # Open configuration in a modal or new page
+    #     st.session_state.edit_config = True
+
+    # if 'edit_config' in st.session_state and st.session_state.edit_config:
+    #     with st.sidebar.expander("✏️ Edit Config", expanded=True):
+    #         # Google Sheet URL
+    #         new_gsheet_url = st.text_input(
+    #             "Google Sheet URL",
+    #             value=config["data_source"]["gsheet_url"],
+    #             help="URL of the Google Sheet containing dispatcher data"
+    #         )
+
+    #         # Tiers configuration
+    #         st.write("### Tier Configuration")
+    #         for i, tier in enumerate(config["tiers"]):
+    #             col1, col2, col3 = st.columns(3)
+    #             with col1:
+    #                 tier_name = st.text_input(f"Tier {i+1} Name", value=tier["Tier"], key=f"tier_name_{i}")
+    #             with col2:
+    #                 min_parcels = st.number_input(f"Min Parcels", value=tier["Min Parcels"] or 0, key=f"tier_min_{i}")
+    #             with col3:
+    #                 max_parcels = st.number_input(f"Max Parcels", value=tier["Max Parcels"] or 0, key=f"tier_max_{i}")
+    #             rate = st.number_input(f"Rate (RM)", value=tier["Rate (RM)"], min_value=0.0, step=0.05, key=f"tier_rate_{i}")
+    #             config["tiers"][i] = {"Tier": tier_name, "Min Parcels": min_parcels, "Max Parcels": max_parcels, "Rate (RM)": rate}
+
+    #         # KPI incentives
+    #         st.write("### KPI Incentives")
+    #         for i, kpi in enumerate(config.get("kpi_incentives", [])):
+    #             col1, col2 = st.columns(2)
+    #             with col1:
+    #                 parcels = st.number_input(f"Parcels Required", value=kpi["parcels"], step=100, key=f"kpi_parcels_{i}")
+    #             with col2:
+    #                 bonus = st.number_input(f"Bonus (RM)", value=kpi["bonus"], step=50.0, key=f"kpi_bonus_{i}")
+    #             description = st.text_input(f"Description", value=kpi["description"], key=f"kpi_desc_{i}")
+    #             config["kpi_incentives"][i] = {"parcels": parcels, "bonus": bonus, "description": description}
+
+    #         # Save configuration
+    #         col1, col2 = st.columns(2)
+    #         with col1:
+    #             if st.button("💾 Save", use_container_width=True):
+    #                 config["data_source"]["gsheet_url"] = new_gsheet_url
+    #                 if Config.save(config):
+    #                     st.success("Configuration saved!")
+    #                     st.cache_data.clear()
+    #                     st.rerun()
+    #         with col2:
+    #             if st.button("❌ Cancel", use_container_width=True):
+    #                 st.session_state.edit_config = False
+    #                 st.rerun()
+
+    # Add footer
     add_footer()
-
 
 if __name__ == "__main__":
     main()
