@@ -1048,6 +1048,7 @@ def main():
     </div>
     """, unsafe_allow_html=True)
     config = Config.load()
+    config["data_source"]["type"] = "gsheet"
     with st.spinner("Loading data from Google Sheets..."):
         df = DataSource.load_data(config)
     if df is None:
