@@ -53,7 +53,7 @@ class Config:
     DEFAULT_CONFIG = {
         "data_source": {
             "type": "gsheet",
-            "gsheet_url": "https://docs.google.com/spreadsheets/d/18_IclDYSEbPLdJ729W47GeSexQu6GXAa/edit?gid=2102741839#gid=2102741839",
+            "gsheet_url": "https://docs.google.com/spreadsheets/d/10x13yRa_-t3iDiTmijlrYh0EWFtNEA89/edit?gid=1904427159#gid=1904427159",
             "sheet_name": None
         },
         "tiers": [
@@ -193,7 +193,7 @@ class DataSource:
 
         if data_source["type"] == "gsheet" and data_source["gsheet_url"]:
             try:
-                return DataSource.read_google_sheet(data_source["gsheet_url"], "Sheet1")
+                return DataSource.read_google_sheet(data_source["gsheet_url"], "Dispatch")
             except Exception as exc:
                 st.error(f"Error reading dispatcher data from Sheet1: {exc}")
                 return None
@@ -254,6 +254,31 @@ class DataSource:
 
 class PayoutCalculator:
     """Handle payout calculations."""
+
+    @staticmethod
+    def _convert_to_float(value):
+        """Convert a value to float, handling comma decimal separators.
+
+        Handles European decimal format (e.g., '84,3' -> 84.3) and standard format.
+        """
+        # Handle NaN, None, or empty string
+        if pd.isna(value) or value == '' or str(value).strip() == '':
+            return 0.0
+
+        # Convert to string and strip whitespace
+        str_value = str(value).strip()
+
+        # Handle empty string after conversion
+        if not str_value or str_value.lower() == 'nan':
+            return 0.0
+
+        # Replace comma with period for decimal separator (handles European format like '84,3')
+        str_value = str_value.replace(',', '.')
+
+        try:
+            return float(str_value)
+        except (ValueError, TypeError):
+            return 0.0
 
     @staticmethod
     def calculate_kpi_bonus(total_parcels: int, kpi_config: List) -> Tuple[float, str]:
@@ -335,7 +360,7 @@ class PayoutCalculator:
             Dictionary containing penalty breakdown by type
         """
         penalty_breakdown = {
-            'duitnow': {'amount': 0.0, 'count': 0, 'waybills': []},
+            'duitnow': {'amount': 0.0, 'waybills': []},
             'ldr': {'amount': 0.0, 'count': 0, 'waybills': []},
             'fake_attempt': {'amount': 0.0, 'count': 0, 'waybills': []},
             'total_amount': 0.0,
@@ -363,9 +388,12 @@ class PayoutCalculator:
                             break
 
                     if penalty_col is not None:
-                        penalty_amount = duitnow_rows[penalty_col].fillna(0).astype(float).sum()
+                        # Convert penalty values, handling comma decimal separators
+                        penalty_values = duitnow_rows[penalty_col].apply(
+                            lambda x: PayoutCalculator._convert_to_float(x)
+                        )
+                        penalty_amount = penalty_values.sum()
                         penalty_breakdown['duitnow']['amount'] = float(penalty_amount)
-                        penalty_breakdown['duitnow']['count'] = len(duitnow_rows)
 
         # 2. Process LD&R penalty (Sheet4)
         if ldr_df is not None and not ldr_df.empty:
@@ -388,7 +416,11 @@ class PayoutCalculator:
                             break
 
                     if amount_col is not None:
-                        penalty_amount = ldr_rows[amount_col].fillna(0).astype(float).sum()
+                        # Convert penalty values, handling comma decimal separators
+                        penalty_values = ldr_rows[amount_col].apply(
+                            lambda x: PayoutCalculator._convert_to_float(x)
+                        )
+                        penalty_amount = penalty_values.sum()
                         penalty_breakdown['ldr']['amount'] = float(penalty_amount)
                         penalty_breakdown['ldr']['count'] = len(ldr_rows)
 
@@ -440,7 +472,6 @@ class PayoutCalculator:
             penalty_breakdown['fake_attempt']['amount']
         )
         penalty_breakdown['total_count'] = (
-            penalty_breakdown['duitnow']['count'] +
             penalty_breakdown['ldr']['count'] +
             penalty_breakdown['fake_attempt']['count']
         )
@@ -558,7 +589,7 @@ class PayoutCalculator:
         )
 
         # Calculate penalty breakdown
-        penalty_breakdown = {'duitnow': {'amount': 0.0, 'count': 0, 'waybills': []},
+        penalty_breakdown = {'duitnow': {'amount': 0.0, 'waybills': []},
                            'ldr': {'amount': 0.0, 'count': 0, 'waybills': []},
                            'fake_attempt': {'amount': 0.0, 'count': 0, 'waybills': []},
                            'total_amount': 0.0, 'total_count': 0}
@@ -939,10 +970,10 @@ class InvoiceGenerator:
                 """
 
                 # DuitNow penalties
-                if penalty_breakdown['duitnow']['count'] > 0:
+                if penalty_breakdown['duitnow']['amount'] > 0:
                     html_content += f"""
                         <div class="penalty-item">
-                            <span><strong>DuitNow:</strong> {penalty_breakdown['duitnow']['count']} parcel(s)</span>
+                            <span><strong>DuitNow:</strong></span>
                             <span>- {currency_symbol} {penalty_breakdown['duitnow']['amount']:,.2f}</span>
                         </div>
                     """
@@ -1035,10 +1066,10 @@ class InvoiceGenerator:
                     <span>- {currency_symbol} {penalty_breakdown['total_amount']:,.2f}</span>
                 </div>"""
 
-            if penalty_breakdown['duitnow']['count'] > 0:
+            if penalty_breakdown['duitnow']['amount'] > 0:
                 html_content += f"""
                 <div class="payout-row penalty-detail-row">
-                    <span>↳ DuitNow ({penalty_breakdown['duitnow']['count']} parcel(s)):</span>
+                    <span>↳ DuitNow:</span>
                     <span>- {currency_symbol} {penalty_breakdown['duitnow']['amount']:,.2f}</span>
                 </div>"""
 
@@ -1323,8 +1354,8 @@ def main():
         display_name = f"{dispatcher_id} - {dispatcher_name}" if dispatcher_name else dispatcher_id
         dispatcher_options.append((dispatcher_id, display_name))
 
-    # Sort by dispatcher ID
-    dispatcher_options.sort(key=lambda x: x[0])
+    # Sort by dispatcher name (alphabetically) - extract name from display_name for sorting
+    dispatcher_options.sort(key=lambda x: (dispatcher_mapping.get(x[0], "").lower() or x[0].lower()))
 
     selected_display = st.selectbox(
         "Select Dispatcher",
@@ -1544,8 +1575,8 @@ def main():
                     penalty_col1, penalty_col2, penalty_col3 = st.columns(3)
 
                     with penalty_col1:
-                        if penalty_breakdown['duitnow']['count'] > 0:
-                            st.error(f"**DuitNow:** {penalty_breakdown['duitnow']['count']} parcel(s) - {config['currency_symbol']}{penalty_breakdown['duitnow']['amount']:,.2f}")
+                        if penalty_breakdown['duitnow']['amount'] > 0:
+                            st.error(f"**DuitNow:** - {config['currency_symbol']}{penalty_breakdown['duitnow']['amount']:,.2f}")
 
                     with penalty_col2:
                         if penalty_breakdown['ldr']['count'] > 0:
