@@ -294,7 +294,7 @@ class PayoutCalculator:
             description = kpi.get("description", f"{required_parcels} parcels")
 
             if total_parcels >= required_parcels:
-                return float(bonus), description
+                return round(float(bonus), 2), description
 
         return 0.0, "No KPI achieved"
 
@@ -312,7 +312,7 @@ class PayoutCalculator:
 
         if qualified_days >= required_days:
             description = f"{qualified_days}/{required_days} days qualified (≥{min_parcels} parcels/day)"
-            return float(bonus_amount), description, qualified_days
+            return round(float(bonus_amount), 2), description, qualified_days
         else:
             description = f"{qualified_days}/{required_days} days qualified (need ≥{min_parcels} parcels/day)"
             return 0.0, description, qualified_days
@@ -406,7 +406,7 @@ class PayoutCalculator:
                             lambda x: PayoutCalculator._convert_to_float(x)
                         )
                         penalty_amount = penalty_values.sum()
-                        penalty_breakdown['duitnow']['amount'] = float(penalty_amount)
+                        penalty_breakdown['duitnow']['amount'] = round(float(penalty_amount), 2)
 
         # 2. Process LD&R penalty (Sheet4)
         if ldr_df is not None and not ldr_df.empty:
@@ -434,7 +434,7 @@ class PayoutCalculator:
                             lambda x: PayoutCalculator._convert_to_float(x)
                         )
                         penalty_amount = penalty_values.sum()
-                        penalty_breakdown['ldr']['amount'] = float(penalty_amount)
+                        penalty_breakdown['ldr']['amount'] = round(float(penalty_amount), 2)
                         penalty_breakdown['ldr']['count'] = len(ldr_rows)
 
                         # Get waybill numbers
@@ -464,7 +464,7 @@ class PayoutCalculator:
                 if not fake_rows.empty:
                     # Fixed RM1.00 per fake attempt
                     penalty_amount = len(fake_rows) * 1.00
-                    penalty_breakdown['fake_attempt']['amount'] = float(penalty_amount)
+                    penalty_breakdown['fake_attempt']['amount'] = round(float(penalty_amount), 2)
                     penalty_breakdown['fake_attempt']['count'] = len(fake_rows)
 
                     # Get waybill numbers
@@ -478,11 +478,12 @@ class PayoutCalculator:
                         waybills = fake_rows[waybill_col].dropna().astype(str).str.strip().tolist()
                         penalty_breakdown['fake_attempt']['waybills'] = [wb for wb in waybills if wb and wb.lower() != 'nan']
 
-        # Calculate totals
-        penalty_breakdown['total_amount'] = (
+        # Calculate totals (round to 2 decimal places to avoid floating-point precision issues)
+        penalty_breakdown['total_amount'] = round(
             penalty_breakdown['duitnow']['amount'] +
             penalty_breakdown['ldr']['amount'] +
-            penalty_breakdown['fake_attempt']['amount']
+            penalty_breakdown['fake_attempt']['amount'],
+            2
         )
         penalty_breakdown['total_count'] = (
             penalty_breakdown['ldr']['count'] +
@@ -523,7 +524,7 @@ class PayoutCalculator:
         # Count unique waybills
         unique_waybills = matched_records["Waybill Number"].dropna().astype(str).str.strip()
         parcel_count = len(unique_waybills)
-        payout = parcel_count * rate
+        payout = round(parcel_count * rate, 2)
 
         return parcel_count, payout, matched_records
 
@@ -592,7 +593,7 @@ class PayoutCalculator:
         )
 
         per_day["payout_per_day"] = per_day["daily_parcels"] * per_day["rate_per_parcel"]
-        base_payout = float(per_day["payout_per_day"].sum())
+        base_payout = round(float(per_day["payout_per_day"].sum()), 2)
 
         total_parcels = int(per_day["daily_parcels"].sum())
         kpi_bonus, kpi_description = PayoutCalculator.calculate_kpi_bonus(total_parcels, kpi_config)
@@ -618,8 +619,11 @@ class PayoutCalculator:
                 str(dispatcher_id), duitnow_df, ldr_df, fake_df
             )
 
-        # Calculate gross payout (base + bonuses - penalties)
-        gross_payout = base_payout + kpi_bonus + attendance_bonus - penalty_breakdown['total_amount']
+        # Calculate gross payout (base + bonuses - penalties) - round to 2 decimal places
+        gross_payout = round(
+            base_payout + kpi_bonus + attendance_bonus - penalty_breakdown['total_amount'],
+            2
+        )
 
         display_df = per_day[["__date", "daily_parcels", "tier", "rate_per_parcel", "payout_per_day"]].copy()
         display_df = display_df.rename(columns={
@@ -1439,16 +1443,16 @@ def main():
                 pickup_df, selected_dispatcher_id, rate=1.00
             )
 
-            # Calculate gross total payout (delivery + pickup + bonuses - penalties)
-            gross_total_payout = gross_delivery_payout + pickup_payout
+            # Calculate gross total payout (delivery + pickup + bonuses - penalties) - round to 2 decimal places
+            gross_total_payout = round(gross_delivery_payout + pickup_payout, 2)
 
             # Calculate advance payout (40% of base delivery payout only, not including pickup, bonuses, penalties)
             advance_payout = 0.0
             if advance_enabled and advance_percentage > 0:
-                advance_payout = (base_delivery_payout * advance_percentage) / 100.0
+                advance_payout = round((base_delivery_payout * advance_percentage) / 100.0, 2)
 
-            # Calculate final payout
-            final_payout = gross_total_payout - advance_payout
+            # Calculate final payout - round to 2 decimal places
+            final_payout = round(gross_total_payout - advance_payout, 2)
 
             # Display metrics in columns
             col1, col2, col3, col4, col5, col6 = st.columns(6)
