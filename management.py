@@ -67,7 +67,6 @@ class Config:
         "data_source": {
             "type": "postgres",
             "postgres_table": "dispatcher",
-            "penalty_table": "penalty",
             "pickup_table": "pickup"
         },
         "database": {"table_name": "dispatcher"},
@@ -79,7 +78,6 @@ class Config:
         ],
         "pickup_fee": 151.00,
         "currency_symbol": "RM",
-        "penalty_rate": 100.0,
         "forecast_days": 30
     }
 
@@ -98,12 +96,8 @@ class Config:
                     # Ensure new fields exist
                     if "postgres_table" not in config.get("data_source", {}):
                         config["data_source"]["postgres_table"] = "dispatcher"
-                    if "penalty_table" not in config.get("data_source", {}):
-                        config["data_source"]["penalty_table"] = "penalty"
                     if "pickup_table" not in config.get("data_source", {}):
                         config["data_source"]["pickup_table"] = "pickup"
-                    if "penalty_rate" not in config:
-                        config["penalty_rate"] = 100.0
                     if "pickup_payout_per_parcel" not in config:
                         config["pickup_payout_per_parcel"] = 1.50
                     if "forecast_days" not in config:
@@ -236,12 +230,6 @@ class DataSource:
                     'item_type': 'Item Type',
                     'cod_amount': 'COD Amount'
                 }
-            elif table_name == 'penalty' or table_name.endswith('penalty'):
-                column_mapping = {
-                    'waybill': 'Waybill Number',
-                    'responsible': 'RESPONSIBLE',
-                    'penalty_amount_actual': 'Penalty Amount'
-                }
             else:
                 column_mapping = {}
 
@@ -279,34 +267,6 @@ class DataSource:
             return df
         except Exception as exc:
             st.error(f"Error reading from PostgreSQL: {exc}")
-            return None
-
-    @staticmethod
-    def load_penalty_data(config: dict) -> Optional[pd.DataFrame]:
-        """Load penalty data from penalty table."""
-        data_source = config["data_source"]
-        engine = DataSource.get_postgres_engine()
-
-        if not engine:
-            return None
-
-        try:
-            penalty_table = data_source.get("penalty_table", "penalty")
-            df = DataSource.read_postgres_table(engine, penalty_table)
-
-            # Map penalty table columns
-            penalty_mapping = {
-                'waybill': 'Waybill Number',
-                'responsible': 'RESPONSIBLE',
-                'penalty_amount_actual': 'Penalty Amount'
-            }
-
-            rename_dict = {old: new for old, new in penalty_mapping.items() if old in df.columns}
-            df = df.rename(columns=rename_dict)
-
-            return df
-        except Exception as exc:
-            st.warning(f"Could not load penalty data from PostgreSQL table '{penalty_table}': {exc}")
             return None
 
     @staticmethod
@@ -419,52 +379,6 @@ class PayoutCalculator:
         return tiers[-1]['rate']
 
     @staticmethod
-    def calculate_penalty(dispatcher_id: str, penalty_df: Optional[pd.DataFrame], penalty_rate: float = 100.0) -> Tuple[float, int, List[str]]:
-        """
-        Calculate penalty for a dispatcher based on penalty data.
-
-        Returns: (penalty_amount, penalty_count, waybill_numbers)
-        """
-        if penalty_df is None or penalty_df.empty or not dispatcher_id:
-            return 0.0, 0, []
-
-        # Find 'RESPONSIBLE' column (mapped from 'responsible')
-        responsible_col = None
-        for col in penalty_df.columns:
-            if col.strip().replace(' ', '').upper() == "RESPONSIBLE":
-                responsible_col = col
-                break
-        if responsible_col is None:
-            return 0.0, 0, []
-
-        # Find waybill column
-        waybill_col = None
-        for col in penalty_df.columns:
-            if 'waybill' in col.lower() or 'Waybill Number' in col:
-                waybill_col = col
-                break
-
-        dispatcher_id_clean = str(dispatcher_id).strip().lower()
-        responsible_series = penalty_df[responsible_col].astype(str).str.strip().str.lower()
-
-        penalty_records = penalty_df[responsible_series == dispatcher_id_clean]
-        penalty_count = len(penalty_records)
-
-        # Use actual penalty amount if available
-        penalty_amount = 0.0
-        if 'Penalty Amount' in penalty_df.columns:
-            penalty_amount = penalty_records['Penalty Amount'].sum()
-        else:
-            penalty_amount = penalty_count * penalty_rate
-
-        waybill_numbers = []
-        if waybill_col and penalty_count > 0:
-            waybill_series = penalty_records[waybill_col].astype(str).str.strip()
-            waybill_numbers = [wb for wb in waybill_series if wb and wb.lower() != 'nan']
-
-        return float(penalty_amount), penalty_count, waybill_numbers
-
-    @staticmethod
     def calculate_pickup_payout(pickup_df: pd.DataFrame, dispatcher_summary_df: pd.DataFrame, pickup_payout_per_parcel: float = 1.50) -> pd.DataFrame:
         """
         Calculate pickup payout based on pickup data.
@@ -536,8 +450,7 @@ class PayoutCalculator:
         return dispatcher_summary_df
 
     @staticmethod
-    def calculate_payout(df: pd.DataFrame, currency_symbol: str, penalty_df: Optional[pd.DataFrame] = None,
-                        penalty_rate: float = 100.0, pickup_df: Optional[pd.DataFrame] = None,
+    def calculate_payout(df: pd.DataFrame, currency_symbol: str, pickup_df: Optional[pd.DataFrame] = None,
                         pickup_payout_per_parcel: float = 1.50) -> Tuple[pd.DataFrame, pd.DataFrame, float]:
         """Calculate payout using tier-based weight calculation."""
         # Prepare data
@@ -608,26 +521,11 @@ class PayoutCalculator:
 
         grouped['avg_rate'] = grouped['dispatch_payout'] / grouped['parcel_count']
 
-        # Calculate penalties
-        grouped['penalty_amount'] = 0.0
-        grouped['penalty_count'] = 0
-        grouped['penalty_waybills'] = ''
-
-        if penalty_df is not None and not penalty_df.empty:
-            for i, row in grouped.iterrows():
-                dispatcher_id = row['dispatcher_id']
-                penalty_amount, penalty_count, penalty_waybills = PayoutCalculator.calculate_penalty(
-                    str(dispatcher_id), penalty_df, penalty_rate
-                )
-                grouped.at[i, 'penalty_amount'] = penalty_amount
-                grouped.at[i, 'penalty_count'] = penalty_count
-                grouped.at[i, 'penalty_waybills'] = ', '.join(penalty_waybills) if penalty_waybills else ''
-
         # Calculate pickup payout
         grouped = PayoutCalculator.calculate_pickup_payout(pickup_df, grouped, pickup_payout_per_parcel)
 
-        # Calculate total payout: dispatch payout - penalty + pickup payout
-        grouped['total_payout'] = grouped['dispatch_payout'] - grouped['penalty_amount'] + grouped['pickup_payout']
+        # Calculate total payout: dispatch payout + pickup payout
+        grouped['total_payout'] = grouped['dispatch_payout'] + grouped['pickup_payout']
 
         # Create display and numeric dataframes
         numeric_df = grouped.rename(columns={
@@ -639,9 +537,6 @@ class PayoutCalculator:
             "avg_rate": "Avg Rate per Parcel",
             "dispatch_payout": "Dispatch Payout",
             "total_payout": "Total Payout",
-            "penalty_amount": "Penalty",
-            "penalty_count": "Penalty Parcels",
-            "penalty_waybills": "Penalty Waybills",
             "pickup_parcels": "Pickup Parcels",
             "pickup_payout": "Pickup Payout",
             "tier1_parcels": "Parcels 0-5kg",
@@ -656,13 +551,7 @@ class PayoutCalculator:
         display_df["Avg Rate per Parcel"] = display_df["Avg Rate per Parcel"].apply(lambda x: f"{currency_symbol}{x:.2f}")
         display_df["Dispatch Payout"] = display_df["Dispatch Payout"].apply(lambda x: f"{currency_symbol}{x:,.2f}")
         display_df["Total Payout"] = display_df["Total Payout"].apply(lambda x: f"{currency_symbol}{x:,.2f}")
-        display_df["Penalty"] = display_df["Penalty"].apply(lambda x: f"-{currency_symbol}{x:,.2f}" if x > 0 else f"{currency_symbol}0.00")
         display_df["Pickup Payout"] = display_df["Pickup Payout"].apply(lambda x: f"{currency_symbol}{x:,.2f}")
-
-        if "Penalty Waybills" in display_df.columns:
-            display_df = display_df.drop(columns=["Penalty Waybills"])
-        if "Penalty Parcels" in display_df.columns:
-            display_df = display_df.drop(columns=["Penalty Parcels"])
 
         total_payout = numeric_df["Total Payout"].sum()
         st.success(f"✅ Processed {len(df_unique)} unique parcels from {len(grouped)} dispatchers")
@@ -670,13 +559,11 @@ class PayoutCalculator:
         # Calculate breakdown for info message
         total_dispatch_payout = numeric_df["Dispatch Payout"].sum()
         total_pickup_payout = numeric_df["Pickup Payout"].sum()
-        total_penalty = numeric_df["Penalty"].sum()
 
         st.info(f"""
         💰 **Payout Breakdown:**
         - Dispatch Payout: {currency_symbol} {total_dispatch_payout:,.2f}
         + Pickup Payout: {currency_symbol} {total_pickup_payout:,.2f}
-        - Penalties: {currency_symbol} {total_penalty:,.2f}
         **Total Payout: {currency_symbol} {total_payout:,.2f}**
         """)
 
@@ -923,13 +810,12 @@ class InvoiceGenerator:
     @staticmethod
     def build_invoice_html(display_df: pd.DataFrame, numeric_df: pd.DataFrame,
                           total_payout: float, currency_symbol: str,
-                          penalty_rate: float = 100.0, pickup_payout_per_parcel: float = 1.50) -> str:
+                          pickup_payout_per_parcel: float = 1.50) -> str:
         """Build management summary invoice HTML with original layout."""
         try:
             total_parcels = int(numeric_df["Parcels Delivered"].sum())
             total_dispatchers = len(numeric_df)
             total_weight = numeric_df["Total Weight (kg)"].sum()
-            total_penalty = numeric_df["Penalty"].sum()
             total_dispatch_payout = numeric_df["Dispatch Payout"].sum() if "Dispatch Payout" in numeric_df.columns else 0.0
             total_pickup_payout = numeric_df["Pickup Payout"].sum() if "Pickup Payout" in numeric_df.columns else 0.0
             total_pickup_parcels = int(numeric_df["Pickup Parcels"].sum()) if "Pickup Parcels" in numeric_df.columns else 0
@@ -937,7 +823,7 @@ class InvoiceGenerator:
 
             table_columns = ["Dispatcher ID", "Dispatcher Name", "Parcels Delivered",
                            "Dispatch Payout", "Pickup Parcels", "Pickup Payout",
-                           "Penalty", "Total Payout"]
+                           "Total Payout"]
 
             html = f"""
             <html>
@@ -1065,10 +951,6 @@ class InvoiceGenerator:
                             <div class="label">Pickup Payout</div>
                             <div class="value">{currency_symbol} {total_pickup_payout:,.2f}</div>
                         </div>
-                        <div class="chip">
-                            <div class="label">Total Penalty</div>
-                            <div class="value">-{currency_symbol} {total_penalty:,.2f}</div>
-                        </div>
                     </div>
 
                     <table>
@@ -1091,7 +973,6 @@ class InvoiceGenerator:
                             <tr><th style="background:var(--primary);color:white;text-align:left;">Summary</th><th style="background:var(--primary);color:white;text-align:right;">Amount</th></tr>
                             <tr><td>Total Dispatch Payout</td><td style="text-align:right;">{currency_symbol} {total_dispatch_payout:,.2f}</td></tr>
                             <tr><td>Pickup Payout</td><td style="text-align:right;">{currency_symbol} {total_pickup_payout:,.2f}</td></tr>
-                            <tr><td>Total Penalty</td><td style="text-align:right;">-{currency_symbol} {total_penalty:,.2f}</td></tr>
                             <tr><td><strong>Total Payout</strong></td><td style="text-align:right;"><strong>{currency_symbol} {total_payout:,.2f}</strong></td></tr>
                         </table>
                     </div>
@@ -1164,7 +1045,6 @@ def main():
     # Show current database configuration
     st.sidebar.success("✅ Using PostgreSQL Database")
     st.sidebar.info(f"📊 Table: `{config['data_source'].get('postgres_table', 'dispatcher')}`")
-    st.sidebar.info(f"⚠️ Penalty Table: `{config['data_source'].get('penalty_table', 'penalty')}`")
     st.sidebar.info(f"📦 Pickup Table: `{config['data_source'].get('pickup_table', 'pickup')}`")
 
     # Database connection status
@@ -1202,21 +1082,6 @@ def main():
         config["pickup_payout_per_parcel"] = pickup_payout_per_parcel
         Config.save(config)
 
-    # Add configuration for penalty rate
-    penalty_rate = st.sidebar.number_input(
-        "Penalty Rate per Incident",
-        min_value=0.0,
-        max_value=500.0,
-        value=config.get("penalty_rate", 100.0),
-        step=10.0,
-        help="Penalty amount per penalty incident"
-    )
-
-    # Update config with new value
-    if penalty_rate != config.get("penalty_rate", 100.0):
-        config["penalty_rate"] = penalty_rate
-        Config.save(config)
-
     # Add configuration for forecast days
     forecast_days = st.sidebar.number_input(
         "Forecast Period (days)",
@@ -1241,9 +1106,6 @@ def main():
 
     **📦 Pickup Payout:**
     - RM{pickup_payout_per_parcel:.2f} per parcel
-
-    **⚠️ Penalty Rate:**
-    - RM{penalty_rate:.2f} per incident
 
     **📈 Forecast Period:**
     - {forecast_days} days
@@ -1297,27 +1159,8 @@ def main():
         else:
             st.sidebar.warning("Selected date column has no valid date values; showing all data.")
 
-    # Load penalty and pickup data
-    penalty_df = DataSource.load_penalty_data(config)
+    # Load pickup data
     pickup_df = DataSource.load_pickup_data(config)
-
-    # Filter penalty_df by selected month/date range (same as main df)
-    if penalty_df is not None and not penalty_df.empty and selected_date_col != "-- None --":
-        penalty_date_col = find_column(penalty_df, "date")
-        if penalty_date_col is None:
-            for col in penalty_df.columns:
-                if any(k in str(col).lower() for k in ["date", "created", "signature", "scan"]):
-                    penalty_date_col = col
-                    break
-
-        if penalty_date_col is not None:
-            penalty_df[penalty_date_col] = pd.to_datetime(penalty_df[penalty_date_col], errors="coerce")
-            penalty_df = penalty_df[
-                (penalty_df[penalty_date_col].dt.date >= start_date) &
-                (penalty_df[penalty_date_col].dt.date <= end_date)
-            ]
-        else:
-            st.warning("Penalty table has no detectable date column; penalties are not filtered by month.")
 
     # Filter pickup_df by selected month/date range
     if pickup_df is not None and not pickup_df.empty and selected_date_col != "-- None --":
@@ -1340,7 +1183,7 @@ def main():
     currency = config.get("currency_symbol", "RM")
 
     display_df, numeric_df, total_payout = PayoutCalculator.calculate_payout(
-        df, currency, penalty_df, penalty_rate, pickup_df, pickup_payout_per_parcel
+        df, currency, pickup_df, pickup_payout_per_parcel
     )
 
     if numeric_df.empty:
@@ -1380,7 +1223,6 @@ def main():
     col5.metric("Dispatch Payout", f"{currency} {total_dispatch_payout:,.2f}")
     col6.metric("Pickup Payout", f"{currency} {total_pickup_payout:,.2f}")
     col7.metric("Pickup Rate", f"{currency} {pickup_payout_per_parcel:.2f}")
-    col8.metric("Total Penalty", f"-{currency} {numeric_df['Penalty'].sum():,.2f}")
 
     # Charts
     st.markdown("---")
@@ -1420,7 +1262,7 @@ def main():
     preferred_order = [
         "Dispatcher ID", "Dispatcher Name", "Parcels Delivered",
         "Dispatch Payout", "Pickup Parcels", "Pickup Payout",
-        "Penalty", "Total Payout", "Total Weight (kg)", "Avg Weight (kg)",
+        "Total Payout", "Total Weight (kg)", "Avg Weight (kg)",
         "Avg Rate per Parcel", "Parcels 0-5kg", "Parcels 5.01-10kg",
         "Parcels 10.01-30kg", "Parcels 30+kg"
     ]
@@ -1614,34 +1456,9 @@ def main():
     else:
         st.info("Insufficient historical data for forecasting. Need at least 7 days of data.")
 
-    if 'Penalty Parcels' in numeric_df.columns and numeric_df['Penalty Parcels'].sum() > 0:
-        st.markdown("---")
-        st.subheader("⚠️ Penalty Details")
-
-        penalty_rows = []
-        penalty_dispatchers = numeric_df[numeric_df['Penalty Parcels'] > 0]
-        for _, row in penalty_dispatchers.iterrows():
-            dispatcher_id = row['Dispatcher ID']
-            dispatcher_name = row['Dispatcher Name']
-            waybills_str = row.get('Penalty Waybills', '')
-            waybills_list = [w.strip() for w in waybills_str.split(',') if w.strip()] if waybills_str else []
-            for waybill_number in waybills_list:
-                penalty_rows.append({
-                    'Dispatcher ID': dispatcher_id,
-                    'Dispatcher Name': dispatcher_name,
-                    'Waybill Number': waybill_number,
-                    'Penalty Amount': f"{currency}{penalty_rate:.2f}"
-                })
-
-        if penalty_rows:
-            penalty_table = pd.DataFrame(penalty_rows)
-            st.dataframe(penalty_table, use_container_width=True, hide_index=True)
-        else:
-            st.info("No penalty waybill numbers available")
-
     st.markdown("---")
     st.subheader("📄 Invoice Generation")
-    invoice_html = InvoiceGenerator.build_invoice_html(display_df, numeric_df, total_payout, currency, penalty_rate, pickup_payout_per_parcel)
+    invoice_html = InvoiceGenerator.build_invoice_html(display_df, numeric_df, total_payout, currency, pickup_payout_per_parcel)
     st.download_button(
         label="📥 Download Invoice (HTML)",
         data=invoice_html.encode("utf-8"),
