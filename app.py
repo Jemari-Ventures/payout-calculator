@@ -942,7 +942,7 @@ class InvoiceGenerator:
                 if penalty_breakdown['duitnow']['count'] > 0:
                     html_content += f"""
                         <div class="penalty-item">
-                            <span><strong>DuitNow:</strong> {penalty_breakdown['duitnow']['count']} parcel(s)</span>
+                            <span><strong>DuitNow:</strong></span>
                             <span>- {currency_symbol} {penalty_breakdown['duitnow']['amount']:,.2f}</span>
                         </div>
                     """
@@ -1038,7 +1038,7 @@ class InvoiceGenerator:
             if penalty_breakdown['duitnow']['count'] > 0:
                 html_content += f"""
                 <div class="payout-row penalty-detail-row">
-                    <span>↳ DuitNow ({penalty_breakdown['duitnow']['count']} parcel(s)):</span>
+                    <span>↳ DuitNow: </span>
                     <span>- {currency_symbol} {penalty_breakdown['duitnow']['amount']:,.2f}</span>
                 </div>"""
 
@@ -1547,7 +1547,7 @@ def main():
 
                     with penalty_col1:
                         if penalty_breakdown['duitnow']['count'] > 0:
-                            st.error(f"**DuitNow:** {penalty_breakdown['duitnow']['count']} parcel(s) - {config['currency_symbol']}{penalty_breakdown['duitnow']['amount']:,.2f}")
+                            st.error(f"**DuitNow:** {config['currency_symbol']}{penalty_breakdown['duitnow']['amount']:,.2f}")
 
                     with penalty_col2:
                         if penalty_breakdown['ldr']['count'] > 0:
