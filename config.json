@@ -3,8 +3,7 @@
     "type": "postgres",
     "gsheet_url": "https://docs.google.com/spreadsheets/d/10x13yRa_-t3iDiTmijlrYh0EWFtNEA89/edit?gid=1904427159#gid=1904427159",
     "sheet_name": null,
-    "postgres_table": "dispatcher",
-    "penalty_table": "penalty",
+    "postgres_table": "dispatch",
     "pickup_table": "pickup"
   },
   "database": {
