@@ -1403,14 +1403,6 @@ class InvoiceGenerator:
                             <div class="value">{total_pickup_parcels:,}</div>
                         </div>
                         <div class="chip">
-                            <div class="label">Pickup Rate</div>
-                            <div class="value">{currency_symbol} {pickup_payout_per_parcel:.2f}</div>
-                        </div>
-                        <div class="chip">
-                            <div class="label">Pickup Payout</div>
-                            <div class="value">{currency_symbol} {total_pickup_payout:,.2f}</div>
-                        </div>
-                        <div class="chip">
                             <div class="label">Total Penalty</div>
                             <div class="value">-{currency_symbol} {total_penalty:,.2f}</div>
                         </div>
