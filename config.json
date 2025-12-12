@@ -1,7 +1,7 @@
 {
   "data_source": {
     "type": "postgres",
-    "gsheet_url": "https://docs.google.com/spreadsheets/d/18_IclDYSEbPLdJ729W47GeSexQu6GXAa/edit?gid=2102741839#gid=2102741839",
+    "gsheet_url": "https://docs.google.com/spreadsheets/d/10x13yRa_-t3iDiTmijlrYh0EWFtNEA89/edit?gid=1904427159#gid=1904427159",
     "sheet_name": null,
     "postgres_table": "dispatcher",
     "penalty_table": "penalty",
