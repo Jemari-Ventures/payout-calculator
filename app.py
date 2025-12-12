@@ -376,9 +376,22 @@ class PayoutCalculator:
                     break
 
             if rider_col is not None:
+                # Filter by dispatcher ID
                 duitnow_rows = duitnow_df[
                     duitnow_df[rider_col].astype(str).str.strip() == str(dispatcher_id).strip()
                 ]
+
+                # Filter by Achieve = Fail
+                achieve_col = None
+                for col in duitnow_df.columns:
+                    if col.upper().strip() == "ACHIEVE":
+                        achieve_col = col
+                        break
+
+                if achieve_col is not None:
+                    duitnow_rows = duitnow_rows[
+                        duitnow_rows[achieve_col].astype(str).str.strip().str.upper() == "FAIL"
+                    ]
 
                 if not duitnow_rows.empty:
                     penalty_col = None
