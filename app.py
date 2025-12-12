@@ -1323,8 +1323,10 @@ def main():
         display_name = f"{dispatcher_id} - {dispatcher_name}" if dispatcher_name else dispatcher_id
         dispatcher_options.append((dispatcher_id, display_name))
 
-    # Sort by dispatcher ID
-    dispatcher_options.sort(key=lambda x: x[0])
+    # Sort alphabetically by the dispatcher name portion
+    dispatcher_options.sort(
+        key=lambda x: x[1].split(" - ", 1)[1].lower() if " - " in x[1] else x[1].lower()
+    )
 
     selected_display = st.selectbox(
         "Select Dispatcher",
