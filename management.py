@@ -9,6 +9,7 @@ import os
 from typing import Optional, Tuple, Dict, List
 from datetime import datetime, timedelta
 from urllib.parse import urlparse, parse_qs
+from decimal import Decimal
 
 import pandas as pd
 import numpy as np
@@ -66,10 +67,10 @@ class Config:
     DEFAULT_CONFIG = {
         "data_source": {
             "type": "postgres",
-            "postgres_table": "dispatcher",
+            "postgres_table": "dispatch",
             "pickup_table": "pickup"
         },
-        "database": {"table_name": "dispatcher"},
+        "database": {"table_name": "dispatch"},
         "weight_tiers": [
             {"min": 0, "max": 5, "rate": 1.50},
             {"min": 5, "max": 10, "rate": 1.60},
@@ -95,7 +96,7 @@ class Config:
                     config = json.load(f)
                     # Ensure new fields exist
                     if "postgres_table" not in config.get("data_source", {}):
-                        config["data_source"]["postgres_table"] = "dispatcher"
+                        config["data_source"]["postgres_table"] = "dispatch"
                     if "pickup_table" not in config.get("data_source", {}):
                         config["data_source"]["pickup_table"] = "pickup"
                     if "pickup_payout_per_parcel" not in config:
@@ -257,8 +258,8 @@ class DataSource:
                     seen_targets.add(new)
             df = df.rename(columns=rename_dict)
 
-            # For dispatcher table, ensure required columns exist even if original columns were missing
-            if table_name == 'dispatcher' or table_name.endswith('dispatcher'):
+            # For dispatch table, ensure required columns exist even if original columns were missing
+            if table_name == 'dispatch' or table_name.endswith('dispatch'):
                 # Ensure Waybill Number exists
                 if 'Waybill Number' not in df.columns:
                     # Try to find waybill_number or waybill column (case-insensitive)
@@ -338,7 +339,7 @@ class DataSource:
             return None
 
         try:
-            table_name = data_source.get("postgres_table", "dispatcher")
+            table_name = data_source.get("postgres_table", "dispatch")
             df = DataSource.read_postgres_table(engine, table_name)
 
             # Verify required columns exist after mapping
@@ -476,31 +477,90 @@ class PayoutCalculator:
 
     @staticmethod
     def get_rate_by_weight(weight: float, tiers: Optional[List[dict]] = None) -> float:
-        """Get per-parcel rate based on weight tiers."""
+        """Get per-parcel rate based on weight tiers.
+
+        Tier boundaries (as specified):
+        - 0kg < x < 5kg → 1.50 (0.01 to 4.99, or exactly 5.0 falls here)
+        - 5.01kg < x < 10kg → 1.60 (5.01 to 9.99, or exactly 10.0 falls here)
+        - 10.01kg < x < 30kg → 2.70 (10.01 to 29.99, or exactly 30.0 falls here)
+        - x > 30kg → 4.00 (30.01+)
+        """
         if tiers is None:
             tiers = Config.load().get("weight_tiers", Config.DEFAULT_CONFIG["weight_tiers"])
 
         w = 0.0 if pd.isna(weight) else float(weight)
 
-        for idx, tier in enumerate(sorted(tiers, key=lambda t: t['min'])):
-            tier_max = tier.get('max', float('inf'))
-            is_first_tier = idx == 0
-            is_last_tier = idx == len(tiers) - 1
+        # Handle zero or negative weights - use first tier
+        if w <= 0:
+            return tiers[0]['rate']
 
-            if is_first_tier:
-                if w <= tier_max:
-                    return tier['rate']
+        # Sort tiers by min value to ensure correct order
+        sorted_tiers = sorted(tiers, key=lambda t: t['min'])
+
+        # Tier 4: x > 30kg (30.01+)
+        if w > 30:
+            return sorted_tiers[3]['rate'] if len(sorted_tiers) > 3 else sorted_tiers[-1]['rate']
+
+        # Tier 3: 10.01kg <= x <= 30kg (10.01 to 30.0)
+        # Note: 30.0 falls into tier 3, not tier 4
+        if w >= 10.01:
+            return sorted_tiers[2]['rate'] if len(sorted_tiers) > 2 else sorted_tiers[-1]['rate']
+
+        # Tier 2: 5.01kg <= x < 10.01kg (5.01 to 10.0)
+        # Note: 10.0 falls into tier 2, not tier 3
+        if w >= 5.01:
+            return sorted_tiers[1]['rate'] if len(sorted_tiers) > 1 else sorted_tiers[0]['rate']
+
+        # Tier 1: 0kg < x < 5.01kg (0.01 to 5.0)
+        # Note: 5.0 falls into tier 1, not tier 2
+        return sorted_tiers[0]['rate']
+
+    @staticmethod
+    def _preprocess_penalty_data(penalty_data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+        """
+        Pre-process penalty dataframes to cache column lookups and Decimal conversions.
+        This improves performance by doing the work once instead of for each dispatcher.
+        """
+        processed = {}
+
+        for penalty_type, df in penalty_data.items():
+            if df is None or df.empty:
                 continue
 
-            if is_last_tier:
-                if w > tier['min']:
-                    return tier['rate']
-                continue
+            df_processed = df.copy()
 
-            if (w > tier['min']) and (w <= tier_max):
-                return tier['rate']
+            # Pre-process DuitNow penalty data
+            if penalty_type == 'duitnow':
+                # Find and cache column names
+                rider_col = next((col for col in df.columns if col.lower() == 'rider'), None)
+                penalty_col = next((col for col in df.columns if col.lower() == 'penalty'), None)
 
-        return tiers[-1]['rate']
+                if rider_col and penalty_col:
+                    # Pre-convert penalty column to Decimal once
+                    if 'penalty_numeric' not in df_processed.columns:
+                        df_processed['penalty_numeric'] = df_processed[penalty_col].apply(
+                            lambda x: Decimal(str(x)) if pd.notna(x) else Decimal('0')
+                        )
+                    # Pre-filter positive penalties
+                    df_processed = df_processed[df_processed['penalty_numeric'] > 0].copy()
+                    # Pre-normalize rider IDs
+                    df_processed['_rider_normalized'] = df_processed[rider_col].astype(str).str.strip().str.lower()
+
+            # Pre-process LDR penalty data
+            elif penalty_type == 'ldr':
+                employee_id_col = next((col for col in df.columns if col.lower() == 'employee_id'), None)
+                if employee_id_col:
+                    df_processed['_employee_id_normalized'] = df_processed[employee_id_col].astype(str).str.strip().str.lower()
+
+            # Pre-process Fake Attempt penalty data
+            elif penalty_type == 'fake_attempt':
+                dispatcher_id_col = next((col for col in df.columns if col.lower() == 'dispatcher_id'), None)
+                if dispatcher_id_col:
+                    df_processed['_dispatcher_id_normalized'] = df_processed[dispatcher_id_col].astype(str).str.strip().str.lower()
+
+            processed[penalty_type] = df_processed
+
+        return processed
 
     @staticmethod
     def calculate_penalty(dispatcher_id: str, penalty_data: Optional[Dict[str, pd.DataFrame]]) -> Tuple[float, int, List[str]]:
@@ -525,54 +585,49 @@ class PayoutCalculator:
         # 1. DuitNow Penalty: rider column = dispatcher_id, penalty amount from penalty column (only positive amounts)
         if 'duitnow' in penalty_data:
             duitnow_df = penalty_data['duitnow']
-            # Find rider column
-            rider_col = None
-            for col in duitnow_df.columns:
-                if col.lower() == 'rider':
-                    rider_col = col
-                    break
+            if not duitnow_df.empty:
+                # Use pre-processed data if available
+                if '_rider_normalized' in duitnow_df.columns:
+                    duitnow_records = duitnow_df[duitnow_df['_rider_normalized'] == dispatcher_id_clean]
+                else:
+                    # Fallback to original logic if not pre-processed
+                    rider_col = next((col for col in duitnow_df.columns if col.lower() == 'rider'), None)
+                    if rider_col:
+                        rider_series = duitnow_df[rider_col].astype(str).str.strip().str.lower()
+                        duitnow_records = duitnow_df[rider_series == dispatcher_id_clean]
+                    else:
+                        duitnow_records = pd.DataFrame()
 
-            if rider_col:
-                # Find penalty column
-                penalty_col = None
-                for col in duitnow_df.columns:
-                    if col.lower() == 'penalty':
-                        penalty_col = col
-                        break
-
-                if penalty_col:
-                    # Filter to only include records with positive penalty amounts
-                    duitnow_df['penalty_numeric'] = pd.to_numeric(duitnow_df[penalty_col], errors='coerce')
-                    duitnow_filtered = duitnow_df[duitnow_df['penalty_numeric'] > 0]
-
-                    rider_series = duitnow_filtered[rider_col].astype(str).str.strip().str.lower()
-                    duitnow_records = duitnow_filtered[rider_series == dispatcher_id_clean]
-                    if not duitnow_records.empty:
-                        duitnow_penalty = duitnow_records[penalty_col].sum()
-                        total_penalty += float(duitnow_penalty)
-                        total_count += len(duitnow_records)
+                if not duitnow_records.empty and 'penalty_numeric' in duitnow_records.columns:
+                    # Round each penalty value first, then sum (matching SQL: SUM((FLOOR((penalty * 100) + 0.5) / 100)))
+                    # This ensures individual dispatcher totals match SQL calculation
+                    rounded_penalties = [
+                        penalty.quantize(Decimal('0.01'), rounding='ROUND_HALF_UP')
+                        for penalty in duitnow_records['penalty_numeric'].tolist()
+                    ]
+                    duitnow_penalty_rounded = sum(rounded_penalties)
+                    total_penalty += float(duitnow_penalty_rounded)  # Convert to float only at the end
+                    total_count += len(duitnow_records)
 
         # 2. LDR Penalty: employee_id column = dispatcher_id, penalty = waybill count * RM 100
         if 'ldr' in penalty_data:
             ldr_df = penalty_data['ldr']
-            # Find employee_id column
-            employee_id_col = None
-            for col in ldr_df.columns:
-                if col.lower() == 'employee_id':
-                    employee_id_col = col
-                    break
+            if not ldr_df.empty:
+                # Use pre-processed data if available
+                if '_employee_id_normalized' in ldr_df.columns:
+                    ldr_records = ldr_df[ldr_df['_employee_id_normalized'] == dispatcher_id_clean]
+                else:
+                    # Fallback to original logic
+                    employee_id_col = next((col for col in ldr_df.columns if col.lower() == 'employee_id'), None)
+                    if employee_id_col:
+                        employee_series = ldr_df[employee_id_col].astype(str).str.strip().str.lower()
+                        ldr_records = ldr_df[employee_series == dispatcher_id_clean]
+                    else:
+                        ldr_records = pd.DataFrame()
 
-            if employee_id_col:
-                employee_series = ldr_df[employee_id_col].astype(str).str.strip().str.lower()
-                ldr_records = ldr_df[employee_series == dispatcher_id_clean]
                 if not ldr_records.empty:
                     # Count unique waybills (using ticket_no or no_awb if available)
-                    waybill_col = None
-                    for col in ldr_df.columns:
-                        if col.lower() in ['ticket_no', 'no_awb', 'waybill_number']:
-                            waybill_col = col
-                            break
-
+                    waybill_col = next((col for col in ldr_df.columns if col.lower() in ['ticket_no', 'no_awb', 'waybill_number']), None)
                     if waybill_col:
                         waybill_count = ldr_records[waybill_col].nunique()
                         waybill_list = ldr_records[waybill_col].dropna().astype(str).unique().tolist()
@@ -587,24 +642,22 @@ class PayoutCalculator:
         # 3. Fake Attempt Penalty: dispatcher_id column = dispatcher_id, penalty = waybill count * RM 1.00
         if 'fake_attempt' in penalty_data:
             fake_attempt_df = penalty_data['fake_attempt']
-            # Find dispatcher_id column
-            dispatcher_id_col = None
-            for col in fake_attempt_df.columns:
-                if col.lower() == 'dispatcher_id':
-                    dispatcher_id_col = col
-                    break
+            if not fake_attempt_df.empty:
+                # Use pre-processed data if available
+                if '_dispatcher_id_normalized' in fake_attempt_df.columns:
+                    fake_attempt_records = fake_attempt_df[fake_attempt_df['_dispatcher_id_normalized'] == dispatcher_id_clean]
+                else:
+                    # Fallback to original logic
+                    dispatcher_id_col = next((col for col in fake_attempt_df.columns if col.lower() == 'dispatcher_id'), None)
+                    if dispatcher_id_col:
+                        dispatcher_series = fake_attempt_df[dispatcher_id_col].astype(str).str.strip().str.lower()
+                        fake_attempt_records = fake_attempt_df[dispatcher_series == dispatcher_id_clean]
+                    else:
+                        fake_attempt_records = pd.DataFrame()
 
-            if dispatcher_id_col:
-                dispatcher_series = fake_attempt_df[dispatcher_id_col].astype(str).str.strip().str.lower()
-                fake_attempt_records = fake_attempt_df[dispatcher_series == dispatcher_id_clean]
                 if not fake_attempt_records.empty:
                     # Count unique waybills
-                    waybill_col = None
-                    for col in fake_attempt_df.columns:
-                        if col.lower() in ['waybill_number', 'waybill']:
-                            waybill_col = col
-                            break
-
+                    waybill_col = next((col for col in fake_attempt_df.columns if col.lower() in ['waybill_number', 'waybill']), None)
                     if waybill_col:
                         waybill_count = fake_attempt_records[waybill_col].nunique()
                         waybill_list = fake_attempt_records[waybill_col].dropna().astype(str).unique().tolist()
@@ -644,48 +697,46 @@ class PayoutCalculator:
         # 1. DuitNow Penalty: rider column = dispatcher_id, penalty amount from penalty column (only positive amounts)
         if 'duitnow' in penalty_data:
             duitnow_df = penalty_data['duitnow']
-            rider_col = None
-            for col in duitnow_df.columns:
-                if col.lower() == 'rider':
-                    rider_col = col
-                    break
+            if not duitnow_df.empty:
+                # Use pre-processed data if available
+                if '_rider_normalized' in duitnow_df.columns:
+                    duitnow_records = duitnow_df[duitnow_df['_rider_normalized'] == dispatcher_id_clean]
+                else:
+                    # Fallback to original logic if not pre-processed
+                    rider_col = next((col for col in duitnow_df.columns if col.lower() == 'rider'), None)
+                    if rider_col:
+                        rider_series = duitnow_df[rider_col].astype(str).str.strip().str.lower()
+                        duitnow_records = duitnow_df[rider_series == dispatcher_id_clean]
+                    else:
+                        duitnow_records = pd.DataFrame()
 
-            if rider_col:
-                penalty_col = None
-                for col in duitnow_df.columns:
-                    if col.lower() == 'penalty':
-                        penalty_col = col
-                        break
-
-                if penalty_col:
-                    # Filter to only include records with positive penalty amounts
-                    duitnow_df['penalty_numeric'] = pd.to_numeric(duitnow_df[penalty_col], errors='coerce')
-                    duitnow_filtered = duitnow_df[duitnow_df['penalty_numeric'] > 0]
-
-                    rider_series = duitnow_filtered[rider_col].astype(str).str.strip().str.lower()
-                    duitnow_records = duitnow_filtered[rider_series == dispatcher_id_clean]
-                    if not duitnow_records.empty:
-                        breakdown['duitnow'] = float(duitnow_records[penalty_col].sum())
+                if not duitnow_records.empty and 'penalty_numeric' in duitnow_records.columns:
+                    # Round each penalty value first, then sum (matching SQL: SUM((FLOOR((penalty * 100) + 0.5) / 100)))
+                    # This ensures individual dispatcher totals match SQL calculation
+                    rounded_penalties = [
+                        penalty.quantize(Decimal('0.01'), rounding='ROUND_HALF_UP')
+                        for penalty in duitnow_records['penalty_numeric'].tolist()
+                    ]
+                    breakdown['duitnow'] = float(sum(rounded_penalties))
 
         # 2. LDR Penalty: employee_id column = dispatcher_id, penalty = waybill count * RM 100
         if 'ldr' in penalty_data:
             ldr_df = penalty_data['ldr']
-            employee_id_col = None
-            for col in ldr_df.columns:
-                if col.lower() == 'employee_id':
-                    employee_id_col = col
-                    break
+            if not ldr_df.empty:
+                # Use pre-processed data if available
+                if '_employee_id_normalized' in ldr_df.columns:
+                    ldr_records = ldr_df[ldr_df['_employee_id_normalized'] == dispatcher_id_clean]
+                else:
+                    # Fallback to original logic
+                    employee_id_col = next((col for col in ldr_df.columns if col.lower() == 'employee_id'), None)
+                    if employee_id_col:
+                        employee_series = ldr_df[employee_id_col].astype(str).str.strip().str.lower()
+                        ldr_records = ldr_df[employee_series == dispatcher_id_clean]
+                    else:
+                        ldr_records = pd.DataFrame()
 
-            if employee_id_col:
-                employee_series = ldr_df[employee_id_col].astype(str).str.strip().str.lower()
-                ldr_records = ldr_df[employee_series == dispatcher_id_clean]
                 if not ldr_records.empty:
-                    waybill_col = None
-                    for col in ldr_df.columns:
-                        if col.lower() in ['ticket_no', 'no_awb', 'waybill_number']:
-                            waybill_col = col
-                            break
-
+                    waybill_col = next((col for col in ldr_df.columns if col.lower() in ['ticket_no', 'no_awb', 'waybill_number']), None)
                     if waybill_col:
                         waybill_count = ldr_records[waybill_col].nunique()
                     else:
@@ -696,22 +747,21 @@ class PayoutCalculator:
         # 3. Fake Attempt Penalty: dispatcher_id column = dispatcher_id, penalty = waybill count * RM 1.00
         if 'fake_attempt' in penalty_data:
             fake_attempt_df = penalty_data['fake_attempt']
-            dispatcher_id_col = None
-            for col in fake_attempt_df.columns:
-                if col.lower() == 'dispatcher_id':
-                    dispatcher_id_col = col
-                    break
+            if not fake_attempt_df.empty:
+                # Use pre-processed data if available
+                if '_dispatcher_id_normalized' in fake_attempt_df.columns:
+                    fake_attempt_records = fake_attempt_df[fake_attempt_df['_dispatcher_id_normalized'] == dispatcher_id_clean]
+                else:
+                    # Fallback to original logic
+                    dispatcher_id_col = next((col for col in fake_attempt_df.columns if col.lower() == 'dispatcher_id'), None)
+                    if dispatcher_id_col:
+                        dispatcher_series = fake_attempt_df[dispatcher_id_col].astype(str).str.strip().str.lower()
+                        fake_attempt_records = fake_attempt_df[dispatcher_series == dispatcher_id_clean]
+                    else:
+                        fake_attempt_records = pd.DataFrame()
 
-            if dispatcher_id_col:
-                dispatcher_series = fake_attempt_df[dispatcher_id_col].astype(str).str.strip().str.lower()
-                fake_attempt_records = fake_attempt_df[dispatcher_series == dispatcher_id_clean]
                 if not fake_attempt_records.empty:
-                    waybill_col = None
-                    for col in fake_attempt_df.columns:
-                        if col.lower() in ['waybill_number', 'waybill']:
-                            waybill_col = col
-                            break
-
+                    waybill_col = next((col for col in fake_attempt_df.columns if col.lower() in ['waybill_number', 'waybill']), None)
                     if waybill_col:
                         waybill_count = fake_attempt_records[waybill_col].nunique()
                     else:
@@ -752,9 +802,18 @@ class PayoutCalculator:
 
             if penalty_col:
                 # Filter to only include records with positive penalty amounts
-                duitnow_df['penalty_numeric'] = pd.to_numeric(duitnow_df[penalty_col], errors='coerce')
+                # Use Decimal to preserve exact precision
+                duitnow_df['penalty_numeric'] = duitnow_df[penalty_col].apply(
+                    lambda x: Decimal(str(x)) if pd.notna(x) else Decimal('0')
+                )
                 duitnow_filtered = duitnow_df[duitnow_df['penalty_numeric'] > 0]
-                penalty_totals['duitnow'] = float(duitnow_filtered[penalty_col].sum())
+                # Round each penalty value first, then sum (matching SQL: SUM((FLOOR((penalty * 100) + 0.5) / 100)))
+                # This ensures the total matches SQL exactly
+                rounded_penalties = [
+                    penalty.quantize(Decimal('0.01'), rounding='ROUND_HALF_UP')
+                    for penalty in duitnow_filtered['penalty_numeric'].tolist()
+                ]
+                penalty_totals['duitnow'] = float(sum(rounded_penalties))
 
         # 2. LDR Penalty: count waybills * RM 100
         if 'ldr' in penalty_data:
@@ -932,7 +991,11 @@ class PayoutCalculator:
             + grouped['tier4_parcels'] * tier_rates[3]
         )
 
-        grouped['avg_rate'] = grouped['dispatch_payout'] / grouped['parcel_count']
+        # Calculate avg_rate with division by zero protection
+        grouped['avg_rate'] = grouped.apply(
+            lambda row: row['dispatch_payout'] / row['parcel_count'] if row['parcel_count'] > 0 else 0.0,
+            axis=1
+        )
 
         # Calculate penalties
         grouped['penalty_amount'] = 0.0
@@ -943,20 +1006,30 @@ class PayoutCalculator:
         grouped['fake_attempt_penalty'] = 0.0
 
         if penalty_data is not None:
-            for i, row in grouped.iterrows():
-                dispatcher_id = row['dispatcher_id']
+            # Pre-process penalty dataframes once for better performance
+            penalty_data_processed = PayoutCalculator._preprocess_penalty_data(penalty_data)
+
+            # Use apply instead of iterrows for better performance
+            def calculate_penalties(row):
+                dispatcher_id = str(row['dispatcher_id'])
                 penalty_amount, penalty_count, penalty_waybills = PayoutCalculator.calculate_penalty(
-                    str(dispatcher_id), penalty_data
+                    dispatcher_id, penalty_data_processed
                 )
                 penalty_breakdown = PayoutCalculator.calculate_penalty_breakdown(
-                    str(dispatcher_id), penalty_data
+                    dispatcher_id, penalty_data_processed
                 )
-                grouped.at[i, 'penalty_amount'] = penalty_amount
-                grouped.at[i, 'penalty_count'] = penalty_count
-                grouped.at[i, 'penalty_waybills'] = ', '.join(penalty_waybills) if penalty_waybills else ''
-                grouped.at[i, 'duitnow_penalty'] = penalty_breakdown['duitnow']
-                grouped.at[i, 'ldr_penalty'] = penalty_breakdown['ldr']
-                grouped.at[i, 'fake_attempt_penalty'] = penalty_breakdown['fake_attempt']
+                return pd.Series({
+                    'penalty_amount': penalty_amount,
+                    'penalty_count': penalty_count,
+                    'penalty_waybills': ', '.join(penalty_waybills) if penalty_waybills else '',
+                    'duitnow_penalty': penalty_breakdown['duitnow'],
+                    'ldr_penalty': penalty_breakdown['ldr'],
+                    'fake_attempt_penalty': penalty_breakdown['fake_attempt']
+                })
+
+            penalty_results = grouped.apply(calculate_penalties, axis=1)
+            grouped[['penalty_amount', 'penalty_count', 'penalty_waybills',
+                     'duitnow_penalty', 'ldr_penalty', 'fake_attempt_penalty']] = penalty_results
 
         # Calculate pickup payout
         grouped = PayoutCalculator.calculate_pickup_payout(pickup_df, grouped, pickup_payout_per_parcel)
@@ -986,7 +1059,7 @@ class PayoutCalculator:
             "tier2_parcels": "Parcels 5.01-10kg",
             "tier3_parcels": "Parcels 10.01-30kg",
             "tier4_parcels": "Parcels 30+kg"
-        }).sort_values(by="Total Payout", ascending=False)
+        }).sort_values(by="Dispatcher Name", ascending=True)
 
         display_df = numeric_df.copy()
         display_df["Total Weight (kg)"] = display_df["Total Weight (kg)"].apply(lambda x: f"{x:.2f}")
@@ -1500,8 +1573,6 @@ def main():
 
     # Show current database configuration
     st.sidebar.success("✅ Using PostgreSQL Database")
-    st.sidebar.info(f"📊 Table: `{config['data_source'].get('postgres_table', 'dispatcher')}`")
-    st.sidebar.info(f"📦 Pickup Table: `{config['data_source'].get('pickup_table', 'pickup')}`")
 
     # Database connection status
     engine = DataSource.get_postgres_engine()
@@ -1586,8 +1657,24 @@ def main():
     )
 
     if selected_date_col != "-- None --":
-        df[selected_date_col] = pd.to_datetime(df[selected_date_col], errors="coerce")
-        valid_dates = df[selected_date_col].dropna()
+        # Track dispatchers before date filtering
+        dispatchers_before_filter = set()
+        if 'Dispatcher ID' in df.columns:
+            dispatchers_before_filter = set(df['Dispatcher ID'].dropna().astype(str).str.strip().unique())
+            dispatchers_before_filter = {d for d in dispatchers_before_filter if d and d.lower() not in ['unknown', 'nan', 'none', 'null', '']}
+
+        # If "Delivery Signature" is selected, check for "delivery_signature" column (original database column)
+        # The correct database column name is "delivery_signature" (lowercase with underscore)
+        date_col_to_use = selected_date_col
+        if selected_date_col == "Delivery Signature":
+            # Prefer the original database column name if it exists
+            if "delivery_signature" in df.columns:
+                date_col_to_use = "delivery_signature"
+            elif "delivery_signature_date" in df.columns:
+                date_col_to_use = "delivery_signature_date"
+
+        df[date_col_to_use] = pd.to_datetime(df[date_col_to_use], errors="coerce")
+        valid_dates = df[date_col_to_use].dropna()
         if not valid_dates.empty:
             min_date, max_date = valid_dates.min().date(), valid_dates.max().date()
             default_start = max(min_date, max_date.replace(day=1))
@@ -1603,10 +1690,37 @@ def main():
             else:
                 start_date = end_date = selected_range
 
-            df = df[
-                (df[selected_date_col].dt.date >= start_date) &
-                (df[selected_date_col].dt.date <= end_date)
+            # Filter by date range
+            df_filtered = df[
+                (df[date_col_to_use].dt.date >= start_date) &
+                (df[date_col_to_use].dt.date <= end_date)
             ]
+
+            # Track dispatchers after filtering
+            dispatchers_after_filter = set()
+            if 'Dispatcher ID' in df_filtered.columns:
+                dispatchers_after_filter = set(df_filtered['Dispatcher ID'].dropna().astype(str).str.strip().unique())
+                dispatchers_after_filter = {d for d in dispatchers_after_filter if d and d.lower() not in ['unknown', 'nan', 'none', 'null', '']}
+
+            # Check for dispatchers lost due to invalid dates
+            lost_dispatchers = dispatchers_before_filter - dispatchers_after_filter
+            if lost_dispatchers:
+                # These dispatchers have no valid dates in the selected date column
+                # Include rows with NULL/invalid dates for these dispatchers
+                dispatchers_with_invalid_dates = df[
+                    (df['Dispatcher ID'].isin(lost_dispatchers)) &
+                    (df[date_col_to_use].isna())
+                ]
+
+                if not dispatchers_with_invalid_dates.empty:
+                    st.info(f"📋 Including {len(lost_dispatchers)} dispatcher(s) with invalid dates in '{selected_date_col}': {sorted(lost_dispatchers)}")
+                    # Combine filtered data with dispatchers that have invalid dates
+                    df = pd.concat([df_filtered, dispatchers_with_invalid_dates], ignore_index=True)
+                else:
+                    st.warning(f"⚠️ {len(lost_dispatchers)} dispatcher(s) have no valid dates in '{selected_date_col}' and will show 0 parcels: {sorted(lost_dispatchers)}")
+                    df = df_filtered
+            else:
+                df = df_filtered
 
             if df.empty:
                 st.warning("No records found for the selected date range.")
