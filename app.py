@@ -53,7 +53,7 @@ class Config:
     DEFAULT_CONFIG = {
         "data_source": {
             "type": "gsheet",
-            "gsheet_url": "https://docs.google.com/spreadsheets/d/10x13yRa_-t3iDiTmijlrYh0EWFtNEA89/edit?gid=1904427159#gid=1904427159",
+            "gsheet_url": "https://docs.google.com/spreadsheets/d/1SzkqlbOgfgnCJBKwmWCBf9ZeG_ZhV35i/edit?gid=429631304#gid=429631304",
             "sheet_name": None
         },
         "tiers": [
@@ -1338,18 +1338,67 @@ def main():
         add_footer()
         return
 
+    # Convert Delivery Signature to datetime
     df["Delivery Signature"] = pd.to_datetime(df["Delivery Signature"], errors="coerce")
-    today = datetime.now()
-    last_month_period = (today - pd.DateOffset(months=1)).to_period("M")
-    monthly_mask = df["Delivery Signature"].dt.to_period("M") == last_month_period
-    df = df[monthly_mask].copy()
 
-    if df.empty:
-        st.warning("No records found for last month. Please update the data source.")
+    # Sidebar for date selection
+    st.sidebar.title("📅 Date Range Selection")
+
+    # Get date range from data
+    valid_dates = df["Delivery Signature"].dropna()
+    if not valid_dates.empty:
+        min_date = valid_dates.min().date()
+        max_date = valid_dates.max().date()
+        # Default to last 30 days if we have enough data, otherwise use full range
+        if (max_date - min_date).days > 30:
+            default_end = max_date
+            default_start = (max_date - pd.Timedelta(days=30)).date()
+        else:
+            default_start = min_date
+            default_end = max_date
+    else:
+        # Fallback if no valid dates
+        today = datetime.now().date()
+        min_date = today - pd.Timedelta(days=365)
+        max_date = today
+        default_start = today - pd.Timedelta(days=30)
+        default_end = today
+
+    start_date = st.sidebar.date_input(
+        "Start Date",
+        value=default_start,
+        min_value=min_date,
+        max_value=max_date,
+        help="Select the start date for the payout period"
+    )
+
+    end_date = st.sidebar.date_input(
+        "End Date",
+        value=default_end,
+        min_value=min_date,
+        max_value=max_date,
+        help="Select the end date for the payout period"
+    )
+
+    # Validate date range
+    if start_date > end_date:
+        st.sidebar.error("⚠️ Start date must be before end date")
         add_footer()
         return
 
-    st.caption(f"Showing deliveries for {last_month_period.start_time:%B %Y}.")
+    # Filter data by date range
+    date_mask = (
+        (df["Delivery Signature"].dt.date >= start_date) &
+        (df["Delivery Signature"].dt.date <= end_date)
+    )
+    df = df[date_mask].copy()
+
+    if df.empty:
+        st.warning(f"No records found for the selected date range ({start_date.strftime('%B %d, %Y')} to {end_date.strftime('%B %d, %Y')}).")
+        add_footer()
+        return
+
+    st.caption(f"Showing deliveries from {start_date.strftime('%B %d, %Y')} to {end_date.strftime('%B %d, %Y')}.")
 
     st.subheader("👤 Dispatcher Selection")
     dispatcher_mapping = {}
@@ -1711,6 +1760,10 @@ def main():
             # Display invoice
             st.components.v1.html(invoice_html, height=1200, scrolling=True)
 
+            # Generate date range string for file names
+            date_range_str = f"{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}"
+            period_display = f"{start_date.strftime('%B %d, %Y')} to {end_date.strftime('%B %d, %Y')}"
+
             # Download buttons
             col1, col2, col3 = st.columns(3)
 
@@ -1719,7 +1772,7 @@ def main():
                 st.download_button(
                     label="📥 Download Invoice (HTML)",
                     data=invoice_html,
-                    file_name=f"invoice_{selected_dispatcher_id}_{last_month_period.start_time:%Y%m}.html",
+                    file_name=f"invoice_{selected_dispatcher_id}_{date_range_str}.html",
                     mime="text/html",
                     use_container_width=True
                 )
@@ -1730,7 +1783,7 @@ def main():
                 st.download_button(
                     label="📊 Download Daily Breakdown (CSV)",
                     data=csv_data,
-                    file_name=f"breakdown_{selected_dispatcher_id}_{last_month_period.start_time:%Y%m}.csv",
+                    file_name=f"breakdown_{selected_dispatcher_id}_{date_range_str}.csv",
                     mime="text/csv",
                     use_container_width=True
                 )
@@ -1742,7 +1795,7 @@ INVOICE SUMMARY
 ===============
 Dispatcher: {selected_dispatcher_name or selected_dispatcher_id}
 Dispatcher ID: {selected_dispatcher_id}
-Period: {last_month_period.start_time:%B %Y}
+Period: {period_display}
 
 SUMMARY
 -------
@@ -1775,7 +1828,7 @@ Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M')}
                 st.download_button(
                     label="📝 Download Summary (TXT)",
                     data=summary_text,
-                    file_name=f"summary_{selected_dispatcher_id}_{last_month_period.start_time:%Y%m}.txt",
+                    file_name=f"summary_{selected_dispatcher_id}_{date_range_str}.txt",
                     mime="text/plain",
                     use_container_width=True
                 )
