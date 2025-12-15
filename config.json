@@ -1,7 +1,7 @@
 {
   "data_source": {
     "type": "postgres",
-    "gsheet_url": "https://docs.google.com/spreadsheets/d/10x13yRa_-t3iDiTmijlrYh0EWFtNEA89/edit?gid=1904427159#gid=1904427159"
+    "gsheet_url": "https://docs.google.com/spreadsheets/d/1SzkqlbOgfgnCJBKwmWCBf9ZeG_ZhV35i/edit?gid=429631304#gid=429631304"
   },
   "database": {
     "table_name": "dispatch"
