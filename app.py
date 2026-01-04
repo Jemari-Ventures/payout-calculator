@@ -181,7 +181,90 @@ class DataSource:
         try:
             resp = requests.get(csv_url, timeout=30)
             resp.raise_for_status()
-            return pd.read_csv(io.BytesIO(resp.content))
+
+            # CRITICAL: Read CSV and preserve waybills exactly as they appear
+            # Strategy: Read WITHOUT dtype specification first, then convert to string immediately
+            # This prevents pandas from doing type inference that could lose waybills
+            resp_content = resp.content
+
+            # Read the full CSV WITHOUT forcing dtype - let pandas read it naturally
+            # Then we'll convert the Waybill Number column to string immediately
+            # This approach is more reliable for preserving waybills that might have mixed formats
+            df = pd.read_csv(
+                io.BytesIO(resp_content),
+                keep_default_na=False,  # Don't automatically convert strings to NaN
+                na_values=[],  # Don't treat any specific values as NaN
+                encoding='utf-8'  # Ensure proper encoding
+            )
+
+            # CRITICAL: Convert Waybill Number to string IMMEDIATELY after reading
+            # This must happen before any other processing to preserve all waybill formats
+            if "Waybill Number" in df.columns:
+                # First, convert the entire column to string type
+                # This ensures all waybills are strings, regardless of how pandas read them
+                # Use astype(str) which is more reliable than dtype=str during read
+                df["Waybill Number"] = df["Waybill Number"].astype(str)
+
+                # Now apply conversion function to clean up and handle edge cases
+                def simple_waybill_converter(x):
+                    """CRITICAL: Preserve ALL waybills that have ANY value.
+
+                    RULE: If waybill has ANY non-empty content, preserve it.
+                    Only return None if the value is truly empty or explicitly NaN.
+
+                    This function NEVER converts a valid waybill to None.
+                    """
+                    # Step 1: If already a string (which it should be after astype(str))
+                    # Check if it's a valid non-empty string
+                    if isinstance(x, str):
+                        x_stripped = x.strip()
+                        # If it has content and is not a "nan" string, return it
+                        if x_stripped and x_stripped.lower() not in ["nan", "none", "null", ""]:
+                            return x_stripped
+                        # If it's empty or "nan" string, check original value
+                        if not x_stripped or x_stripped.lower() in ["nan", "none", "null"]:
+                            return None
+
+                    # Step 2: Try to convert to string (handles numeric types)
+                    try:
+                        waybill_str = str(x).strip()
+                        # If we got a string with content, return it
+                        if waybill_str and waybill_str.lower() not in ["nan", "none", "null", ""]:
+                            # Handle numeric types - remove .0 from floats
+                            if isinstance(x, (float, int)) and not pd.isna(x):
+                                # If it's a float that's an integer, convert to int first
+                                if isinstance(x, float) and x.is_integer():
+                                    return str(int(x))
+                                # Otherwise, return as string
+                                return waybill_str
+                            return waybill_str
+                    except Exception:
+                        pass
+
+                    # Step 3: Check if it's truly None or NaN
+                    if x is None:
+                        return None
+
+                    try:
+                        if pd.isna(x):
+                            return None
+                    except:
+                        # If pd.isna fails, the value is probably valid
+                        # Try one more time to convert to string
+                        try:
+                            result = str(x).strip()
+                            if result and result.lower() not in ["nan", "none", "null", ""]:
+                                return result
+                        except:
+                            pass
+
+                    # Only return None if we truly can't get any value
+                    return None
+
+                # Apply conversion - this preserves ALL waybills with values
+                df["Waybill Number"] = df["Waybill Number"].apply(simple_waybill_converter)
+
+            return df
         except Exception as exc:
             st.error(f"Failed to fetch Google Sheet: {exc}")
             raise
@@ -521,8 +604,31 @@ class PayoutCalculator:
         if matched_records.empty:
             return 0, 0.0, pd.DataFrame()
 
-        # Count unique waybills
-        unique_waybills = matched_records["Waybill Number"].dropna().astype(str).str.strip()
+        # Count unique waybills - TREAT ALL WAYBILLS AS STRINGS
+        # Convert to string to preserve format (including "-", letters, numbers, etc.)
+        # Only filter out NaN values, keep everything else
+        def safe_waybill_to_string(value):
+            """Safely convert waybill to string, preserving original format.
+
+            Handles numeric waybills (int/float) by converting to string without decimal notation.
+            """
+            if pd.isna(value):
+                return None
+            # Handle numeric types (int/float) - convert to string without decimal notation
+            if isinstance(value, (int, float)):
+                # If it's a float with no decimal part (e.g., 631891688390.0), convert to int first
+                if isinstance(value, float) and value.is_integer():
+                    return str(int(value))
+                else:
+                    return str(value)
+            # For strings and other types, convert to string and strip
+            waybill_str = str(value).strip()
+            if waybill_str == "" or waybill_str.lower() == "nan":
+                return None
+            return waybill_str
+
+        waybill_strings = matched_records["Waybill Number"].apply(safe_waybill_to_string)
+        unique_waybills = waybill_strings[waybill_strings.notna() & (waybill_strings != "")].unique()
         parcel_count = len(unique_waybills)
         payout = round(parcel_count * rate, 2)
 
@@ -556,13 +662,274 @@ class PayoutCalculator:
             return "Unmatched", 0.0
 
         work = filtered_df.copy()
-        work["__date"] = pd.to_datetime(work["Delivery Signature"], errors="coerce").dt.date
-        work["__waybill"] = work["Waybill Number"].astype(str).str.strip()
 
-        work = work[work["__waybill"].notna() & (work["__waybill"] != "") & (work["__waybill"].str.lower() != "nan")]
+        # Convert dates - but DON'T drop records with invalid dates
+        # Use errors="coerce" to convert invalid dates to NaT, but keep the records
+        work["__date"] = pd.to_datetime(work["Delivery Signature"], errors="coerce").dt.date
+
+        # Preserve original waybill
+        work["__waybill_original"] = work["Waybill Number"].copy()
+
+        # Convert waybill to string - TREAT ALL WAYBILLS AS STRINGS
+        # This ensures waybills with "-", letters, numbers are preserved exactly as they are
+        # Handle NaN values by checking before conversion to avoid "nan" strings
+        def safe_waybill_to_string(value):
+            """CRITICAL: Preserve ALL waybills that have ANY value.
+
+            RULE: If waybill has ANY non-empty content, preserve it.
+            Only return None if the value is truly empty or explicitly NaN.
+
+            This function NEVER converts a valid waybill to None.
+            """
+            # Step 1: If already a string, check if it's valid
+            if isinstance(value, str):
+                value_stripped = value.strip()
+                # If it has content and is not a "nan" string, return it
+                if value_stripped and value_stripped.lower() not in ["nan", "none", "null", ""]:
+                    return value_stripped
+                # If it's empty or "nan" string, return None
+                if not value_stripped or value_stripped.lower() in ["nan", "none", "null"]:
+                    return None
+
+            # Step 2: Try to convert to string (handles numeric types)
+            try:
+                waybill_str = str(value).strip()
+                # If we got a string with content, return it
+                if waybill_str and waybill_str.lower() not in ["nan", "none", "null", ""]:
+                    # Handle numeric types - remove .0 from floats
+                    if isinstance(value, (float, int)) and not pd.isna(value):
+                        # If it's a float that's an integer, convert to int first
+                        if isinstance(value, float) and value.is_integer():
+                            return str(int(value))
+                        # Otherwise, return as string
+                        return waybill_str
+                    return waybill_str
+            except Exception:
+                pass
+
+            # Step 3: Check if it's truly None or NaN
+            if value is None:
+                return None
+
+            try:
+                if pd.isna(value):
+                    return None
+            except:
+                # If pd.isna fails, the value is probably valid
+                # Try one more time to convert to string
+                try:
+                    result = str(value).strip()
+                    if result and result.lower() not in ["nan", "none", "null", ""]:
+                        return result
+                except:
+                    pass
+
+            # Only return None if we truly can't get any value
+            return None
+
+        # CRITICAL: Convert waybills - NEVER convert a valid waybill to None
+        # If waybill has ANY value in raw data, preserve it
+        work["__waybill"] = work["Waybill Number"].apply(safe_waybill_to_string)
+
+        # CRITICAL RECOVERY LAYER 1: If waybill became None but original has value, recover it
+        # This ensures NO valid waybill from raw data is lost
+        none_waybills = work[work["__waybill"].isna()]
+        if not none_waybills.empty:
+            for idx in none_waybills.index:
+                original_wb = work.loc[idx, "Waybill Number"]
+                # If original waybill exists and is not NaN, recover it
+                if pd.notna(original_wb):
+                    try:
+                        # Convert to string and use it if it has content
+                        recovered = str(original_wb).strip()
+                        if recovered and recovered.lower() not in ["nan", "none", "null", ""]:
+                            # Handle numeric types - remove .0 from floats
+                            if isinstance(original_wb, (float, int)) and not pd.isna(original_wb):
+                                if isinstance(original_wb, float) and original_wb.is_integer():
+                                    recovered = str(int(original_wb))
+                            work.loc[idx, "__waybill"] = recovered
+                    except Exception:
+                        # If recovery fails, try one more time with direct string conversion
+                        try:
+                            direct_str = str(original_wb)
+                            if direct_str and direct_str.strip() and direct_str.lower() not in ["nan", "none", "null"]:
+                                work.loc[idx, "__waybill"] = direct_str.strip()
+                        except:
+                            pass
+
+        # CRITICAL RECOVERY LAYER 2: Final check - if waybill is still None but original has value
+        # This is a last resort to ensure NO waybill is lost
+        none_mask = work["__waybill"].isna()
+        if none_mask.any():
+            for idx in work[none_mask].index:
+                original_wb = work.loc[idx, "Waybill Number"]
+                # If original has ANY value (even if pandas thinks it's NaN), try to recover it
+                # Check both the original column and the preserved original
+                if pd.notna(original_wb):
+                    try:
+                        waybill_str = str(original_wb).strip()
+                        if waybill_str and waybill_str.lower() not in ["nan", "none", "null", ""]:
+                            # Handle numeric types
+                            if isinstance(original_wb, (float, int)) and not pd.isna(original_wb):
+                                if isinstance(original_wb, float) and original_wb.is_integer():
+                                    waybill_str = str(int(original_wb))
+                            work.loc[idx, "__waybill"] = waybill_str
+                    except Exception:
+                        # Last resort: try direct conversion without any checks
+                        try:
+                            direct = str(original_wb)
+                            if direct and direct != "nan":
+                                work.loc[idx, "__waybill"] = direct.strip()
+                        except:
+                            pass
+
+        # Store count before processing
+        total_before_filter = len(work)
+
+        # NO FILTERING - Keep ALL waybills that have any value
+        # Only filter out records where waybill is explicitly None/NaN
+        # This ensures ALL waybills are included:
+        # - Waybills with "-" (like "673002663768-01")
+        # - Waybills with letters (like "CNMYJ000930823", "CNMYJ000937478")
+        # - Waybills with numbers only (like "680009861506502")
+        # - Waybills with any combination of characters
+        # - Waybills with invalid dates (we'll handle dates separately)
+        #
+        # IMPORTANT: Only exclude if waybill is explicitly None (from NaN values)
+        # Handle records with missing waybills - generate unique placeholder waybills
+        # This ensures records without waybills are still included in the count
+        # The user wants ALL records included, even if waybill is missing
+        missing_waybill_mask = work["__waybill"].isna()
+        if missing_waybill_mask.any():
+            # Generate unique placeholder waybills for records without waybills
+            # Format: "MISSING_WAYBILL_{row_index}_{date}_{dispatcher}"
+            missing_indices = work[missing_waybill_mask].index
+            for idx in missing_indices:
+                date_str = str(work.loc[idx, "__date"]) if pd.notna(work.loc[idx, "__date"]) else "UNKNOWN"
+                dispatcher = work.loc[idx, "Dispatcher ID"] if "Dispatcher ID" in work.columns and pd.notna(work.loc[idx, "Dispatcher ID"]) else "UNKNOWN"
+                placeholder_waybill = f"MISSING_WAYBILL_{idx}_{date_str}_{dispatcher}"
+                work.loc[idx, "__waybill"] = placeholder_waybill
+                # Also update the original waybill
+                if pd.isna(work.loc[idx, "__waybill_original"]):
+                    work.loc[idx, "__waybill_original"] = placeholder_waybill
+
+        # Now all records should have a waybill - no need to filter
+        # work = work[work["__waybill"].notna()]  # REMOVED - we now include all records with placeholder waybills
+
+        # Handle invalid dates - keep the waybill but use the date from Delivery Signature if possible
+        # If date is invalid, we'll still count the waybill but group it separately
+        # This ensures waybills aren't dropped just because of date parsing issues
+        invalid_date_mask = work["__date"].isna()
+        if invalid_date_mask.any():
+            # Try to extract date from Delivery Signature string if datetime conversion failed
+            for idx in work[invalid_date_mask].index:
+                delivery_sig = work.loc[idx, "Delivery Signature"]
+                if pd.notna(delivery_sig):
+                    # Try parsing as string date
+                    try:
+                        parsed_date = pd.to_datetime(str(delivery_sig), errors="coerce").date()
+                        if pd.notna(parsed_date):
+                            work.loc[idx, "__date"] = parsed_date
+                    except:
+                        pass
+            # For any remaining invalid dates, use today's date as fallback
+            # This ensures the waybill is still counted
+            work["__date"] = work["__date"].fillna(pd.Timestamp.today().date())
+
+        # Post-processing: Ensure ALL waybills from original data are included
+        # If any waybills were filtered out, restore them from the original data
+        # This handles ALL waybill formats: CNMYJ*, numeric-only, with hyphens, etc.
+
+        # Get all unique waybills from original data - convert to string for comparison
+        def normalize_waybill_for_comparison(wb):
+            """Normalize waybill for comparison - handles numeric and string formats."""
+            if pd.isna(wb):
+                return None
+            # Convert to string, handling numeric types correctly
+            if isinstance(wb, (int, float)):
+                if isinstance(wb, float) and wb.is_integer():
+                    return str(int(wb))  # 680009861506502.0 -> "680009861506502"
+                return str(wb)
+            return str(wb).strip()
+
+        original_waybills = filtered_df["Waybill Number"].dropna().unique()
+        current_waybills_set = set(work["__waybill"].dropna().astype(str).str.strip().unique())
+
+        # Find waybills that exist in original data but not in current work
+        missing_waybills_all = []
+        for orig_wb in original_waybills:
+            orig_wb_normalized = normalize_waybill_for_comparison(orig_wb)
+            if orig_wb_normalized and orig_wb_normalized.lower() not in ["nan", "none", ""]:
+                # Check if it's in current set (try both exact match and normalized)
+                if orig_wb_normalized not in current_waybills_set:
+                    missing_waybills_all.append(orig_wb_normalized)
+
+        if missing_waybills_all:
+            # Find records with these missing waybills in original data
+            # Use multiple matching strategies to catch all formats
+            missing_mask = pd.Series([False] * len(filtered_df), index=filtered_df.index)
+            for missing_wb in missing_waybills_all:
+                # Try exact match
+                mask1 = filtered_df["Waybill Number"].astype(str).str.strip() == missing_wb
+                # Try case-insensitive match
+                mask2 = filtered_df["Waybill Number"].astype(str).str.strip().str.upper() == missing_wb.upper()
+                # Try numeric comparison for numeric waybills
+                try:
+                    missing_wb_num = float(missing_wb)
+                    if missing_wb_num.is_integer():
+                        mask3 = filtered_df["Waybill Number"].astype(float) == missing_wb_num
+                    else:
+                        mask3 = pd.Series([False] * len(filtered_df), index=filtered_df.index)
+                except (ValueError, TypeError):
+                    mask3 = pd.Series([False] * len(filtered_df), index=filtered_df.index)
+
+                missing_mask = missing_mask | mask1 | mask2 | mask3
+
+            missing_records_all = filtered_df[missing_mask].copy()
+
+            if not missing_records_all.empty:
+                # Convert waybill - use direct string conversion to ensure it's never None
+                def force_waybill_to_string(x):
+                    """Force convert waybill to string - never return None for valid values."""
+                    if pd.isna(x):
+                        return None
+                    # Convert to string directly
+                    wb_str = str(x).strip()
+                    if wb_str == "" or wb_str.lower() in ["nan", "none"]:
+                        return None
+                    # Handle numeric types
+                    if isinstance(x, (int, float)):
+                        if isinstance(x, float) and x.is_integer():
+                            return str(int(x))
+                        return str(x)
+                    return wb_str
+
+                missing_records_all["__waybill"] = missing_records_all["Waybill Number"].apply(force_waybill_to_string)
+                missing_records_all["__waybill_original"] = missing_records_all["Waybill Number"].copy()
+                missing_records_all["__date"] = pd.to_datetime(
+                    missing_records_all["Delivery Signature"], errors="coerce"
+                ).dt.date
+                # Fill invalid dates
+                missing_records_all["__date"] = missing_records_all["__date"].fillna(
+                    pd.Timestamp.today().date()
+                )
+                # Only filter out records where waybill is still None after force conversion
+                missing_records_all = missing_records_all[missing_records_all["__waybill"].notna()]
+                # Add back to work dataframe
+                if not missing_records_all.empty:
+                    work = pd.concat([work, missing_records_all], ignore_index=True)
+                    # Update counts after restoration
+                    total_after_filter = len(work)
+                    filtered_out_count = total_before_filter - total_after_filter
+
+        # Store count after processing
+        total_after_filter = len(work)
 
         work = work.sort_values(by=["__date", "__waybill", "Delivery Signature"])
-        work = work.drop_duplicates(subset=["__date", "__waybill"], keep="last")
+
+        # SIMPLE: No deduplication needed - user confirmed waybills have no duplicates
+        # Just get all unique waybills that have data (not None)
+        all_unique_waybills = work[work["__waybill"].notna()]["__waybill"].unique().tolist()
 
         per_day = (
             work.groupby(["__date"], dropna=False)["__waybill"]
@@ -1349,20 +1716,17 @@ def main():
     if not valid_dates.empty:
         min_date = valid_dates.min().date()
         max_date = valid_dates.max().date()
-        # Default to last 30 days if we have enough data, otherwise use full range
-        if (max_date - min_date).days > 30:
-            default_end = max_date
-            default_start = (max_date - pd.Timedelta(days=30)).date()
-        else:
-            default_start = min_date
-            default_end = max_date
+        # Default to FULL RANGE to include ALL waybills
+        # User can adjust the date range if needed, but by default show everything
+        default_start = min_date
+        default_end = max_date
     else:
         # Fallback if no valid dates
         today = datetime.now().date()
         min_date = today - pd.Timedelta(days=365)
         max_date = today
-        default_start = today - pd.Timedelta(days=30)
-        default_end = today
+        default_start = min_date
+        default_end = max_date
 
     start_date = st.sidebar.date_input(
         "Start Date",
@@ -1386,12 +1750,23 @@ def main():
         add_footer()
         return
 
-    # Filter data by date range
+
+    # Filter data by date range - but INCLUDE waybills with invalid/missing dates
+    # This ensures ALL waybills are available, even if their dates can't be parsed
+    df["__delivery_date"] = pd.to_datetime(df["Delivery Signature"], errors="coerce").dt.date
+
+    # Include records that:
+    # 1. Have valid dates within the selected range, OR
+    # 2. Have invalid/missing dates (we'll handle these in calculate_tiered_daily)
     date_mask = (
-        (df["Delivery Signature"].dt.date >= start_date) &
-        (df["Delivery Signature"].dt.date <= end_date)
+        (df["__delivery_date"] >= start_date) & (df["__delivery_date"] <= end_date)
+    ) | (
+        df["__delivery_date"].isna()  # Include records with invalid/missing dates
     )
     df = df[date_mask].copy()
+
+    # Drop the temporary column
+    df = df.drop(columns=["__delivery_date"], errors="ignore")
 
     if df.empty:
         st.warning(f"No records found for the selected date range ({start_date.strftime('%B %d, %Y')} to {end_date.strftime('%B %d, %Y')}).")
@@ -1444,8 +1819,9 @@ def main():
         add_footer()
         return
 
-    # Filter data for selected dispatcher
+    # Filter data for selected dispatcher (after date filtering)
     dispatcher_df = df[df["Dispatcher ID"].astype(str) == selected_dispatcher_id].copy()
+
 
     if dispatcher_df.empty:
         st.warning(f"No delivery records found for {selected_dispatcher_name or selected_dispatcher_id}.")
@@ -1562,6 +1938,8 @@ def main():
                     "Payout": st.column_config.TextColumn("Payout")
                 }
             )
+
+
 
             # Display bonuses and penalties
             st.subheader("🎯 Incentives & Penalties")
