@@ -523,10 +523,14 @@ class PayoutCalculator:
             return 0, 0.0, pd.DataFrame()
 
         # Filter out rows with empty waybill numbers
-        # Waybill must have a value (non-empty) - accept any non-empty value
-        waybill_col = matched_records["Waybill Number"].astype(str).str.strip()
-        # Only exclude empty strings - accept all non-empty waybill values
-        valid_records = matched_records[waybill_col != '']
+        # Waybill must have a value (non-empty) - treat waybill as string
+        # Convert waybill to string to prevent scientific notation or number formatting
+        matched_records["Waybill Number"] = matched_records["Waybill Number"].astype(str).str.strip()
+        # Filter out empty strings and "nan" strings
+        valid_records = matched_records[
+            (matched_records["Waybill Number"] != "") &
+            (matched_records["Waybill Number"].str.lower() != "nan")
+        ]
 
         if valid_records.empty:
             return 0, 0.0, pd.DataFrame()
@@ -566,35 +570,25 @@ class PayoutCalculator:
 
         work = filtered_df.copy()
 
+        # Validate required columns
+        if "Waybill Number" not in work.columns or "Delivery Signature" not in work.columns:
+            return (pd.DataFrame(), 0.0, 0.0, 0.0, "", 0.0, "", 0, pd.DataFrame(), {})
+
         # Parse delivery signature date - handles format like "2025-12-18 17:41:25"
         work["__date"] = pd.to_datetime(work["Delivery Signature"], errors="coerce").dt.date
 
-        # Convert waybill to string - waybill must have a value (non-empty)
-        # Accept ANY non-empty waybill value as valid
-        # Try to find waybill column with different possible names
-        waybill_col_name = None
-        for col_name in ["Waybill Number", "Waybill", "waybill number", "waybill"]:
-            if col_name in work.columns:
-                waybill_col_name = col_name
-                break
+        # Convert waybill to string - treat as string, waybill is unique identifier
+        work["__waybill"] = work["Waybill Number"].astype(str).str.strip()
 
-        if waybill_col_name:
-            # Convert to string and strip whitespace
-            work["__waybill"] = work[waybill_col_name].astype(str).str.strip()
-            # Replace "nan" strings (from NaN conversion) with empty string for filtering
-            work["__waybill"] = work["__waybill"].replace("nan", "")
-        else:
-            # If column doesn't exist, create empty waybill column
-            work["__waybill"] = ""
+        # Filter: keep only rows with valid waybill (non-empty, not "nan") and valid date
+        work = work[
+            (work["__waybill"] != "") &
+            (work["__waybill"].str.lower() != "nan") &
+            (work["__date"].notna())
+        ]
 
-        # Only exclude rows where waybill is empty (must have a value)
-        # Accept ALL non-empty values: "CNMYJ000930823", "673002663768-01", "680009861506502", etc.
-        work = work[work["__waybill"] != ""]
-
-        # Filter out rows with invalid dates (NaN dates) - need valid dates for daily grouping
-        work = work[work["__date"].notna()]
-
-        # Sort and remove duplicates - keep last entry per date+waybill combination
+        # Remove duplicates - keep last entry per date+waybill combination
+        # This ensures each waybill is counted only once per day
         work = work.sort_values(by=["__date", "__waybill", "Delivery Signature"])
         work = work.drop_duplicates(subset=["__date", "__waybill"], keep="last")
 
@@ -1658,6 +1652,11 @@ def main():
                     # Clean up column names for display and remove unnamed columns
                     display_pickup_df = pickup_filtered_df.copy()
 
+                    # Ensure Waybill Number is treated as string BEFORE filtering columns
+                    # This prevents scientific notation or number formatting
+                    if "Waybill Number" in display_pickup_df.columns:
+                        display_pickup_df["Waybill Number"] = display_pickup_df["Waybill Number"].astype(str)
+
                     # Filter out unnamed columns (columns that start with "Unnamed" or are empty)
                     valid_columns = [
                         col for col in display_pickup_df.columns
@@ -1665,14 +1664,32 @@ def main():
                     ]
                     display_pickup_df = display_pickup_df[valid_columns]
 
+                    # Store original waybill column name before renaming
+                    waybill_col_original = None
+                    if "Waybill Number" in display_pickup_df.columns:
+                        waybill_col_original = "Waybill Number"
+
                     # Clean up column names for display
                     display_pickup_df.columns = [str(col).title() for col in display_pickup_df.columns]
+
+                    # Configure column display - ensure waybill is shown as text (not number)
+                    column_config = {}
+                    # Find waybill column after title transformation
+                    waybill_col_display = None
+                    for col in display_pickup_df.columns:
+                        if "waybill" in col.lower():
+                            waybill_col_display = col
+                            break
+
+                    if waybill_col_display:
+                        column_config[waybill_col_display] = st.column_config.TextColumn(waybill_col_display)
 
                     # Display the filtered pickup dataframe
                     st.dataframe(
                         display_pickup_df,
                         use_container_width=True,
-                        hide_index=True
+                        hide_index=True,
+                        column_config=column_config if column_config else None
                     )
             else:
                 with st.expander("📦 Pickup Details", expanded=False):
