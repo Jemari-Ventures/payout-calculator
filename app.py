@@ -578,8 +578,9 @@ class PayoutCalculator:
     @staticmethod
     def calculate_pickup(pickup_df: pd.DataFrame, dispatcher_id: str, rate: float = 1.00) -> Tuple[int, float, pd.DataFrame]:
         """
-        Counts unique Waybill Numbers for selected dispatcher in Sheet2
+        Counts total parcels (rows) for selected dispatcher in Sheet2
         based on Pick Up Dispatcher ID matching the dispatcher_id.
+        Filters out rows with empty or invalid waybill numbers.
 
         Returns:
             Tuple of (parcel_count, payout, filtered_pickup_df)
@@ -628,11 +629,26 @@ class PayoutCalculator:
             return waybill_str
 
         waybill_strings = matched_records["Waybill Number"].apply(safe_waybill_to_string)
-        unique_waybills = waybill_strings[waybill_strings.notna() & (waybill_strings != "")].unique()
-        parcel_count = len(unique_waybills)
+
+        # Filter records to only include those with valid waybills
+        valid_waybill_mask = waybill_strings.notna() & (waybill_strings != "")
+        valid_records = matched_records[valid_waybill_mask].copy()
+
+        if valid_records.empty:
+            return 0, 0.0, pd.DataFrame()
+
+        # Convert waybill column to string in the returned DataFrame
+        # This ensures waybills are treated as strings and preserves format
+        if "Waybill Number" in valid_records.columns:
+            valid_records["Waybill Number"] = valid_records["Waybill Number"].apply(safe_waybill_to_string)
+
+        # Count total parcels (rows) - each row represents one parcel
+        # Even if waybills are duplicated, each row is a separate parcel
+        parcel_count = len(valid_records)
+
         payout = round(parcel_count * rate, 2)
 
-        return parcel_count, payout, matched_records
+        return parcel_count, payout, valid_records
 
     @staticmethod
     def calculate_tiered_daily(filtered_df: pd.DataFrame, tiers_config: List,
@@ -925,6 +941,8 @@ class PayoutCalculator:
         # Store count after processing
         total_after_filter = len(work)
 
+        # Remove duplicates - keep last entry per date+waybill combination
+        # This ensures each waybill is counted only once per day
         work = work.sort_values(by=["__date", "__waybill", "Delivery Signature"])
 
         # SIMPLE: No deduplication needed - user confirmed waybills have no duplicates
@@ -1843,6 +1861,27 @@ def main():
     advance_percentage = advance_config.get("percentage", 0.0)
     advance_description = advance_config.get("description", "Advance Payout (40% of Base Delivery)")
 
+    # Initialize variables that might be used in other tabs
+    advance_payout = 0.0
+    base_delivery_payout = 0.0
+    gross_delivery_payout = 0.0
+    gross_total_payout = 0.0
+    final_payout = 0.0
+    kpi_bonus = 0.0
+    attendance_bonus = 0.0
+    pickup_payout = 0.0
+    pickup_parcels = 0
+    kpi_description = ""
+    attendance_desc = ""
+    qualified_days = 0
+    display_df = pd.DataFrame()
+    penalty_breakdown = {'duitnow': {'amount': 0.0, 'waybills': []},
+                        'ldr': {'amount': 0.0, 'count': 0, 'waybills': []},
+                        'fake_attempt': {'amount': 0.0, 'count': 0, 'waybills': []},
+                        'total_amount': 0.0, 'total_count': 0}
+    per_day_df = pd.DataFrame()
+    pickup_filtered_df = pd.DataFrame()
+
     # Create tabs for different views
     tab1, tab2, tab3 = st.tabs(["📊 Payout Details", "📈 Performance Charts", "🧾 Invoice"])
 
@@ -1999,15 +2038,60 @@ def main():
                 with st.expander("📦 Pickup Details", expanded=False):
                     st.info(f"**Total Pickup Parcels: {pickup_parcels}** | **Payout: {config['currency_symbol']}{pickup_payout:,.2f}** (RM1.00 per parcel)")
 
-                    # Clean up column names for display
+                    # Clean up column names for display and remove unnamed columns
                     display_pickup_df = pickup_filtered_df.copy()
+
+                    # Ensure Waybill Number is treated as string BEFORE filtering columns
+                    # This prevents scientific notation or number formatting
+                    # Use safe conversion to handle numeric waybills properly
+                    if "Waybill Number" in display_pickup_df.columns:
+                        def safe_waybill_display(value):
+                            """Safely convert waybill to string for display, preserving format."""
+                            if pd.isna(value):
+                                return ""
+                            # Handle numeric types - remove .0 from floats
+                            if isinstance(value, (int, float)):
+                                if isinstance(value, float) and value.is_integer():
+                                    return str(int(value))
+                                return str(value)
+                            # For strings, return as-is
+                            return str(value).strip()
+
+                        display_pickup_df["Waybill Number"] = display_pickup_df["Waybill Number"].apply(safe_waybill_display)
+
+                    # Filter out unnamed columns (columns that start with "Unnamed" or are empty)
+                    valid_columns = [
+                        col for col in display_pickup_df.columns
+                        if not (str(col).startswith('Unnamed') or str(col).strip() == '' or str(col).lower() == 'nan')
+                    ]
+                    display_pickup_df = display_pickup_df[valid_columns]
+
+                    # Store original waybill column name before renaming
+                    waybill_col_original = None
+                    if "Waybill Number" in display_pickup_df.columns:
+                        waybill_col_original = "Waybill Number"
+
+                    # Clean up column names for display
                     display_pickup_df.columns = [str(col).title() for col in display_pickup_df.columns]
+
+                    # Configure column display - ensure waybill is shown as text (not number)
+                    column_config = {}
+                    # Find waybill column after title transformation
+                    waybill_col_display = None
+                    for col in display_pickup_df.columns:
+                        if "waybill" in col.lower():
+                            waybill_col_display = col
+                            break
+
+                    if waybill_col_display:
+                        column_config[waybill_col_display] = st.column_config.TextColumn(waybill_col_display)
 
                     # Display the filtered pickup dataframe
                     st.dataframe(
                         display_pickup_df,
                         use_container_width=True,
-                        hide_index=True
+                        hide_index=True,
+                        column_config=column_config if column_config else None
                     )
             else:
                 with st.expander("📦 Pickup Details", expanded=False):
