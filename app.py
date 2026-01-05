@@ -495,8 +495,9 @@ class PayoutCalculator:
     @staticmethod
     def calculate_pickup(pickup_df: pd.DataFrame, dispatcher_id: str, rate: float = 1.00) -> Tuple[int, float, pd.DataFrame]:
         """
-        Counts unique Waybill Numbers for selected dispatcher in Sheet2
+        Counts total parcels (rows) for selected dispatcher in Sheet2
         based on Pick Up Dispatcher ID matching the dispatcher_id.
+        Filters out rows with empty or invalid waybill numbers.
 
         Returns:
             Tuple of (parcel_count, payout, filtered_pickup_df)
@@ -521,12 +522,20 @@ class PayoutCalculator:
         if matched_records.empty:
             return 0, 0.0, pd.DataFrame()
 
-        # Count unique waybills
-        unique_waybills = matched_records["Waybill Number"].dropna().astype(str).str.strip()
-        parcel_count = len(unique_waybills)
+        # Filter out rows with empty waybill numbers
+        # Waybill must have a value (non-empty) - accept any non-empty value
+        waybill_col = matched_records["Waybill Number"].astype(str).str.strip()
+        # Only exclude empty strings - accept all non-empty waybill values
+        valid_records = matched_records[waybill_col != '']
+
+        if valid_records.empty:
+            return 0, 0.0, pd.DataFrame()
+
+        # Count total parcels (rows) - each row represents one parcel
+        parcel_count = len(valid_records)
         payout = round(parcel_count * rate, 2)
 
-        return parcel_count, payout, matched_records
+        return parcel_count, payout, valid_records
 
     @staticmethod
     def calculate_tiered_daily(filtered_df: pd.DataFrame, tiers_config: List,
@@ -556,11 +565,36 @@ class PayoutCalculator:
             return "Unmatched", 0.0
 
         work = filtered_df.copy()
+
+        # Parse delivery signature date - handles format like "2025-12-18 17:41:25"
         work["__date"] = pd.to_datetime(work["Delivery Signature"], errors="coerce").dt.date
-        work["__waybill"] = work["Waybill Number"].astype(str).str.strip()
 
-        work = work[work["__waybill"].notna() & (work["__waybill"] != "") & (work["__waybill"].str.lower() != "nan")]
+        # Convert waybill to string - waybill must have a value (non-empty)
+        # Accept ANY non-empty waybill value as valid
+        # Try to find waybill column with different possible names
+        waybill_col_name = None
+        for col_name in ["Waybill Number", "Waybill", "waybill number", "waybill"]:
+            if col_name in work.columns:
+                waybill_col_name = col_name
+                break
 
+        if waybill_col_name:
+            # Convert to string and strip whitespace
+            work["__waybill"] = work[waybill_col_name].astype(str).str.strip()
+            # Replace "nan" strings (from NaN conversion) with empty string for filtering
+            work["__waybill"] = work["__waybill"].replace("nan", "")
+        else:
+            # If column doesn't exist, create empty waybill column
+            work["__waybill"] = ""
+
+        # Only exclude rows where waybill is empty (must have a value)
+        # Accept ALL non-empty values: "CNMYJ000930823", "673002663768-01", "680009861506502", etc.
+        work = work[work["__waybill"] != ""]
+
+        # Filter out rows with invalid dates (NaN dates) - need valid dates for daily grouping
+        work = work[work["__date"].notna()]
+
+        # Sort and remove duplicates - keep last entry per date+waybill combination
         work = work.sort_values(by=["__date", "__waybill", "Delivery Signature"])
         work = work.drop_duplicates(subset=["__date", "__waybill"], keep="last")
 
@@ -1621,8 +1655,17 @@ def main():
                 with st.expander("📦 Pickup Details", expanded=False):
                     st.info(f"**Total Pickup Parcels: {pickup_parcels}** | **Payout: {config['currency_symbol']}{pickup_payout:,.2f}** (RM1.00 per parcel)")
 
-                    # Clean up column names for display
+                    # Clean up column names for display and remove unnamed columns
                     display_pickup_df = pickup_filtered_df.copy()
+
+                    # Filter out unnamed columns (columns that start with "Unnamed" or are empty)
+                    valid_columns = [
+                        col for col in display_pickup_df.columns
+                        if not (str(col).startswith('Unnamed') or str(col).strip() == '' or str(col).lower() == 'nan')
+                    ]
+                    display_pickup_df = display_pickup_df[valid_columns]
+
+                    # Clean up column names for display
                     display_pickup_df.columns = [str(col).title() for col in display_pickup_df.columns]
 
                     # Display the filtered pickup dataframe
