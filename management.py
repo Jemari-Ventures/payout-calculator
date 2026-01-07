@@ -1656,6 +1656,10 @@ def main():
         help="Choose which column should be used for date filtering."
     )
 
+    # Initialize date range variables
+    start_date = None
+    end_date = None
+
     if selected_date_col != "-- None --":
         # Track dispatchers before date filtering
         dispatchers_before_filter = set()
@@ -1733,22 +1737,111 @@ def main():
     penalty_data = DataSource.load_penalty_data(config)
     pickup_df = DataSource.load_pickup_data(config)
 
-    # Filter pickup_df by selected month/date range
-    if pickup_df is not None and not pickup_df.empty and selected_date_col != "-- None --":
-        pickup_date_col = None
-        for col in pickup_df.columns:
-            if any(k in str(col).lower() for k in ["date", "pick_up", "pickup", "signature"]):
-                pickup_date_col = col
-                break
+    # Filter all data by selected date range if a date column is selected
+    if selected_date_col != "-- None --" and start_date is not None and end_date is not None:
+        # Filter pickup_df by selected month/date range
+        if pickup_df is not None and not pickup_df.empty:
+            pickup_date_col = None
+            for col in pickup_df.columns:
+                if any(k in str(col).lower() for k in ["date", "pick_up", "pickup", "signature"]):
+                    pickup_date_col = col
+                    break
 
-        if pickup_date_col is not None:
-            pickup_df[pickup_date_col] = pd.to_datetime(pickup_df[pickup_date_col], errors="coerce")
-            pickup_df = pickup_df[
-                (pickup_df[pickup_date_col].dt.date >= start_date) &
-                (pickup_df[pickup_date_col].dt.date <= end_date)
-            ]
-        else:
-            st.warning("Pickup table has no detectable date column; pickup parcels are not filtered by month.")
+            if pickup_date_col is not None:
+                pickup_df[pickup_date_col] = pd.to_datetime(pickup_df[pickup_date_col], errors="coerce")
+                initial_pickup_count = len(pickup_df)
+                pickup_df = pickup_df[
+                    (pickup_df[pickup_date_col].dt.date >= start_date) &
+                    (pickup_df[pickup_date_col].dt.date <= end_date)
+                ]
+                filtered_pickup_count = len(pickup_df)
+                if initial_pickup_count != filtered_pickup_count:
+                    st.info(f"📦 Filtered pickup data: {initial_pickup_count:,} → {filtered_pickup_count:,} records")
+            else:
+                st.warning("⚠️ Pickup table has no detectable date column; pickup parcels are not filtered by date range.")
+
+        # Filter penalty data by selected date range
+        if penalty_data is not None:
+            # Filter DuitNow penalty
+            if 'duitnow' in penalty_data and penalty_data['duitnow'] is not None and not penalty_data['duitnow'].empty:
+                duitnow_df = penalty_data['duitnow']
+                duitnow_date_col = None
+                # Try to find date columns in DuitNow data
+                for col in duitnow_df.columns:
+                    col_lower = str(col).lower()
+                    if any(k in col_lower for k in ["date", "time", "delivery", "signature", "created_at", "updated_at"]):
+                        duitnow_date_col = col
+                        break
+
+                if duitnow_date_col is not None:
+                    duitnow_df[duitnow_date_col] = pd.to_datetime(duitnow_df[duitnow_date_col], errors="coerce")
+                    initial_duitnow_count = len(duitnow_df)
+                    duitnow_df = duitnow_df[
+                        (duitnow_df[duitnow_date_col].dt.date >= start_date) &
+                        (duitnow_df[duitnow_date_col].dt.date <= end_date)
+                    ]
+                    filtered_duitnow_count = len(duitnow_df)
+                    penalty_data['duitnow'] = duitnow_df
+                    if initial_duitnow_count != filtered_duitnow_count:
+                        st.info(f"⚠️ Filtered DuitNow penalty: {initial_duitnow_count:,} → {filtered_duitnow_count:,} records")
+                else:
+                    st.warning("⚠️ DuitNow penalty table has no detectable date column; penalties are not filtered by date range.")
+
+            # Filter LDR penalty
+            if 'ldr' in penalty_data and penalty_data['ldr'] is not None and not penalty_data['ldr'].empty:
+                ldr_df = penalty_data['ldr']
+                ldr_date_col = None
+                # Try to find date columns in LDR data
+                for col in ldr_df.columns:
+                    col_lower = str(col).lower()
+                    if any(k in col_lower for k in ["date", "time", "delivery", "signature", "created_at", "updated_at"]):
+                        ldr_date_col = col
+                        break
+
+                if ldr_date_col is not None:
+                    ldr_df[ldr_date_col] = pd.to_datetime(ldr_df[ldr_date_col], errors="coerce")
+                    initial_ldr_count = len(ldr_df)
+                    ldr_df = ldr_df[
+                        (ldr_df[ldr_date_col].dt.date >= start_date) &
+                        (ldr_df[ldr_date_col].dt.date <= end_date)
+                    ]
+                    filtered_ldr_count = len(ldr_df)
+                    penalty_data['ldr'] = ldr_df
+                    if initial_ldr_count != filtered_ldr_count:
+                        st.info(f"⚠️ Filtered LDR penalty: {initial_ldr_count:,} → {filtered_ldr_count:,} records")
+                else:
+                    st.warning("⚠️ LDR penalty table has no detectable date column; penalties are not filtered by date range.")
+
+            # Filter Fake Attempt penalty
+            if 'fake_attempt' in penalty_data and penalty_data['fake_attempt'] is not None and not penalty_data['fake_attempt'].empty:
+                fake_attempt_df = penalty_data['fake_attempt']
+                fake_attempt_date_col = None
+                # Try to find time_delivery or other date columns
+                for col in fake_attempt_df.columns:
+                    col_lower = str(col).lower()
+                    if any(k in col_lower for k in ["time_delivery", "date", "time", "delivery", "signature", "created_at", "updated_at"]):
+                        fake_attempt_date_col = col
+                        # Prefer time_delivery if it exists
+                        if col_lower == "time_delivery":
+                            break
+
+                if fake_attempt_date_col is not None:
+                    fake_attempt_df[fake_attempt_date_col] = pd.to_datetime(fake_attempt_df[fake_attempt_date_col], errors="coerce")
+                    initial_fake_count = len(fake_attempt_df)
+                    fake_attempt_df = fake_attempt_df[
+                        (fake_attempt_df[fake_attempt_date_col].dt.date >= start_date) &
+                        (fake_attempt_df[fake_attempt_date_col].dt.date <= end_date)
+                    ]
+                    filtered_fake_count = len(fake_attempt_df)
+                    penalty_data['fake_attempt'] = fake_attempt_df
+                    if initial_fake_count != filtered_fake_count:
+                        st.info(f"⚠️ Filtered Fake Attempt penalty: {initial_fake_count:,} → {filtered_fake_count:,} records")
+                else:
+                    st.warning("⚠️ Fake Attempt penalty table has no detectable date column; penalties are not filtered by date range.")
+
+        # Show summary of date filtering
+        if selected_date_col != "-- None --" and start_date is not None and end_date is not None:
+            st.success(f"✅ All data filtered by date range: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
 
     # Calculate payouts
     currency = config.get("currency_symbol", "RM")
