@@ -53,7 +53,7 @@ class Config:
     DEFAULT_CONFIG = {
         "data_source": {
             "type": "gsheet",
-            "gsheet_url": "https://docs.google.com/spreadsheets/d/1SzkqlbOgfgnCJBKwmWCBf9ZeG_ZhV35i/edit?gid=429631304#gid=429631304",
+            "gsheet_url": "https://docs.google.com/spreadsheets/d/1T24tNnDoRtkaE7i9tBLZrsNqWLE80An4/edit?usp=sharing&ouid=109319992457995119696&rtpof=true&sd=true",
             "sheet_name": None
         },
         "tiers": [
@@ -126,6 +126,47 @@ class Config:
 
 
 # =============================================================================
+# UTILITY FUNCTIONS
+# =============================================================================
+
+def find_column(df: pd.DataFrame, possible_names: List[str], case_sensitive: bool = False) -> Optional[str]:
+    """Find a column in DataFrame by trying multiple possible names.
+
+    Args:
+        df: DataFrame to search
+        possible_names: List of possible column names to try
+        case_sensitive: Whether to match case exactly
+
+    Returns:
+        Column name if found, None otherwise
+    """
+    if df is None or df.empty:
+        return None
+
+    # Try exact matches first
+    for name in possible_names:
+        if name in df.columns:
+            return name
+
+    # Try case-insensitive matches
+    if not case_sensitive:
+        df_cols_lower = {str(col).lower().strip(): col for col in df.columns}
+        for name in possible_names:
+            name_lower = str(name).lower().strip()
+            if name_lower in df_cols_lower:
+                return df_cols_lower[name_lower]
+
+        # Try normalized matching (remove spaces, dots, convert to lowercase)
+        df_cols_normalized = {str(col).lower().strip().replace(" ", "_").replace(".", "").replace("|", "").replace("/", "_"): col
+                              for col in df.columns}
+        for name in possible_names:
+            name_normalized = str(name).lower().strip().replace(" ", "_").replace(".", "").replace("|", "").replace("/", "_")
+            if name_normalized in df_cols_normalized:
+                return df_cols_normalized[name_normalized]
+
+    return None
+
+# =============================================================================
 # DATA SOURCE MANAGEMENT
 # =============================================================================
 
@@ -194,16 +235,18 @@ class DataSource:
                 io.BytesIO(resp_content),
                 keep_default_na=False,  # Don't automatically convert strings to NaN
                 na_values=[],  # Don't treat any specific values as NaN
-                encoding='utf-8'  # Ensure proper encoding
+                encoding='utf-8',  # Ensure proper encoding
+                low_memory=False  # Read entire file to determine dtypes, eliminates DtypeWarning
             )
 
             # CRITICAL: Convert Waybill Number to string IMMEDIATELY after reading
             # This must happen before any other processing to preserve all waybill formats
-            if "Waybill Number" in df.columns:
+            waybill_col = find_column(df, ["Waybill Number", "waybill_number", "Waybill", "waybill"])
+            if waybill_col:
                 # First, convert the entire column to string type
                 # This ensures all waybills are strings, regardless of how pandas read them
                 # Use astype(str) which is more reliable than dtype=str during read
-                df["Waybill Number"] = df["Waybill Number"].astype(str)
+                df[waybill_col] = df[waybill_col].astype(str)
 
                 # Now apply conversion function to clean up and handle edge cases
                 def simple_waybill_converter(x):
@@ -262,7 +305,7 @@ class DataSource:
                     return None
 
                 # Apply conversion - this preserves ALL waybills with values
-                df["Waybill Number"] = df["Waybill Number"].apply(simple_waybill_converter)
+                df[waybill_col] = df[waybill_col].apply(simple_waybill_converter)
 
             return df
         except Exception as exc:
@@ -450,26 +493,50 @@ class PayoutCalculator:
             'total_count': 0
         }
 
+        # Normalize dispatcher_id for comparison
+        dispatcher_id_normalized = str(dispatcher_id).strip()
+
         # 1. Process DuitNow penalty (Sheet3) - No waybills
         if duitnow_df is not None and not duitnow_df.empty:
             rider_col = None
+            # Try exact match first (case-insensitive, strip spaces)
             for col in duitnow_df.columns:
-                if col.upper().strip() == "RIDER":
+                col_normalized = str(col).upper().strip().replace(" ", "")
+                if col_normalized == "RIDER":
                     rider_col = col
                     break
 
+            # If not found, try case-insensitive partial match
+            if rider_col is None:
+                for col in duitnow_df.columns:
+                    col_upper = str(col).upper().strip()
+                    if "RIDER" in col_upper:
+                        rider_col = col
+                        break
+
             if rider_col is not None:
-                # Filter by dispatcher ID
-                duitnow_rows = duitnow_df[
-                    duitnow_df[rider_col].astype(str).str.strip() == str(dispatcher_id).strip()
+                # Filter by dispatcher ID - normalize both sides for comparison
+                duitnow_df_copy = duitnow_df.copy()
+                duitnow_df_copy[rider_col] = duitnow_df_copy[rider_col].astype(str).str.strip()
+                duitnow_rows = duitnow_df_copy[
+                    duitnow_df_copy[rider_col] == dispatcher_id_normalized
                 ]
 
                 # Filter by Achieve = Fail
                 achieve_col = None
                 for col in duitnow_df.columns:
-                    if col.upper().strip() == "ACHIEVE":
+                    col_normalized = str(col).upper().strip().replace(" ", "")
+                    if col_normalized == "ACHIEVE":
                         achieve_col = col
                         break
+
+                # If not found, try case-insensitive partial match
+                if achieve_col is None:
+                    for col in duitnow_df.columns:
+                        col_upper = str(col).upper().strip()
+                        if "ACHIEVE" in col_upper:
+                            achieve_col = col
+                            break
 
                 if achieve_col is not None:
                     duitnow_rows = duitnow_rows[
@@ -478,10 +545,20 @@ class PayoutCalculator:
 
                 if not duitnow_rows.empty:
                     penalty_col = None
+                    # Try exact match first
                     for col in duitnow_df.columns:
-                        if "PENALTY" in col.upper():
+                        col_normalized = str(col).upper().strip().replace(" ", "")
+                        if col_normalized == "PENALTY":
                             penalty_col = col
                             break
+
+                    # If not found, try partial match
+                    if penalty_col is None:
+                        for col in duitnow_df.columns:
+                            col_upper = str(col).upper().strip()
+                            if "PENALTY" in col_upper:
+                                penalty_col = col
+                                break
 
                     if penalty_col is not None:
                         # Convert penalty values, handling comma decimal separators
@@ -494,22 +571,63 @@ class PayoutCalculator:
         # 2. Process LD&R penalty (Sheet4)
         if ldr_df is not None and not ldr_df.empty:
             emp_id_col = None
+            # Try exact matches first (both original and normalized formats)
+            exact_matches = ["Employee ID", "employee_id", "EMPLOYEE ID", "EMPLOYEE_ID"]
             for col in ldr_df.columns:
-                if "EMPLOYEE ID" in col.upper() or "EMPLOYEEID" in col.upper().replace(" ", ""):
+                col_str = str(col).strip()
+                if col_str in exact_matches:
                     emp_id_col = col
                     break
 
+            # If not found, try normalized pattern matching
+            if emp_id_col is None:
+                for col in ldr_df.columns:
+                    col_normalized = str(col).upper().strip().replace(" ", "_").replace(".", "")
+                    if col_normalized == "EMPLOYEEID" or col_normalized == "EMPLOYEE_ID":
+                        emp_id_col = col
+                        break
+
+            # If not found, try case-insensitive partial match
+            if emp_id_col is None:
+                for col in ldr_df.columns:
+                    col_upper = str(col).upper().strip()
+                    if "EMPLOYEE" in col_upper and "ID" in col_upper:
+                        emp_id_col = col
+                        break
+
             if emp_id_col is not None:
-                ldr_rows = ldr_df[
-                    ldr_df[emp_id_col].astype(str).str.strip() == str(dispatcher_id).strip()
+                # Normalize both sides for comparison
+                ldr_df_copy = ldr_df.copy()
+                ldr_df_copy[emp_id_col] = ldr_df_copy[emp_id_col].astype(str).str.strip()
+                ldr_rows = ldr_df_copy[
+                    ldr_df_copy[emp_id_col] == dispatcher_id_normalized
                 ]
 
                 if not ldr_rows.empty:
                     amount_col = None
+                    # Try exact matches first (both original and normalized formats)
+                    exact_amount_matches = ["Amount", "amount", "AMOUNT"]
                     for col in ldr_df.columns:
-                        if col.upper().strip() == "AMOUNT":
+                        col_str = str(col).strip()
+                        if col_str in exact_amount_matches:
                             amount_col = col
                             break
+
+                    # If not found, try normalized pattern matching
+                    if amount_col is None:
+                        for col in ldr_df.columns:
+                            col_normalized = str(col).upper().strip().replace(" ", "")
+                            if col_normalized == "AMOUNT":
+                                amount_col = col
+                                break
+
+                    # If not found, try case-insensitive partial match
+                    if amount_col is None:
+                        for col in ldr_df.columns:
+                            col_upper = str(col).upper().strip()
+                            if "AMOUNT" in col_upper:
+                                amount_col = col
+                                break
 
                     if amount_col is not None:
                         # Convert penalty values, handling comma decimal separators
@@ -522,10 +640,45 @@ class PayoutCalculator:
 
                         # Get waybill numbers
                         awb_col = None
+                        # Try exact matches first (both original and normalized formats)
+                        exact_awb_matches = ["No. AWB", "no_awb", "NO. AWB", "NO_AWB", "No AWB", "no awb"]
                         for col in ldr_df.columns:
-                            if "NO. AWB" in col.upper() or "AWB" in col.upper():
+                            col_str = str(col).strip()
+                            if col_str in exact_awb_matches:
                                 awb_col = col
                                 break
+
+                        # If not found, try normalized pattern matching
+                        if awb_col is None:
+                            for col in ldr_df.columns:
+                                col_normalized = str(col).upper().strip().replace(" ", "_").replace(".", "")
+                                if col_normalized == "NOAWB" or col_normalized == "NO_AWB":
+                                    awb_col = col
+                                    break
+
+                        # If not found, try "No. AWB" pattern with spaces
+                        if awb_col is None:
+                            for col in ldr_df.columns:
+                                col_upper = str(col).upper().strip()
+                                if "NO. AWB" in col_upper or "NO AWB" in col_upper:
+                                    awb_col = col
+                                    break
+
+                        # If not found, try pattern with "NO" and "AWB"
+                        if awb_col is None:
+                            for col in ldr_df.columns:
+                                col_upper = str(col).upper().strip()
+                                if "AWB" in col_upper and "NO" in col_upper:
+                                    awb_col = col
+                                    break
+
+                        # If not found, try simpler pattern - just "AWB"
+                        if awb_col is None:
+                            for col in ldr_df.columns:
+                                col_upper = str(col).upper().strip()
+                                if "AWB" in col_upper:
+                                    awb_col = col
+                                    break
 
                         if awb_col is not None:
                             waybills = ldr_rows[awb_col].dropna().astype(str).str.strip().tolist()
@@ -534,14 +687,27 @@ class PayoutCalculator:
         # 3. Process Fake attempt penalty (Sheet5)
         if fake_df is not None and not fake_df.empty:
             disp_id_col = None
+            # Try multiple patterns for dispatcher ID column
             for col in fake_df.columns:
-                if "DISPATCHER ID" in col.upper() or "DISPATCHERID" in col.upper().replace(" ", ""):
+                col_normalized = str(col).upper().strip().replace(" ", "")
+                if col_normalized == "DISPATCHERID" or ("DISPATCHER" in col_normalized and "ID" in col_normalized):
                     disp_id_col = col
                     break
 
+            # If not found, try case-insensitive partial match with spaces
+            if disp_id_col is None:
+                for col in fake_df.columns:
+                    col_upper = str(col).upper().strip()
+                    if "DISPATCHER" in col_upper and "ID" in col_upper:
+                        disp_id_col = col
+                        break
+
             if disp_id_col is not None:
-                fake_rows = fake_df[
-                    fake_df[disp_id_col].astype(str).str.strip() == str(dispatcher_id).strip()
+                # Normalize both sides for comparison
+                fake_df_copy = fake_df.copy()
+                fake_df_copy[disp_id_col] = fake_df_copy[disp_id_col].astype(str).str.strip()
+                fake_rows = fake_df_copy[
+                    fake_df_copy[disp_id_col] == dispatcher_id_normalized
                 ]
 
                 if not fake_rows.empty:
@@ -552,10 +718,28 @@ class PayoutCalculator:
 
                     # Get waybill numbers
                     waybill_col = None
+                    # Try "Waybill Number" pattern first
                     for col in fake_df.columns:
-                        if "WAYBILL NUMBER" in col.upper() or "WAYBILL" in col.upper():
+                        col_upper = str(col).upper().strip()
+                        if "WAYBILL NUMBER" in col_upper or "WAYBILLNUMBER" in col_upper.replace(" ", ""):
                             waybill_col = col
                             break
+
+                    # If not found, try pattern with "WAYBILL" and "NUMBER"
+                    if waybill_col is None:
+                        for col in fake_df.columns:
+                            col_upper = str(col).upper().strip()
+                            if "WAYBILL" in col_upper and "NUMBER" in col_upper:
+                                waybill_col = col
+                                break
+
+                    # If not found, try simpler pattern - just "WAYBILL"
+                    if waybill_col is None:
+                        for col in fake_df.columns:
+                            col_upper = str(col).upper().strip()
+                            if "WAYBILL" in col_upper:
+                                waybill_col = col
+                                break
 
                     if waybill_col is not None:
                         waybills = fake_rows[waybill_col].dropna().astype(str).str.strip().tolist()
@@ -588,19 +772,58 @@ class PayoutCalculator:
         if pickup_df is None or pickup_df.empty or not dispatcher_id:
             return 0, 0.0, pd.DataFrame()
 
-        # Make sure columns exist
-        if "Pick Up Dispatcher ID" not in pickup_df.columns or "Waybill Number" not in pickup_df.columns:
+        # Find dispatcher column - handle multiple possible column name formats
+        dispatcher_col = None
+        possible_dispatcher_cols = [
+            "Pick Up Dispatcher ID", "Pick Up Dispatcher Id", "Pickup Dispatcher ID",
+            "pickup_dispatcher_id", "pickup_dispatcher", "Pickup Dispatcher",
+            "dispatcher_id", "Dispatcher ID"
+        ]
+        for col_name in possible_dispatcher_cols:
+            if col_name in pickup_df.columns:
+                dispatcher_col = col_name
+                break
+
+        # If not found, try case-insensitive search
+        if dispatcher_col is None:
+            for col in pickup_df.columns:
+                col_lower = str(col).lower().strip()
+                if "pickup" in col_lower and "dispatcher" in col_lower:
+                    dispatcher_col = col
+                    break
+
+        # Find waybill column - handle multiple possible column name formats
+        waybill_col = None
+        possible_waybill_cols = [
+            "Waybill Number", "Waybill", "waybill_number", "waybill",
+            "Waybill No", "AWB", "No. AWB"
+        ]
+        for col_name in possible_waybill_cols:
+            if col_name in pickup_df.columns:
+                waybill_col = col_name
+                break
+
+        # If not found, try case-insensitive search
+        if waybill_col is None:
+            for col in pickup_df.columns:
+                col_lower = str(col).lower().strip()
+                if "waybill" in col_lower or "awb" in col_lower:
+                    waybill_col = col
+                    break
+
+        # Make sure required columns exist
+        if dispatcher_col is None or waybill_col is None:
             return 0, 0.0, pd.DataFrame()
 
         # Convert dispatcher_id to string for comparison
         dispatcher_id_str = str(dispatcher_id).strip()
 
-        # Clean and prepare the Pick Up Dispatcher ID column
+        # Clean and prepare the dispatcher ID column
         pickup_df = pickup_df.copy()
-        pickup_df["Pick Up Dispatcher ID"] = pickup_df["Pick Up Dispatcher ID"].astype(str).str.strip()
+        pickup_df[dispatcher_col] = pickup_df[dispatcher_col].astype(str).str.strip()
 
         # Filter records for this dispatcher
-        matched_records = pickup_df[pickup_df["Pick Up Dispatcher ID"] == dispatcher_id_str]
+        matched_records = pickup_df[pickup_df[dispatcher_col] == dispatcher_id_str]
 
         if matched_records.empty:
             return 0, 0.0, pd.DataFrame()
@@ -628,7 +851,7 @@ class PayoutCalculator:
                 return None
             return waybill_str
 
-        waybill_strings = matched_records["Waybill Number"].apply(safe_waybill_to_string)
+        waybill_strings = matched_records[waybill_col].apply(safe_waybill_to_string)
 
         # Filter records to only include those with valid waybills
         valid_waybill_mask = waybill_strings.notna() & (waybill_strings != "")
@@ -639,8 +862,8 @@ class PayoutCalculator:
 
         # Convert waybill column to string in the returned DataFrame
         # This ensures waybills are treated as strings and preserves format
-        if "Waybill Number" in valid_records.columns:
-            valid_records["Waybill Number"] = valid_records["Waybill Number"].apply(safe_waybill_to_string)
+        if waybill_col in valid_records.columns:
+            valid_records[waybill_col] = valid_records[waybill_col].apply(safe_waybill_to_string)
 
         # Count total parcels (rows) - each row represents one parcel
         # Even if waybills are duplicated, each row is a separate parcel
@@ -679,12 +902,20 @@ class PayoutCalculator:
 
         work = filtered_df.copy()
 
+        # Find column names with flexible matching
+        delivery_sig_col = find_column(work, ["Delivery Signature", "delivery_signature", "Delivery Signature", "delivery_sig"])
+        waybill_col = find_column(work, ["Waybill Number", "waybill_number", "Waybill", "waybill"])
+        dispatcher_id_col = find_column(work, ["Dispatcher ID", "dispatcher_id", "Dispatcher Id", "DISPATCHER ID"])
+
+        if delivery_sig_col is None or waybill_col is None:
+            raise ValueError("Required columns (Delivery Signature and Waybill Number) not found in data")
+
         # Convert dates - but DON'T drop records with invalid dates
         # Use errors="coerce" to convert invalid dates to NaT, but keep the records
-        work["__date"] = pd.to_datetime(work["Delivery Signature"], errors="coerce").dt.date
+        work["__date"] = pd.to_datetime(work[delivery_sig_col], errors="coerce").dt.date
 
         # Preserve original waybill
-        work["__waybill_original"] = work["Waybill Number"].copy()
+        work["__waybill_original"] = work[waybill_col].copy()
 
         # Convert waybill to string - TREAT ALL WAYBILLS AS STRINGS
         # This ensures waybills with "-", letters, numbers are preserved exactly as they are
@@ -745,14 +976,14 @@ class PayoutCalculator:
 
         # CRITICAL: Convert waybills - NEVER convert a valid waybill to None
         # If waybill has ANY value in raw data, preserve it
-        work["__waybill"] = work["Waybill Number"].apply(safe_waybill_to_string)
+        work["__waybill"] = work[waybill_col].apply(safe_waybill_to_string)
 
         # CRITICAL RECOVERY LAYER 1: If waybill became None but original has value, recover it
         # This ensures NO valid waybill from raw data is lost
         none_waybills = work[work["__waybill"].isna()]
         if not none_waybills.empty:
             for idx in none_waybills.index:
-                original_wb = work.loc[idx, "Waybill Number"]
+                original_wb = work.loc[idx, waybill_col]
                 # If original waybill exists and is not NaN, recover it
                 if pd.notna(original_wb):
                     try:
@@ -778,7 +1009,7 @@ class PayoutCalculator:
         none_mask = work["__waybill"].isna()
         if none_mask.any():
             for idx in work[none_mask].index:
-                original_wb = work.loc[idx, "Waybill Number"]
+                original_wb = work.loc[idx, waybill_col]
                 # If original has ANY value (even if pandas thinks it's NaN), try to recover it
                 # Check both the original column and the preserved original
                 if pd.notna(original_wb):
@@ -822,7 +1053,7 @@ class PayoutCalculator:
             missing_indices = work[missing_waybill_mask].index
             for idx in missing_indices:
                 date_str = str(work.loc[idx, "__date"]) if pd.notna(work.loc[idx, "__date"]) else "UNKNOWN"
-                dispatcher = work.loc[idx, "Dispatcher ID"] if "Dispatcher ID" in work.columns and pd.notna(work.loc[idx, "Dispatcher ID"]) else "UNKNOWN"
+                dispatcher = work.loc[idx, dispatcher_id_col] if dispatcher_id_col and dispatcher_id_col in work.columns and pd.notna(work.loc[idx, dispatcher_id_col]) else "UNKNOWN"
                 placeholder_waybill = f"MISSING_WAYBILL_{idx}_{date_str}_{dispatcher}"
                 work.loc[idx, "__waybill"] = placeholder_waybill
                 # Also update the original waybill
@@ -839,7 +1070,7 @@ class PayoutCalculator:
         if invalid_date_mask.any():
             # Try to extract date from Delivery Signature string if datetime conversion failed
             for idx in work[invalid_date_mask].index:
-                delivery_sig = work.loc[idx, "Delivery Signature"]
+                delivery_sig = work.loc[idx, delivery_sig_col]
                 if pd.notna(delivery_sig):
                     # Try parsing as string date
                     try:
@@ -868,7 +1099,7 @@ class PayoutCalculator:
                 return str(wb)
             return str(wb).strip()
 
-        original_waybills = filtered_df["Waybill Number"].dropna().unique()
+        original_waybills = filtered_df[waybill_col].dropna().unique()
         current_waybills_set = set(work["__waybill"].dropna().astype(str).str.strip().unique())
 
         # Find waybills that exist in original data but not in current work
@@ -886,14 +1117,14 @@ class PayoutCalculator:
             missing_mask = pd.Series([False] * len(filtered_df), index=filtered_df.index)
             for missing_wb in missing_waybills_all:
                 # Try exact match
-                mask1 = filtered_df["Waybill Number"].astype(str).str.strip() == missing_wb
+                mask1 = filtered_df[waybill_col].astype(str).str.strip() == missing_wb
                 # Try case-insensitive match
-                mask2 = filtered_df["Waybill Number"].astype(str).str.strip().str.upper() == missing_wb.upper()
+                mask2 = filtered_df[waybill_col].astype(str).str.strip().str.upper() == missing_wb.upper()
                 # Try numeric comparison for numeric waybills
                 try:
                     missing_wb_num = float(missing_wb)
                     if missing_wb_num.is_integer():
-                        mask3 = filtered_df["Waybill Number"].astype(float) == missing_wb_num
+                        mask3 = filtered_df[waybill_col].astype(float) == missing_wb_num
                     else:
                         mask3 = pd.Series([False] * len(filtered_df), index=filtered_df.index)
                 except (ValueError, TypeError):
@@ -920,10 +1151,10 @@ class PayoutCalculator:
                         return str(x)
                     return wb_str
 
-                missing_records_all["__waybill"] = missing_records_all["Waybill Number"].apply(force_waybill_to_string)
-                missing_records_all["__waybill_original"] = missing_records_all["Waybill Number"].copy()
+                missing_records_all["__waybill"] = missing_records_all[waybill_col].apply(force_waybill_to_string)
+                missing_records_all["__waybill_original"] = missing_records_all[waybill_col].copy()
                 missing_records_all["__date"] = pd.to_datetime(
-                    missing_records_all["Delivery Signature"], errors="coerce"
+                    missing_records_all[delivery_sig_col], errors="coerce"
                 ).dt.date
                 # Fill invalid dates
                 missing_records_all["__date"] = missing_records_all["__date"].fillna(
@@ -943,7 +1174,7 @@ class PayoutCalculator:
 
         # Remove duplicates - keep last entry per date+waybill combination
         # This ensures each waybill is counted only once per day
-        work = work.sort_values(by=["__date", "__waybill", "Delivery Signature"])
+        work = work.sort_values(by=["__date", "__waybill", delivery_sig_col])
 
         # SIMPLE: No deduplication needed - user confirmed waybills have no duplicates
         # Just get all unique waybills that have data (not None)
@@ -993,11 +1224,15 @@ class PayoutCalculator:
                            'fake_attempt': {'amount': 0.0, 'count': 0, 'waybills': []},
                            'total_amount': 0.0, 'total_count': 0}
 
+        # Extract dispatcher_id with flexible column name matching
         dispatcher_id = None
-        for col in ["Dispatcher ID", "Dispatcher Id", "dispatcher_id"]:
-            if col in filtered_df.columns:
-                dispatcher_id = filtered_df[col].iloc[0] if len(filtered_df) > 0 else None
-                break
+        if dispatcher_id_col and dispatcher_id_col in filtered_df.columns:
+            dispatcher_id = filtered_df[dispatcher_id_col].iloc[0] if len(filtered_df) > 0 else None
+        else:
+            # Fallback: try to find dispatcher ID column
+            dispatcher_id_col_fallback = find_column(filtered_df, ["Dispatcher ID", "dispatcher_id", "Dispatcher Id", "DISPATCHER ID"])
+            if dispatcher_id_col_fallback:
+                dispatcher_id = filtered_df[dispatcher_id_col_fallback].iloc[0] if len(filtered_df) > 0 else None
 
         if dispatcher_id:
             penalty_breakdown = PayoutCalculator.calculate_penalty(
@@ -1714,8 +1949,19 @@ def main():
         return
 
     df = df.rename(columns={c: str(c).strip() for c in df.columns})
-    required_columns = ["Dispatcher ID", "Waybill Number", "Delivery Signature"]
-    missing_columns = [col for col in required_columns if col not in df.columns]
+
+    # Find required columns with flexible matching
+    dispatcher_id_col = find_column(df, ["Dispatcher ID", "dispatcher_id", "Dispatcher Id", "DISPATCHER ID"])
+    waybill_col = find_column(df, ["Waybill Number", "waybill_number", "Waybill", "waybill"])
+    delivery_sig_col = find_column(df, ["Delivery Signature", "delivery_signature", "Delivery Signature", "delivery_sig"])
+
+    missing_columns = []
+    if dispatcher_id_col is None:
+        missing_columns.append("Dispatcher ID")
+    if waybill_col is None:
+        missing_columns.append("Waybill Number")
+    if delivery_sig_col is None:
+        missing_columns.append("Delivery Signature")
 
     if missing_columns:
         st.error(f"Missing required columns: {', '.join(missing_columns)}")
@@ -1723,14 +1969,19 @@ def main():
         add_footer()
         return
 
+    # Store column names for later use
+    df.attrs['dispatcher_id_col'] = dispatcher_id_col
+    df.attrs['waybill_col'] = waybill_col
+    df.attrs['delivery_sig_col'] = delivery_sig_col
+
     # Convert Delivery Signature to datetime
-    df["Delivery Signature"] = pd.to_datetime(df["Delivery Signature"], errors="coerce")
+    df[delivery_sig_col] = pd.to_datetime(df[delivery_sig_col], errors="coerce")
 
     # Sidebar for date selection
     st.sidebar.title("📅 Date Range Selection")
 
     # Get date range from data
-    valid_dates = df["Delivery Signature"].dropna()
+    valid_dates = df[delivery_sig_col].dropna()
     if not valid_dates.empty:
         min_date = valid_dates.min().date()
         max_date = valid_dates.max().date()
@@ -1771,7 +2022,7 @@ def main():
 
     # Filter data by date range - but INCLUDE waybills with invalid/missing dates
     # This ensures ALL waybills are available, even if their dates can't be parsed
-    df["__delivery_date"] = pd.to_datetime(df["Delivery Signature"], errors="coerce").dt.date
+    df["__delivery_date"] = pd.to_datetime(df[delivery_sig_col], errors="coerce").dt.date
 
     # Include records that:
     # 1. Have valid dates within the selected range, OR
@@ -1795,18 +2046,17 @@ def main():
 
     st.subheader("👤 Dispatcher Selection")
     dispatcher_mapping = {}
-    for candidate_col in ["Dispatcher Name", "Name", "Rider Name"]:
-        if candidate_col in df.columns:
-            temp_mapping = df[["Dispatcher ID", candidate_col]].dropna()
-            temp_mapping["Dispatcher ID"] = temp_mapping["Dispatcher ID"].astype(str)
-            temp_mapping[candidate_col] = temp_mapping[candidate_col].astype(str)
-            for _, row in temp_mapping.iterrows():
-                dispatcher_id = row["Dispatcher ID"]
-                dispatcher_name = clean_dispatcher_name(row[candidate_col])
-                if dispatcher_id not in dispatcher_mapping:
-                    dispatcher_mapping[dispatcher_id] = dispatcher_name
-            if dispatcher_mapping:
-                break
+    dispatcher_name_col = find_column(df, ["Dispatcher Name", "dispatcher_name", "Rider Name", "rider_name", "Name", "name"])
+
+    if dispatcher_name_col and dispatcher_id_col:
+        temp_mapping = df[[dispatcher_id_col, dispatcher_name_col]].dropna()
+        temp_mapping[dispatcher_id_col] = temp_mapping[dispatcher_id_col].astype(str)
+        temp_mapping[dispatcher_name_col] = temp_mapping[dispatcher_name_col].astype(str)
+        for _, row in temp_mapping.iterrows():
+            dispatcher_id = row[dispatcher_id_col]
+            dispatcher_name = clean_dispatcher_name(row[dispatcher_name_col])
+            if dispatcher_id not in dispatcher_mapping:
+                dispatcher_mapping[dispatcher_id] = dispatcher_name
     # Create a list of options for the dropdown with ID and cleaned name
     dispatcher_options = []
     for dispatcher_id, dispatcher_name in dispatcher_mapping.items():
@@ -1838,7 +2088,7 @@ def main():
         return
 
     # Filter data for selected dispatcher (after date filtering)
-    dispatcher_df = df[df["Dispatcher ID"].astype(str) == selected_dispatcher_id].copy()
+    dispatcher_df = df[df[dispatcher_id_col].astype(str) == selected_dispatcher_id].copy()
 
 
     if dispatcher_df.empty:
