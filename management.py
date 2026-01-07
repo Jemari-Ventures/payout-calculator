@@ -79,7 +79,8 @@ class Config:
         ],
         "pickup_fee": 151.00,
         "currency_symbol": "RM",
-        "forecast_days": 30
+        "forecast_days": 30,
+        "qr_order_payout_per_order": 1.80
     }
 
     _cache = None
@@ -103,6 +104,8 @@ class Config:
                         config["pickup_payout_per_parcel"] = 1.50
                     if "forecast_days" not in config:
                         config["forecast_days"] = 30
+                    if "qr_order_payout_per_order" not in config:
+                        config["qr_order_payout_per_order"] = 1.80
                     cls._cache = config
                     return cls._cache
             except Exception as e:
@@ -244,6 +247,8 @@ class DataSource:
             elif table_name == 'ldr_penalty' or table_name.endswith('ldr_penalty'):
                 column_mapping = {}  # No mapping needed, use original column names
             elif table_name == 'fake_attempt_penalty' or table_name.endswith('fake_attempt_penalty'):
+                column_mapping = {}  # No mapping needed, use original column names
+            elif table_name == 'qr_order' or table_name.endswith('qr_order'):
                 column_mapping = {}  # No mapping needed, use original column names
             else:
                 column_mapping = {}
@@ -409,6 +414,21 @@ class DataSource:
             return df
         except Exception as exc:
             st.warning(f"Could not load pickup data from PostgreSQL table '{pickup_table}': {exc}")
+            return None
+
+    @staticmethod
+    def load_qr_order_data(config: dict) -> Optional[pd.DataFrame]:
+        """Load QR order data from qr_order table."""
+        engine = DataSource.get_postgres_engine()
+
+        if not engine:
+            return None
+
+        try:
+            df = DataSource.read_postgres_table(engine, 'qr_order')
+            return df
+        except Exception as exc:
+            st.warning(f"Could not load QR order data from PostgreSQL table 'qr_order': {exc}")
             return None
 
 # =============================================================================
@@ -794,26 +814,43 @@ class PayoutCalculator:
         # 1. DuitNow Penalty: sum all penalty amounts (only positive amounts)
         if 'duitnow' in penalty_data:
             duitnow_df = penalty_data['duitnow']
-            penalty_col = None
-            for col in duitnow_df.columns:
-                if col.lower() == 'penalty':
-                    penalty_col = col
-                    break
 
-            if penalty_col:
-                # Filter to only include records with positive penalty amounts
-                # Use Decimal to preserve exact precision
-                duitnow_df['penalty_numeric'] = duitnow_df[penalty_col].apply(
-                    lambda x: Decimal(str(x)) if pd.notna(x) else Decimal('0')
-                )
-                duitnow_filtered = duitnow_df[duitnow_df['penalty_numeric'] > 0]
-                # Round each penalty value first, then sum (matching SQL: SUM((FLOOR((penalty * 100) + 0.5) / 100)))
-                # This ensures the total matches SQL exactly
-                rounded_penalties = [
-                    penalty.quantize(Decimal('0.01'), rounding='ROUND_HALF_UP')
-                    for penalty in duitnow_filtered['penalty_numeric'].tolist()
-                ]
-                penalty_totals['duitnow'] = float(sum(rounded_penalties))
+            # Check if dataframe is empty (might have been filtered out by date range)
+            if duitnow_df is None or duitnow_df.empty:
+                st.warning("⚠️ DuitNow penalty dataframe is empty (may have been filtered out by date range)")
+                penalty_totals['duitnow'] = 0.0
+            else:
+                penalty_col = None
+                for col in duitnow_df.columns:
+                    if col.lower() == 'penalty':
+                        penalty_col = col
+                        break
+
+                if penalty_col:
+                    # Filter to only include records with positive penalty amounts
+                    # Use Decimal to preserve exact precision
+                    duitnow_df['penalty_numeric'] = duitnow_df[penalty_col].apply(
+                        lambda x: Decimal(str(x)) if pd.notna(x) else Decimal('0')
+                    )
+                    duitnow_filtered = duitnow_df[duitnow_df['penalty_numeric'] > 0]
+
+                    # Round each penalty value first, then sum (matching SQL: SUM((FLOOR((penalty * 100) + 0.5) / 100)))
+                    # This ensures the total matches SQL exactly
+                    if len(duitnow_filtered) > 0:
+                        rounded_penalties = [
+                            penalty.quantize(Decimal('0.01'), rounding='ROUND_HALF_UP')
+                            for penalty in duitnow_filtered['penalty_numeric'].tolist()
+                        ]
+                        penalty_totals['duitnow'] = float(sum(rounded_penalties))
+                    else:
+                        # Show diagnostic info if no positive penalties found
+                        total_records = len(duitnow_df)
+                        sample_penalties = duitnow_df[penalty_col].head(5).tolist()
+                        st.warning(f"⚠️ No positive penalty amounts found in DuitNow data. Total records: {total_records}, Sample values: {sample_penalties}")
+                        penalty_totals['duitnow'] = 0.0
+                else:
+                    st.error(f"❌ 'penalty' column not found in DuitNow data. Available columns: {list(duitnow_df.columns)}")
+                    penalty_totals['duitnow'] = 0.0
 
         # 2. LDR Penalty: count waybills * RM 100
         if 'ldr' in penalty_data:
@@ -921,9 +958,84 @@ class PayoutCalculator:
         return dispatcher_summary_df
 
     @staticmethod
+    def calculate_qr_order_payout(qr_order_df: pd.DataFrame, dispatcher_summary_df: pd.DataFrame, qr_order_payout_per_order: float = 1.80) -> pd.DataFrame:
+        """
+        Calculate QR order payout based on QR order data.
+
+        Args:
+            qr_order_df: DataFrame containing QR order data
+            dispatcher_summary_df: DataFrame containing dispatcher summary (must have 'Dispatcher ID' column)
+            qr_order_payout_per_order: Payout per QR order (RM 1.80 per order_no)
+
+        Returns:
+            DataFrame with QR order payout added to dispatcher summary
+        """
+        if qr_order_df is None or qr_order_df.empty:
+            dispatcher_summary_df['qr_order_count'] = 0
+            dispatcher_summary_df['qr_order_payout'] = 0.0
+            return dispatcher_summary_df
+
+        # Find dispatcher column in QR order data
+        dispatcher_col = None
+        for col in qr_order_df.columns:
+            col_lower = str(col).lower()
+            if col_lower == 'dispatcher':
+                dispatcher_col = col
+                break
+
+        if not dispatcher_col:
+            st.warning("⚠️ No dispatcher column found in QR order data")
+            dispatcher_summary_df['qr_order_count'] = 0
+            dispatcher_summary_df['qr_order_payout'] = 0.0
+            return dispatcher_summary_df
+
+        # Find order_no column (unique identifier for each order)
+        order_no_col = None
+        for col in qr_order_df.columns:
+            col_lower = str(col).lower()
+            if col_lower == 'order_no' or col_lower == 'order_no':
+                order_no_col = col
+                break
+
+        if not order_no_col:
+            st.warning("⚠️ No order_no column found in QR order data")
+            dispatcher_summary_df['qr_order_count'] = 0
+            dispatcher_summary_df['qr_order_payout'] = 0.0
+            return dispatcher_summary_df
+
+        # Clean dispatcher IDs
+        qr_order_df['clean_dispatcher_id'] = qr_order_df[dispatcher_col].astype(str).str.strip()
+
+        # Group by dispatcher ID to count unique orders
+        qr_order_summary = qr_order_df.groupby('clean_dispatcher_id').agg(
+            qr_order_count=(order_no_col, 'nunique')
+        ).reset_index()
+
+        # Calculate QR order payout
+        qr_order_summary['qr_order_payout'] = qr_order_summary['qr_order_count'] * qr_order_payout_per_order
+
+        # Rename column for merging
+        qr_order_summary = qr_order_summary.rename(columns={'clean_dispatcher_id': 'dispatcher_id'})
+
+        # Merge with dispatcher summary
+        dispatcher_summary_df = dispatcher_summary_df.merge(
+            qr_order_summary[['dispatcher_id', 'qr_order_count', 'qr_order_payout']],
+            on='dispatcher_id',
+            how='left'
+        )
+
+        # Fill NaN values
+        dispatcher_summary_df['qr_order_count'] = dispatcher_summary_df['qr_order_count'].fillna(0)
+        dispatcher_summary_df['qr_order_payout'] = dispatcher_summary_df['qr_order_payout'].fillna(0.0)
+
+        return dispatcher_summary_df
+
+    @staticmethod
     def calculate_payout(df: pd.DataFrame, currency_symbol: str, penalty_data: Optional[Dict[str, pd.DataFrame]] = None,
                         pickup_df: Optional[pd.DataFrame] = None,
-                        pickup_payout_per_parcel: float = 1.50) -> Tuple[pd.DataFrame, pd.DataFrame, float]:
+                        pickup_payout_per_parcel: float = 1.50,
+                        qr_order_df: Optional[pd.DataFrame] = None,
+                        qr_order_payout_per_order: float = 1.80) -> Tuple[pd.DataFrame, pd.DataFrame, float]:
         """Calculate payout using tier-based weight calculation."""
         # Prepare data
         df_clean = DataProcessor.prepare_dataframe(df)
@@ -1034,8 +1146,11 @@ class PayoutCalculator:
         # Calculate pickup payout
         grouped = PayoutCalculator.calculate_pickup_payout(pickup_df, grouped, pickup_payout_per_parcel)
 
-        # Calculate total payout: dispatch payout - penalty + pickup payout
-        grouped['total_payout'] = grouped['dispatch_payout'] - grouped['penalty_amount'] + grouped['pickup_payout']
+        # Calculate QR order payout
+        grouped = PayoutCalculator.calculate_qr_order_payout(qr_order_df, grouped, qr_order_payout_per_order)
+
+        # Calculate total payout: dispatch payout - penalty + pickup payout + QR order payout
+        grouped['total_payout'] = grouped['dispatch_payout'] - grouped['penalty_amount'] + grouped['pickup_payout'] + grouped['qr_order_payout']
 
         # Create display and numeric dataframes
         numeric_df = grouped.rename(columns={
@@ -1055,6 +1170,8 @@ class PayoutCalculator:
             "fake_attempt_penalty": "Fake Attempt Penalty",
             "pickup_parcels": "Pickup Parcels",
             "pickup_payout": "Pickup Payout",
+            "qr_order_count": "QR Orders",
+            "qr_order_payout": "QR Order Payout",
             "tier1_parcels": "Parcels 0-5kg",
             "tier2_parcels": "Parcels 5.01-10kg",
             "tier3_parcels": "Parcels 10.01-30kg",
@@ -1075,6 +1192,8 @@ class PayoutCalculator:
         if "Fake Attempt Penalty" in display_df.columns:
             display_df["Fake Attempt Penalty"] = display_df["Fake Attempt Penalty"].apply(lambda x: f"-{currency_symbol}{x:,.2f}" if x > 0 else f"{currency_symbol}0.00")
         display_df["Pickup Payout"] = display_df["Pickup Payout"].apply(lambda x: f"{currency_symbol}{x:,.2f}")
+        if "QR Order Payout" in display_df.columns:
+            display_df["QR Order Payout"] = display_df["QR Order Payout"].apply(lambda x: f"{currency_symbol}{x:,.2f}")
 
         # Keep Penalty Waybills and Penalty Parcels in numeric_df but remove from display_df
         if "Penalty Waybills" in display_df.columns:
@@ -1088,12 +1207,14 @@ class PayoutCalculator:
         # Calculate breakdown for info message
         total_dispatch_payout = numeric_df["Dispatch Payout"].sum()
         total_pickup_payout = numeric_df["Pickup Payout"].sum()
+        total_qr_order_payout = numeric_df["QR Order Payout"].sum() if "QR Order Payout" in numeric_df.columns else 0.0
         total_penalty = numeric_df["Penalty"].sum()
 
         st.info(f"""
         💰 **Payout Breakdown:**
         - Dispatch Payout: {currency_symbol} {total_dispatch_payout:,.2f}
         + Pickup Payout: {currency_symbol} {total_pickup_payout:,.2f}
+        + QR Order Payout: {currency_symbol} {total_qr_order_payout:,.2f}
         - Penalties: {currency_symbol} {total_penalty:,.2f}
         **Total Payout: {currency_symbol} {total_payout:,.2f}**
         """)
@@ -1609,6 +1730,21 @@ def main():
         config["pickup_payout_per_parcel"] = pickup_payout_per_parcel
         Config.save(config)
 
+    # Add configuration for QR order payout per order
+    qr_order_payout_per_order = st.sidebar.number_input(
+        "QR Order Payout per Order",
+        min_value=0.0,
+        max_value=100.0,
+        value=config.get("qr_order_payout_per_order", 1.80),
+        step=0.10,
+        help="Payout amount per QR order"
+    )
+
+    # Update config with new value
+    if qr_order_payout_per_order != config.get("qr_order_payout_per_order", 1.80):
+        config["qr_order_payout_per_order"] = qr_order_payout_per_order
+        Config.save(config)
+
     # Add configuration for forecast days
     forecast_days = st.sidebar.number_input(
         "Forecast Period (days)",
@@ -1633,6 +1769,9 @@ def main():
 
     **📦 Pickup Payout:**
     - RM{pickup_payout_per_parcel:.2f} per parcel
+
+    **📱 QR Order Payout:**
+    - RM{qr_order_payout_per_order:.2f} per order
 
     **📈 Forecast Period:**
     - {forecast_days} days
@@ -1733,9 +1872,10 @@ def main():
         else:
             st.sidebar.warning("Selected date column has no valid date values; showing all data.")
 
-    # Load penalty and pickup data
+    # Load penalty, pickup, and QR order data
     penalty_data = DataSource.load_penalty_data(config)
     pickup_df = DataSource.load_pickup_data(config)
+    qr_order_df = DataSource.load_qr_order_data(config)
 
     # Filter all data by selected date range if a date column is selected
     if selected_date_col != "-- None --" and start_date is not None and end_date is not None:
@@ -1762,30 +1902,62 @@ def main():
 
         # Filter penalty data by selected date range
         if penalty_data is not None:
-            # Filter DuitNow penalty
+            # Filter DuitNow penalty - use created_at column for date filtering
             if 'duitnow' in penalty_data and penalty_data['duitnow'] is not None and not penalty_data['duitnow'].empty:
                 duitnow_df = penalty_data['duitnow']
                 duitnow_date_col = None
-                # Try to find date columns in DuitNow data
-                for col in duitnow_df.columns:
-                    col_lower = str(col).lower()
-                    if any(k in col_lower for k in ["date", "time", "delivery", "signature", "created_at", "updated_at"]):
-                        duitnow_date_col = col
-                        break
+
+                # Explicitly look for created_at column for DuitNow penalty
+                if 'created_at' in duitnow_df.columns:
+                    duitnow_date_col = 'created_at'
+                else:
+                    # Try case-insensitive search
+                    for col in duitnow_df.columns:
+                        if str(col).lower() == "created_at":
+                            duitnow_date_col = col
+                            break
+
+                # If created_at not found, try other date columns as fallback
+                if duitnow_date_col is None:
+                    for col in duitnow_df.columns:
+                        col_lower = str(col).lower()
+                        if any(k in col_lower for k in ["date", "time", "delivery", "signature", "updated_at"]):
+                            duitnow_date_col = col
+                            break
 
                 if duitnow_date_col is not None:
                     duitnow_df[duitnow_date_col] = pd.to_datetime(duitnow_df[duitnow_date_col], errors="coerce")
                     initial_duitnow_count = len(duitnow_df)
+
+                    # Check for valid dates before filtering
+                    valid_dates = duitnow_df[duitnow_date_col].notna()
+                    invalid_date_count = (~valid_dates).sum()
+
+                    if invalid_date_count > 0:
+                        st.warning(f"⚠️ DuitNow: {invalid_date_count:,} records have invalid/null dates in '{duitnow_date_col}' column")
+
+                    # Show date range of data before filtering
+                    if valid_dates.any():
+                        min_date_in_data = duitnow_df[valid_dates][duitnow_date_col].min().date()
+                        max_date_in_data = duitnow_df[valid_dates][duitnow_date_col].max().date()
+                        st.info(f"📅 DuitNow date range in data: {min_date_in_data} to {max_date_in_data} (filtering: {start_date} to {end_date})")
+
+                    # Filter by date range
                     duitnow_df = duitnow_df[
                         (duitnow_df[duitnow_date_col].dt.date >= start_date) &
                         (duitnow_df[duitnow_date_col].dt.date <= end_date)
                     ]
                     filtered_duitnow_count = len(duitnow_df)
                     penalty_data['duitnow'] = duitnow_df
-                    if initial_duitnow_count != filtered_duitnow_count:
-                        st.info(f"⚠️ Filtered DuitNow penalty: {initial_duitnow_count:,} → {filtered_duitnow_count:,} records")
+
+                    if filtered_duitnow_count == 0:
+                        st.error(f"❌ All DuitNow penalty records filtered out! Initial: {initial_duitnow_count:,} records, after date filter: 0 records. Date range might not match data dates.")
+                    elif initial_duitnow_count != filtered_duitnow_count:
+                        st.info(f"⚠️ Filtered DuitNow penalty using '{duitnow_date_col}': {initial_duitnow_count:,} → {filtered_duitnow_count:,} records")
+                    else:
+                        st.info(f"ℹ️ DuitNow penalty filtered using '{duitnow_date_col}' column (all {initial_duitnow_count:,} records within date range)")
                 else:
-                    st.warning("⚠️ DuitNow penalty table has no detectable date column; penalties are not filtered by date range.")
+                    st.warning("⚠️ DuitNow penalty table has no 'created_at' column or other detectable date column; penalties are not filtered by date range.")
 
             # Filter LDR penalty
             if 'ldr' in penalty_data and penalty_data['ldr'] is not None and not penalty_data['ldr'].empty:
@@ -1839,15 +2011,55 @@ def main():
                 else:
                     st.warning("⚠️ Fake Attempt penalty table has no detectable date column; penalties are not filtered by date range.")
 
+            # Filter QR order data by selected date range
+            if qr_order_df is not None and not qr_order_df.empty:
+                qr_order_date_col = None
+                # Explicitly look for created_at column for QR orders
+                if 'created_at' in qr_order_df.columns:
+                    qr_order_date_col = 'created_at'
+                else:
+                    # Try case-insensitive search
+                    for col in qr_order_df.columns:
+                        if str(col).lower() == "created_at":
+                            qr_order_date_col = col
+                            break
+
+                if qr_order_date_col is not None:
+                    qr_order_df[qr_order_date_col] = pd.to_datetime(qr_order_df[qr_order_date_col], errors="coerce")
+                    initial_qr_count = len(qr_order_df)
+
+                    # Check for valid dates before filtering
+                    valid_dates = qr_order_df[qr_order_date_col].notna()
+                    invalid_date_count = (~valid_dates).sum()
+
+                    if invalid_date_count > 0:
+                        st.warning(f"⚠️ QR Orders: {invalid_date_count:,} records have invalid/null dates in '{qr_order_date_col}' column")
+
+                    # Filter by date range
+                    qr_order_df = qr_order_df[
+                        (qr_order_df[qr_order_date_col].dt.date >= start_date) &
+                        (qr_order_df[qr_order_date_col].dt.date <= end_date)
+                    ]
+                    filtered_qr_count = len(qr_order_df)
+
+                    if filtered_qr_count == 0:
+                        st.error(f"❌ All QR order records filtered out! Initial: {initial_qr_count:,} records, after date filter: 0 records.")
+                    elif initial_qr_count != filtered_qr_count:
+                        st.info(f"📦 Filtered QR orders using '{qr_order_date_col}': {initial_qr_count:,} → {filtered_qr_count:,} records")
+                else:
+                    st.warning("⚠️ QR order table has no 'created_at' column; QR orders are not filtered by date range.")
+
         # Show summary of date filtering
         if selected_date_col != "-- None --" and start_date is not None and end_date is not None:
             st.success(f"✅ All data filtered by date range: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
 
     # Calculate payouts
     currency = config.get("currency_symbol", "RM")
+    qr_order_payout_per_order = config.get("qr_order_payout_per_order", 1.80)
 
     display_df, numeric_df, total_payout = PayoutCalculator.calculate_payout(
-        df, currency, penalty_data, pickup_df, pickup_payout_per_parcel
+        df, currency, penalty_data, pickup_df, pickup_payout_per_parcel,
+        qr_order_df, qr_order_payout_per_order
     )
 
     if numeric_df.empty:
@@ -1878,6 +2090,8 @@ def main():
 
     total_pickup_parcels = int(numeric_df["Pickup Parcels"].sum()) if "Pickup Parcels" in numeric_df.columns else 0
     total_pickup_payout = numeric_df["Pickup Payout"].sum() if "Pickup Payout" in numeric_df.columns else 0.0
+    total_qr_orders = int(numeric_df["QR Orders"].sum()) if "QR Orders" in numeric_df.columns else 0
+    total_qr_order_payout = numeric_df["QR Order Payout"].sum() if "QR Order Payout" in numeric_df.columns else 0.0
     total_dispatch_payout = numeric_df["Dispatch Payout"].sum() if "Dispatch Payout" in numeric_df.columns else 0.0
 
     total_penalty = numeric_df["Penalty"].sum() if "Penalty" in numeric_df.columns else 0.0
@@ -1888,11 +2102,11 @@ def main():
     col1.metric("Dispatchers", f"{len(display_df):,}")
     col2.metric("Delivery Parcels", f"{int(numeric_df['Parcels Delivered'].sum()):,}")
     col3.metric("Pickup Parcels", f"{total_pickup_parcels:,}")
-    col4.metric("Total Payout", f"{currency} {total_payout:,.2f}")
-    col5.metric("Dispatch Payout", f"{currency} {total_dispatch_payout:,.2f}")
-    col6.metric("Pickup Payout", f"{currency} {total_pickup_payout:,.2f}")
-    col7.metric("Pickup Rate", f"{currency} {pickup_payout_per_parcel:.2f}")
-    col8.metric("Total Penalty", f"-{currency} {total_penalty:,.2f}")
+    col4.metric("QR Orders", f"{total_qr_orders:,}")
+    col5.metric("Total Payout", f"{currency} {total_payout:,.2f}")
+    col6.metric("Dispatch Payout", f"{currency} {total_dispatch_payout:,.2f}")
+    col7.metric("Pickup Payout", f"{currency} {total_pickup_payout:,.2f}")
+    col8.metric("QR Order Payout", f"{currency} {total_qr_order_payout:,.2f}")
 
     # Penalty breakdown by type
     st.markdown("#### ⚠️ Penalty Breakdown by Type")
@@ -1942,6 +2156,7 @@ def main():
     preferred_order = [
         "Dispatcher ID", "Dispatcher Name", "Parcels Delivered",
         "Dispatch Payout", "Pickup Parcels", "Pickup Payout",
+        "QR Orders", "QR Order Payout",
         "Penalty", "DuitNow Penalty", "LDR Penalty", "Fake Attempt Penalty",
         "Total Payout", "Total Weight (kg)", "Avg Weight (kg)",
         "Avg Rate per Parcel", "Parcels 0-5kg", "Parcels 5.01-10kg",
