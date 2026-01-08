@@ -80,7 +80,8 @@ class Config:
         "pickup_fee": 151.00,
         "currency_symbol": "RM",
         "forecast_days": 30,
-        "qr_order_payout_per_order": 1.80
+        "qr_order_payout_per_order": 1.80,
+        "return_payout_per_parcel": 1.50
     }
 
     _cache = None
@@ -106,6 +107,8 @@ class Config:
                         config["forecast_days"] = 30
                     if "qr_order_payout_per_order" not in config:
                         config["qr_order_payout_per_order"] = 1.80
+                    if "return_payout_per_parcel" not in config:
+                        config["return_payout_per_parcel"] = 1.50
                     cls._cache = config
                     return cls._cache
             except Exception as e:
@@ -250,6 +253,16 @@ class DataSource:
                 column_mapping = {}  # No mapping needed, use original column names
             elif table_name == 'qr_order' or table_name.endswith('qr_order'):
                 column_mapping = {}  # No mapping needed, use original column names
+            elif table_name == 'return' or table_name.endswith('return'):
+                column_mapping = {
+                    'waybill_number': 'Waybill Number',
+                    'dispatcher_id': 'Dispatcher ID',
+                    'rider_name': 'Dispatcher Name',
+                    'sender_name': 'Sender Name',
+                    'delivered_signature_id': 'Delivered Signature ID',
+                    'created_at': 'Created At',
+                    'updated_at': 'Updated At'
+                }
             else:
                 column_mapping = {}
 
@@ -429,6 +442,21 @@ class DataSource:
             return df
         except Exception as exc:
             st.warning(f"Could not load QR order data from PostgreSQL table 'qr_order': {exc}")
+            return None
+
+    @staticmethod
+    def load_return_data(config: dict) -> Optional[pd.DataFrame]:
+        """Load return data from return table."""
+        engine = DataSource.get_postgres_engine()
+
+        if not engine:
+            return None
+
+        try:
+            df = DataSource.read_postgres_table(engine, 'return')
+            return df
+        except Exception as exc:
+            st.warning(f"Could not load return data from PostgreSQL table 'return': {exc}")
             return None
 
 # =============================================================================
@@ -1031,11 +1059,86 @@ class PayoutCalculator:
         return dispatcher_summary_df
 
     @staticmethod
+    def calculate_return_payout(return_df: pd.DataFrame, dispatcher_summary_df: pd.DataFrame, return_payout_per_parcel: float = 1.50) -> pd.DataFrame:
+        """
+        Calculate return payout based on return data.
+
+        Args:
+            return_df: DataFrame containing return data
+            dispatcher_summary_df: DataFrame containing dispatcher summary (must have 'Dispatcher ID' column)
+            return_payout_per_parcel: Payout per return parcel
+
+        Returns:
+            DataFrame with return payout added to dispatcher summary
+        """
+        if return_df is None or return_df.empty:
+            dispatcher_summary_df['return_parcels'] = 0
+            dispatcher_summary_df['return_payout'] = 0.0
+            return dispatcher_summary_df
+
+        # Find dispatcher ID column in return data
+        return_dispatcher_col = None
+        for col in return_df.columns:
+            col_lower = str(col).lower()
+            if 'dispatcher_id' in col_lower or 'Dispatcher ID' in col:
+                return_dispatcher_col = col
+                break
+
+        if not return_dispatcher_col:
+            st.warning("⚠️ No dispatcher ID column found in return data")
+            dispatcher_summary_df['return_parcels'] = 0
+            dispatcher_summary_df['return_payout'] = 0.0
+            return dispatcher_summary_df
+
+        # Find waybill column in return data
+        waybill_col = None
+        for col in return_df.columns:
+            col_lower = str(col).lower()
+            if 'waybill' in col_lower or 'Waybill Number' in col:
+                waybill_col = col
+                break
+
+        if not waybill_col:
+            st.warning("⚠️ No waybill column found in return data")
+            dispatcher_summary_df['return_parcels'] = 0
+            dispatcher_summary_df['return_payout'] = 0.0
+            return dispatcher_summary_df
+
+        # Clean dispatcher IDs
+        return_df['clean_dispatcher_id'] = return_df[return_dispatcher_col].astype(str).str.strip()
+
+        # Group by dispatcher ID to count unique waybills
+        return_summary = return_df.groupby('clean_dispatcher_id').agg(
+            return_parcels=(waybill_col, 'nunique')
+        ).reset_index()
+
+        # Calculate return payout
+        return_summary['return_payout'] = return_summary['return_parcels'] * return_payout_per_parcel
+
+        # Rename column for merging
+        return_summary = return_summary.rename(columns={'clean_dispatcher_id': 'dispatcher_id'})
+
+        # Merge with dispatcher summary
+        dispatcher_summary_df = dispatcher_summary_df.merge(
+            return_summary[['dispatcher_id', 'return_parcels', 'return_payout']],
+            on='dispatcher_id',
+            how='left'
+        )
+
+        # Fill NaN values
+        dispatcher_summary_df['return_parcels'] = dispatcher_summary_df['return_parcels'].fillna(0)
+        dispatcher_summary_df['return_payout'] = dispatcher_summary_df['return_payout'].fillna(0.0)
+
+        return dispatcher_summary_df
+
+    @staticmethod
     def calculate_payout(df: pd.DataFrame, currency_symbol: str, penalty_data: Optional[Dict[str, pd.DataFrame]] = None,
                         pickup_df: Optional[pd.DataFrame] = None,
                         pickup_payout_per_parcel: float = 1.50,
                         qr_order_df: Optional[pd.DataFrame] = None,
-                        qr_order_payout_per_order: float = 1.80) -> Tuple[pd.DataFrame, pd.DataFrame, float]:
+                        qr_order_payout_per_order: float = 1.80,
+                        return_df: Optional[pd.DataFrame] = None,
+                        return_payout_per_parcel: float = 1.50) -> Tuple[pd.DataFrame, pd.DataFrame, float]:
         """Calculate payout using tier-based weight calculation."""
         # Prepare data
         df_clean = DataProcessor.prepare_dataframe(df)
@@ -1149,8 +1252,11 @@ class PayoutCalculator:
         # Calculate QR order payout
         grouped = PayoutCalculator.calculate_qr_order_payout(qr_order_df, grouped, qr_order_payout_per_order)
 
-        # Calculate total payout: dispatch payout - penalty + pickup payout + QR order payout
-        grouped['total_payout'] = grouped['dispatch_payout'] - grouped['penalty_amount'] + grouped['pickup_payout'] + grouped['qr_order_payout']
+        # Calculate return payout
+        grouped = PayoutCalculator.calculate_return_payout(return_df, grouped, return_payout_per_parcel)
+
+        # Calculate total payout: dispatch payout - penalty + pickup payout + QR order payout + return payout
+        grouped['total_payout'] = grouped['dispatch_payout'] - grouped['penalty_amount'] + grouped['pickup_payout'] + grouped['qr_order_payout'] + grouped['return_payout']
 
         # Create display and numeric dataframes
         numeric_df = grouped.rename(columns={
@@ -1172,6 +1278,8 @@ class PayoutCalculator:
             "pickup_payout": "Pickup Payout",
             "qr_order_count": "QR Orders",
             "qr_order_payout": "QR Order Payout",
+            "return_parcels": "Return Parcels",
+            "return_payout": "Return Payout",
             "tier1_parcels": "Parcels 0-5kg",
             "tier2_parcels": "Parcels 5.01-10kg",
             "tier3_parcels": "Parcels 10.01-30kg",
@@ -1194,6 +1302,8 @@ class PayoutCalculator:
         display_df["Pickup Payout"] = display_df["Pickup Payout"].apply(lambda x: f"{currency_symbol}{x:,.2f}")
         if "QR Order Payout" in display_df.columns:
             display_df["QR Order Payout"] = display_df["QR Order Payout"].apply(lambda x: f"{currency_symbol}{x:,.2f}")
+        if "Return Payout" in display_df.columns:
+            display_df["Return Payout"] = display_df["Return Payout"].apply(lambda x: f"{currency_symbol}{x:,.2f}")
 
         # Keep Penalty Waybills and Penalty Parcels in numeric_df but remove from display_df
         if "Penalty Waybills" in display_df.columns:
@@ -1208,6 +1318,7 @@ class PayoutCalculator:
         total_dispatch_payout = numeric_df["Dispatch Payout"].sum()
         total_pickup_payout = numeric_df["Pickup Payout"].sum()
         total_qr_order_payout = numeric_df["QR Order Payout"].sum() if "QR Order Payout" in numeric_df.columns else 0.0
+        total_return_payout = numeric_df["Return Payout"].sum() if "Return Payout" in numeric_df.columns else 0.0
         total_penalty = numeric_df["Penalty"].sum()
 
         st.info(f"""
@@ -1215,6 +1326,7 @@ class PayoutCalculator:
         - Dispatch Payout: {currency_symbol} {total_dispatch_payout:,.2f}
         + Pickup Payout: {currency_symbol} {total_pickup_payout:,.2f}
         + QR Order Payout: {currency_symbol} {total_qr_order_payout:,.2f}
+        + Return Payout: {currency_symbol} {total_return_payout:,.2f}
         - Penalties: {currency_symbol} {total_penalty:,.2f}
         **Total Payout: {currency_symbol} {total_payout:,.2f}**
         """)
@@ -1471,11 +1583,14 @@ class InvoiceGenerator:
             total_dispatch_payout = numeric_df["Dispatch Payout"].sum() if "Dispatch Payout" in numeric_df.columns else 0.0
             total_pickup_payout = numeric_df["Pickup Payout"].sum() if "Pickup Payout" in numeric_df.columns else 0.0
             total_pickup_parcels = int(numeric_df["Pickup Parcels"].sum()) if "Pickup Parcels" in numeric_df.columns else 0
+            total_return_payout = numeric_df["Return Payout"].sum() if "Return Payout" in numeric_df.columns else 0.0
+            total_return_parcels = int(numeric_df["Return Parcels"].sum()) if "Return Parcels" in numeric_df.columns else 0
             total_penalty = numeric_df["Penalty"].sum() if "Penalty" in numeric_df.columns else 0.0
             top_3 = display_df.head(3)
 
             table_columns = ["Dispatcher ID", "Dispatcher Name", "Parcels Delivered",
                            "Dispatch Payout", "Pickup Parcels", "Pickup Payout",
+                           "Return Parcels", "Return Payout",
                            "Penalty", "Total Payout"]
 
             html = f"""
@@ -1597,6 +1712,10 @@ class InvoiceGenerator:
                             <div class="value">{total_pickup_parcels:,}</div>
                         </div>
                         <div class="chip">
+                            <div class="label">Return Parcels</div>
+                            <div class="value">{total_return_parcels:,}</div>
+                        </div>
+                        <div class="chip">
                             <div class="label">Total Penalty</div>
                             <div class="value">-{currency_symbol} {total_penalty:,.2f}</div>
                         </div>
@@ -1622,6 +1741,7 @@ class InvoiceGenerator:
                             <tr><th style="background:var(--primary);color:white;text-align:left;">Summary</th><th style="background:var(--primary);color:white;text-align:right;">Amount</th></tr>
                             <tr><td>Total Dispatch Payout</td><td style="text-align:right;">{currency_symbol} {total_dispatch_payout:,.2f}</td></tr>
                             <tr><td>Pickup Payout</td><td style="text-align:right;">{currency_symbol} {total_pickup_payout:,.2f}</td></tr>
+                            <tr><td>Return Payout</td><td style="text-align:right;">{currency_symbol} {total_return_payout:,.2f}</td></tr>
                             <tr><td>Total Penalty</td><td style="text-align:right;">-{currency_symbol} {total_penalty:,.2f}</td></tr>
                             <tr><td><strong>Total Payout</strong></td><td style="text-align:right;"><strong>{currency_symbol} {total_payout:,.2f}</strong></td></tr>
                         </table>
@@ -1745,6 +1865,21 @@ def main():
         config["qr_order_payout_per_order"] = qr_order_payout_per_order
         Config.save(config)
 
+    # Add configuration for return payout per parcel
+    return_payout_per_parcel = st.sidebar.number_input(
+        "Return Payout per Parcel",
+        min_value=0.0,
+        max_value=100.0,
+        value=config.get("return_payout_per_parcel", 1.50),
+        step=0.10,
+        help="Payout amount per return parcel"
+    )
+
+    # Update config with new value
+    if return_payout_per_parcel != config.get("return_payout_per_parcel", 1.50):
+        config["return_payout_per_parcel"] = return_payout_per_parcel
+        Config.save(config)
+
     # Add configuration for forecast days
     forecast_days = st.sidebar.number_input(
         "Forecast Period (days)",
@@ -1772,6 +1907,9 @@ def main():
 
     **📱 QR Order Payout:**
     - RM{qr_order_payout_per_order:.2f} per order
+
+    **↩️ Return Payout:**
+    - RM{return_payout_per_parcel:.2f} per parcel
 
     **📈 Forecast Period:**
     - {forecast_days} days
@@ -1872,10 +2010,11 @@ def main():
         else:
             st.sidebar.warning("Selected date column has no valid date values; showing all data.")
 
-    # Load penalty, pickup, and QR order data
+    # Load penalty, pickup, QR order, and return data
     penalty_data = DataSource.load_penalty_data(config)
     pickup_df = DataSource.load_pickup_data(config)
     qr_order_df = DataSource.load_qr_order_data(config)
+    return_df = DataSource.load_return_data(config)
 
     # Filter all data by selected date range if a date column is selected
     if selected_date_col != "-- None --" and start_date is not None and end_date is not None:
@@ -2049,6 +2188,44 @@ def main():
                 else:
                     st.warning("⚠️ QR order table has no 'created_at' column; QR orders are not filtered by date range.")
 
+            # Filter return data by selected date range
+            if return_df is not None and not return_df.empty:
+                return_date_col = None
+                # Explicitly look for created_at column for returns
+                if 'created_at' in return_df.columns:
+                    return_date_col = 'created_at'
+                else:
+                    # Try case-insensitive search
+                    for col in return_df.columns:
+                        if str(col).lower() == "created_at":
+                            return_date_col = col
+                            break
+
+                if return_date_col is not None:
+                    return_df[return_date_col] = pd.to_datetime(return_df[return_date_col], errors="coerce")
+                    initial_return_count = len(return_df)
+
+                    # Check for valid dates before filtering
+                    valid_dates = return_df[return_date_col].notna()
+                    invalid_date_count = (~valid_dates).sum()
+
+                    if invalid_date_count > 0:
+                        st.warning(f"⚠️ Returns: {invalid_date_count:,} records have invalid/null dates in '{return_date_col}' column")
+
+                    # Filter by date range
+                    return_df = return_df[
+                        (return_df[return_date_col].dt.date >= start_date) &
+                        (return_df[return_date_col].dt.date <= end_date)
+                    ]
+                    filtered_return_count = len(return_df)
+
+                    if filtered_return_count == 0:
+                        st.error(f"❌ All return records filtered out! Initial: {initial_return_count:,} records, after date filter: 0 records.")
+                    elif initial_return_count != filtered_return_count:
+                        st.info(f"↩️ Filtered returns using '{return_date_col}': {initial_return_count:,} → {filtered_return_count:,} records")
+                else:
+                    st.warning("⚠️ Return table has no 'created_at' column; returns are not filtered by date range.")
+
         # Show summary of date filtering
         if selected_date_col != "-- None --" and start_date is not None and end_date is not None:
             st.success(f"✅ All data filtered by date range: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
@@ -2056,10 +2233,11 @@ def main():
     # Calculate payouts
     currency = config.get("currency_symbol", "RM")
     qr_order_payout_per_order = config.get("qr_order_payout_per_order", 1.80)
+    return_payout_per_parcel = config.get("return_payout_per_parcel", 1.50)
 
     display_df, numeric_df, total_payout = PayoutCalculator.calculate_payout(
         df, currency, penalty_data, pickup_df, pickup_payout_per_parcel,
-        qr_order_df, qr_order_payout_per_order
+        qr_order_df, qr_order_payout_per_order, return_df, return_payout_per_parcel
     )
 
     if numeric_df.empty:
@@ -2087,11 +2265,14 @@ def main():
     st.subheader("📈 Performance Overview")
     col1, col2, col3, col4 = st.columns(4)
     col5, col6, col7, col8 = st.columns(4)
+    col9, col10 = st.columns(2)
 
     total_pickup_parcels = int(numeric_df["Pickup Parcels"].sum()) if "Pickup Parcels" in numeric_df.columns else 0
     total_pickup_payout = numeric_df["Pickup Payout"].sum() if "Pickup Payout" in numeric_df.columns else 0.0
     total_qr_orders = int(numeric_df["QR Orders"].sum()) if "QR Orders" in numeric_df.columns else 0
     total_qr_order_payout = numeric_df["QR Order Payout"].sum() if "QR Order Payout" in numeric_df.columns else 0.0
+    total_return_parcels = int(numeric_df["Return Parcels"].sum()) if "Return Parcels" in numeric_df.columns else 0
+    total_return_payout = numeric_df["Return Payout"].sum() if "Return Payout" in numeric_df.columns else 0.0
     total_dispatch_payout = numeric_df["Dispatch Payout"].sum() if "Dispatch Payout" in numeric_df.columns else 0.0
 
     total_penalty = numeric_df["Penalty"].sum() if "Penalty" in numeric_df.columns else 0.0
@@ -2103,10 +2284,12 @@ def main():
     col2.metric("Delivery Parcels", f"{int(numeric_df['Parcels Delivered'].sum()):,}")
     col3.metric("Pickup Parcels", f"{total_pickup_parcels:,}")
     col4.metric("QR Orders", f"{total_qr_orders:,}")
-    col5.metric("Total Payout", f"{currency} {total_payout:,.2f}")
-    col6.metric("Dispatch Payout", f"{currency} {total_dispatch_payout:,.2f}")
-    col7.metric("Pickup Payout", f"{currency} {total_pickup_payout:,.2f}")
-    col8.metric("QR Order Payout", f"{currency} {total_qr_order_payout:,.2f}")
+    col5.metric("Return Parcels", f"{total_return_parcels:,}")
+    col6.metric("Total Payout", f"{currency} {total_payout:,.2f}")
+    col7.metric("Dispatch Payout", f"{currency} {total_dispatch_payout:,.2f}")
+    col8.metric("Pickup Payout", f"{currency} {total_pickup_payout:,.2f}")
+    col9.metric("QR Order Payout", f"{currency} {total_qr_order_payout:,.2f}")
+    col10.metric("Return Payout", f"{currency} {total_return_payout:,.2f}")
 
     # Penalty breakdown by type
     st.markdown("#### ⚠️ Penalty Breakdown by Type")
@@ -2157,6 +2340,7 @@ def main():
         "Dispatcher ID", "Dispatcher Name", "Parcels Delivered",
         "Dispatch Payout", "Pickup Parcels", "Pickup Payout",
         "QR Orders", "QR Order Payout",
+        "Return Parcels", "Return Payout",
         "Penalty", "DuitNow Penalty", "LDR Penalty", "Fake Attempt Penalty",
         "Total Payout", "Total Weight (kg)", "Avg Weight (kg)",
         "Avg Rate per Parcel", "Parcels 0-5kg", "Parcels 5.01-10kg",
