@@ -385,6 +385,18 @@ class DataSource:
                 return None
         return None
 
+    @staticmethod
+    def load_return_data(config: dict) -> Optional[pd.DataFrame]:
+        """Load Return data from Return sheet."""
+        data_source = config["data_source"]
+        if data_source["type"] == "gsheet" and data_source["gsheet_url"]:
+            try:
+                return DataSource.read_google_sheet(data_source["gsheet_url"], sheet_name="Return")
+            except Exception as exc:
+                st.warning(f"Could not load Return data: {exc}")
+                return None
+        return None
+
 
 # =============================================================================
 # PAYOUT CALCULATIONS
@@ -992,6 +1004,112 @@ class PayoutCalculator:
         return order_count, payout, valid_records
 
     @staticmethod
+    def calculate_return(return_df: pd.DataFrame, dispatcher_id: str, rate: float = 0.50) -> Tuple[int, float, pd.DataFrame]:
+        """
+        Counts total return parcels for selected dispatcher based on dispatcher_id column matching the dispatcher_id.
+        Filters out rows with empty or invalid waybill numbers.
+
+        Returns:
+            Tuple of (return_count, payout, filtered_return_df)
+        """
+        if return_df is None or return_df.empty or not dispatcher_id:
+            return 0, 0.0, pd.DataFrame()
+
+        # Find dispatcher column - handle multiple possible column name formats
+        dispatcher_col = None
+        possible_dispatcher_cols = [
+            "dispatcher_id", "Dispatcher ID", "dispatcher", "Dispatcher", "DISPATCHER_ID", "DISPATCHER ID"
+        ]
+        for col_name in possible_dispatcher_cols:
+            if col_name in return_df.columns:
+                dispatcher_col = col_name
+                break
+
+        # If not found, try case-insensitive search
+        if dispatcher_col is None:
+            for col in return_df.columns:
+                col_lower = str(col).lower().strip()
+                if "dispatcher" in col_lower and "id" in col_lower:
+                    dispatcher_col = col
+                    break
+
+        # Find waybill column - handle multiple possible column name formats
+        waybill_col = None
+        possible_waybill_cols = [
+            "waybill_number", "Waybill Number", "waybill", "Waybill", "WAYBILL_NUMBER", "WAYBILL NUMBER"
+        ]
+        for col_name in possible_waybill_cols:
+            if col_name in return_df.columns:
+                waybill_col = col_name
+                break
+
+        # If not found, try case-insensitive search
+        if waybill_col is None:
+            for col in return_df.columns:
+                col_lower = str(col).lower().strip()
+                if "waybill" in col_lower:
+                    waybill_col = col
+                    break
+
+        # Make sure required columns exist
+        if dispatcher_col is None or waybill_col is None:
+            return 0, 0.0, pd.DataFrame()
+
+        # Convert dispatcher_id to string for comparison
+        dispatcher_id_str = str(dispatcher_id).strip()
+
+        # Clean and prepare the dispatcher column
+        return_df = return_df.copy()
+        return_df[dispatcher_col] = return_df[dispatcher_col].astype(str).str.strip()
+
+        # Filter records for this dispatcher
+        matched_records = return_df[return_df[dispatcher_col] == dispatcher_id_str]
+
+        if matched_records.empty:
+            return 0, 0.0, pd.DataFrame()
+
+        # Count unique waybills - TREAT ALL WAYBILLS AS STRINGS
+        # Convert to string to preserve format
+        # Only filter out NaN values, keep everything else
+        def safe_waybill_to_string(value):
+            """Safely convert waybill to string, preserving original format."""
+            if pd.isna(value):
+                return None
+            # Handle numeric types (int/float) - convert to string without decimal notation
+            if isinstance(value, (int, float)):
+                # If it's a float with no decimal part, convert to int first
+                if isinstance(value, float) and value.is_integer():
+                    return str(int(value))
+                else:
+                    return str(value)
+            # For strings and other types, convert to string and strip
+            waybill_str = str(value).strip()
+            if waybill_str == "" or waybill_str.lower() == "nan":
+                return None
+            return waybill_str
+
+        waybill_strings = matched_records[waybill_col].apply(safe_waybill_to_string)
+
+        # Filter records to only include those with valid waybills
+        valid_waybill_mask = waybill_strings.notna() & (waybill_strings != "")
+        valid_records = matched_records[valid_waybill_mask].copy()
+
+        if valid_records.empty:
+            return 0, 0.0, pd.DataFrame()
+
+        # Convert waybill column to string in the returned DataFrame
+        # This ensures waybills are treated as strings and preserves format
+        if waybill_col in valid_records.columns:
+            valid_records[waybill_col] = valid_records[waybill_col].apply(safe_waybill_to_string)
+
+        # Count total return parcels (rows) - each row represents one return parcel
+        return_count = len(valid_records)
+
+        payout = round(return_count * rate, 2)
+
+        return return_count, payout, valid_records
+
+    @staticmethod
     def calculate_tiered_daily(filtered_df: pd.DataFrame, tiers_config: List,
                               kpi_config: List, special_rates_config: List,
                               attendance_config: dict, currency_symbol: str,
@@ -1484,6 +1602,8 @@ class InvoiceGenerator:
         pickup_parcels: int = 0,
         qr_order_payout: float = 0.0,
         qr_order_count: int = 0,
+        return_payout: float = 0.0,
+        return_count: int = 0,
         kpi_description: str = "",
         attendance_description: str = ""
     ) -> str:
@@ -1492,7 +1612,7 @@ class InvoiceGenerator:
         cleaned_name = clean_dispatcher_name(name)
 
         # Calculate final payout after advance
-        final_payout = gross_payout + pickup_payout + qr_order_payout - advance_payout
+        final_payout = gross_payout + pickup_payout + qr_order_payout + return_payout - advance_payout
 
         html_content = f"""
         <html>
@@ -1691,6 +1811,10 @@ class InvoiceGenerator:
                         <div class="value">{qr_order_count:,}</div>
                     </div>
                     <div class="chip">
+                        <div class="label">Return Parcels</div>
+                        <div class="value">{return_count:,}</div>
+                    </div>
+                    <div class="chip">
                         <div class="label">Working Days</div>
                         <div class="value">{total_days}</div>
                     </div>
@@ -1815,6 +1939,10 @@ class InvoiceGenerator:
                     <span>+ {currency_symbol} {qr_order_payout:,.2f}</span>
                 </div>
                 <div class="payout-row">
+                    <span>Return Payout ({return_count} parcel(s) × {currency_symbol}0.50):</span>
+                    <span>+ {currency_symbol} {return_payout:,.2f}</span>
+                </div>
+                <div class="payout-row">
                     <span>KPI Incentive Bonus:</span>
                     <span>+ {currency_symbol} {kpi_bonus:,.2f}</span>
                 </div>
@@ -1871,8 +1999,8 @@ class InvoiceGenerator:
         # Add gross payout calculation
         html_content += f"""
                 <div class="payout-row" style="border-top: 1px dashed var(--border); margin-top: 8px; padding-top: 8px;">
-                    <span><strong>Gross Payout (Delivery + Pickup + QR Order + Bonuses - Penalties):</strong></span>
-                    <span><strong>{currency_symbol} {gross_payout + pickup_payout + qr_order_payout:,.2f}</strong></span>
+                    <span><strong>Gross Payout (Delivery + Pickup + QR Order + Return + Bonuses - Penalties):</strong></span>
+                    <span><strong>{currency_symbol} {gross_payout + pickup_payout + qr_order_payout + return_payout:,.2f}</strong></span>
                 </div>
                 <div class="payout-row">
                     <span>{advance_payout_desc}:</span>
@@ -2227,6 +2355,7 @@ def main():
     # Load additional data sheets
     pickup_df = DataSource.load_pickup_data(config)
     qr_order_df = DataSource.load_qr_order_data(config)
+    return_df = DataSource.load_return_data(config)
     duitnow_df = DataSource.load_duitnow_penalty_data(config)
     ldr_df = DataSource.load_ldr_penalty_data(config)
     fake_attempt_df = DataSource.load_fake_attempt_penalty_data(config)
@@ -2252,6 +2381,8 @@ def main():
     pickup_parcels = 0
     qr_order_payout = 0.0
     qr_order_count = 0
+    return_payout = 0.0
+    return_count = 0
     kpi_description = ""
     attendance_desc = ""
     qualified_days = 0
@@ -2263,6 +2394,7 @@ def main():
     per_day_df = pd.DataFrame()
     pickup_filtered_df = pd.DataFrame()
     qr_order_filtered_df = pd.DataFrame()
+    return_filtered_df = pd.DataFrame()
 
     # Create tabs for different views
     tab1, tab2, tab3 = st.tabs(["📊 Payout Details", "📈 Performance Charts", "🧾 Invoice"])
@@ -2294,8 +2426,13 @@ def main():
                 qr_order_df, selected_dispatcher_id, rate=1.80
             )
 
-            # Calculate gross total payout (delivery + pickup + QR order + bonuses - penalties) - round to 2 decimal places
-            gross_total_payout = round(gross_delivery_payout + pickup_payout + qr_order_payout, 2)
+            # Calculate return payout (RM0.50 per return parcel)
+            return_count, return_payout, return_filtered_df = PayoutCalculator.calculate_return(
+                return_df, selected_dispatcher_id, rate=0.50
+            )
+
+            # Calculate gross total payout (delivery + pickup + QR order + return + bonuses - penalties) - round to 2 decimal places
+            gross_total_payout = round(gross_delivery_payout + pickup_payout + qr_order_payout + return_payout, 2)
 
             # Calculate advance payout (40% of base delivery payout only, not including pickup, bonuses, penalties)
             advance_payout = 0.0
@@ -2370,7 +2507,7 @@ def main():
             # Display bonuses and penalties
             st.subheader("🎯 Incentives & Penalties")
 
-            col1, col2, col3, col4, col5 = st.columns(5)
+            col1, col2, col3, col4, col5, col6 = st.columns(6)
 
             with col1:
                 st.metric(
@@ -2421,6 +2558,22 @@ def main():
                     )
 
             with col5:
+                if return_count > 0:
+                    st.metric(
+                        "Return Payout",
+                        f"{config['currency_symbol']}{return_payout:,.2f}",
+                        delta=f"{return_count} parcels",
+                        delta_color="normal"
+                    )
+                else:
+                    st.metric(
+                        "Return Payout",
+                        f"{config['currency_symbol']}0.00",
+                        delta="No returns",
+                        delta_color="off"
+                    )
+
+            with col6:
                 if penalty_breakdown['total_amount'] > 0:
                     st.metric(
                         "Total Penalty",
@@ -2563,6 +2716,71 @@ def main():
                 with st.expander("📱 QR Order Details", expanded=False):
                     st.info("No QR order records found for this dispatcher.")
 
+            # Display return details if available
+            if return_count > 0 and not return_filtered_df.empty:
+                with st.expander("📦 Return Details", expanded=False):
+                    st.info(f"**Total Return Parcels: {return_count}** | **Payout: {config['currency_symbol']}{return_payout:,.2f}** (RM0.50 per parcel)")
+
+                    # Clean up column names for display and remove unnamed columns
+                    display_return_df = return_filtered_df.copy()
+
+                    # Ensure Waybill Number is treated as string BEFORE filtering columns
+                    # This prevents scientific notation or number formatting
+                    # Use safe conversion to handle numeric waybills properly
+                    waybill_col_return = None
+                    for col in display_return_df.columns:
+                        if "waybill" in str(col).lower():
+                            waybill_col_return = col
+                            break
+
+                    if waybill_col_return:
+                        def safe_waybill_display(value):
+                            """Safely convert waybill to string for display, preserving format."""
+                            if pd.isna(value):
+                                return ""
+                            # Handle numeric types - remove .0 from floats
+                            if isinstance(value, (int, float)):
+                                if isinstance(value, float) and value.is_integer():
+                                    return str(int(value))
+                                return str(value)
+                            # For strings, return as-is
+                            return str(value).strip()
+
+                        display_return_df[waybill_col_return] = display_return_df[waybill_col_return].apply(safe_waybill_display)
+
+                    # Filter out unnamed columns (columns that start with "Unnamed" or are empty)
+                    valid_columns = [
+                        col for col in display_return_df.columns
+                        if not (str(col).startswith('Unnamed') or str(col).strip() == '' or str(col).lower() == 'nan')
+                    ]
+                    display_return_df = display_return_df[valid_columns]
+
+                    # Clean up column names for display
+                    display_return_df.columns = [str(col).title() for col in display_return_df.columns]
+
+                    # Configure column display - ensure waybill is shown as text (not number)
+                    column_config = {}
+                    # Find waybill column after title transformation
+                    waybill_col_display = None
+                    for col in display_return_df.columns:
+                        if "waybill" in col.lower():
+                            waybill_col_display = col
+                            break
+
+                    if waybill_col_display:
+                        column_config[waybill_col_display] = st.column_config.TextColumn(waybill_col_display)
+
+                    # Display the filtered return dataframe
+                    st.dataframe(
+                        display_return_df,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config=column_config if column_config else None
+                    )
+            else:
+                with st.expander("📦 Return Details", expanded=False):
+                    st.info("No return records found for this dispatcher.")
+
             # Display penalty details if any
             if penalty_breakdown['total_amount'] > 0:
                 with st.expander("⚠️ Penalty Details"):
@@ -2603,6 +2821,7 @@ def main():
                 **Additional Earnings:**
                 - Pickup ({pickup_parcels} parcels): +{config['currency_symbol']}{pickup_payout:,.2f}
                 - QR Order ({qr_order_count} orders): +{config['currency_symbol']}{qr_order_payout:,.2f}
+                - Return ({return_count} parcels): +{config['currency_symbol']}{return_payout:,.2f}
                 - Gross Total: {config['currency_symbol']}{gross_total_payout:,.2f}
                 """)
 
@@ -2684,6 +2903,8 @@ def main():
                 pickup_parcels=pickup_parcels,
                 qr_order_payout=qr_order_payout,
                 qr_order_count=qr_order_count,
+                return_payout=return_payout,
+                return_count=return_count,
                 kpi_description=kpi_description,
                 attendance_description=attendance_desc
             )
@@ -2734,12 +2955,14 @@ Total Delivery Parcels: {display_df['Total Parcel'].sum():,}
 Working Days: {len(display_df)}
 Pickup Parcels: {pickup_parcels:,}
 QR Orders: {qr_order_count:,}
+Return Parcels: {return_count:,}
 
 PAYOUT BREAKDOWN
 ----------------
 Base Delivery Payout: {config['currency_symbol']}{base_delivery_payout:,.2f}
 Pickup Payout: +{config['currency_symbol']}{pickup_payout:,.2f}
 QR Order Payout: +{config['currency_symbol']}{qr_order_payout:,.2f}
+Return Payout: +{config['currency_symbol']}{return_payout:,.2f}
 KPI Bonus: +{config['currency_symbol']}{kpi_bonus:,.2f}
 Attendance Bonus: +{config['currency_symbol']}{attendance_bonus:,.2f}
 Total Penalties: -{config['currency_symbol']}{penalty_breakdown['total_amount']:,.2f}

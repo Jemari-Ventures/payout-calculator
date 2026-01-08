@@ -1,7 +1,9 @@
 {
   "data_source": {
     "type": "postgres",
-    "gsheet_url": "https://docs.google.com/spreadsheets/d/1T24tNnDoRtkaE7i9tBLZrsNqWLE80An4/edit?usp=sharing&ouid=109319992457995119696&rtpof=true&sd=true"
+    "gsheet_url": "https://docs.google.com/spreadsheets/d/1T24tNnDoRtkaE7i9tBLZrsNqWLE80An4/edit?usp=sharing&ouid=109319992457995119696&rtpof=true&sd=true",
+    "postgres_table": "dispatch",
+    "pickup_table": "pickup"
   },
   "database": {
     "table_name": "dispatch"
@@ -86,5 +88,7 @@
     }
   ],
   "pickup_payout_per_parcel": 1.0,
-  "forecast_days": 15
+  "forecast_days": 15,
+  "qr_order_payout_per_order": 1.8,
+  "return_payout_per_parcel": 0.5
 }
