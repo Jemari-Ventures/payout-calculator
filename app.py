@@ -374,6 +374,18 @@ class DataSource:
         return None
 
     @staticmethod
+    def load_cod_penalty_data(config: dict) -> Optional[pd.DataFrame]:
+        """Load COD penalty data from COD sheet."""
+        data_source = config["data_source"]
+        if data_source["type"] == "gsheet" and data_source["gsheet_url"]:
+            try:
+                return DataSource.read_google_sheet(data_source["gsheet_url"], sheet_name="COD")
+            except Exception as exc:
+                st.warning(f"Could not load COD penalty data: {exc}")
+                return None
+        return None
+
+    @staticmethod
     def load_qr_order_data(config: dict) -> Optional[pd.DataFrame]:
         """Load QR Order data from QR Order sheet."""
         data_source = config["data_source"]
@@ -497,14 +509,16 @@ class PayoutCalculator:
     def calculate_penalty(dispatcher_id: str,
                          duitnow_df: Optional[pd.DataFrame] = None,
                          ldr_df: Optional[pd.DataFrame] = None,
-                         fake_df: Optional[pd.DataFrame] = None) -> Dict:
-        """Calculate total penalty for a dispatcher from three penalty sheets.
+                         fake_df: Optional[pd.DataFrame] = None,
+                         cod_df: Optional[pd.DataFrame] = None) -> Dict:
+        """Calculate total penalty for a dispatcher from penalty sheets.
 
         Args:
             dispatcher_id: The dispatcher ID to check
             duitnow_df: DataFrame from Sheet3 (DuitNow penalty)
             ldr_df: DataFrame from Sheet4 (LD&R penalty)
             fake_df: DataFrame from Sheet5 (Fake attempt penalty)
+            cod_df: DataFrame from COD sheet (COD penalty)
 
         Returns:
             Dictionary containing penalty breakdown by type
@@ -513,6 +527,7 @@ class PayoutCalculator:
             'duitnow': {'amount': 0.0, 'waybills': []},
             'ldr': {'amount': 0.0, 'count': 0, 'waybills': []},
             'fake_attempt': {'amount': 0.0, 'count': 0, 'waybills': []},
+            'cod': {'amount': 0.0, 'count': 0},
             'total_amount': 0.0,
             'total_count': 0
         }
@@ -769,16 +784,88 @@ class PayoutCalculator:
                         waybills = fake_rows[waybill_col].dropna().astype(str).str.strip().tolist()
                         penalty_breakdown['fake_attempt']['waybills'] = [wb for wb in waybills if wb and wb.lower() != 'nan']
 
+        # 4. Process COD penalty (COD sheet)
+        if cod_df is not None and not cod_df.empty:
+            dispatcher_id_col = None
+            # Try exact matches first
+            exact_matches = ["dispatcher_id", "Dispatcher ID", "DISPATCHER_ID", "DISPATCHER ID"]
+            for col in cod_df.columns:
+                col_str = str(col).strip()
+                if col_str in exact_matches:
+                    dispatcher_id_col = col
+                    break
+
+            # If not found, try normalized pattern matching
+            if dispatcher_id_col is None:
+                for col in cod_df.columns:
+                    col_normalized = str(col).upper().strip().replace(" ", "_").replace(".", "")
+                    if col_normalized == "DISPATCHERID" or col_normalized == "DISPATCHER_ID":
+                        dispatcher_id_col = col
+                        break
+
+            # If not found, try case-insensitive partial match
+            if dispatcher_id_col is None:
+                for col in cod_df.columns:
+                    col_upper = str(col).upper().strip()
+                    if "DISPATCHER" in col_upper and "ID" in col_upper:
+                        dispatcher_id_col = col
+                        break
+
+            if dispatcher_id_col is not None:
+                # Normalize both sides for comparison
+                cod_df_copy = cod_df.copy()
+                cod_df_copy[dispatcher_id_col] = cod_df_copy[dispatcher_id_col].astype(str).str.strip()
+                cod_rows = cod_df_copy[
+                    cod_df_copy[dispatcher_id_col] == dispatcher_id_normalized
+                ]
+
+                if not cod_rows.empty:
+                    penalty_col = None
+                    # Try exact matches first
+                    exact_penalty_matches = ["penalty", "Penalty", "PENALTY"]
+                    for col in cod_df.columns:
+                        col_str = str(col).strip()
+                        if col_str in exact_penalty_matches:
+                            penalty_col = col
+                            break
+
+                    # If not found, try normalized pattern matching
+                    if penalty_col is None:
+                        for col in cod_df.columns:
+                            col_normalized = str(col).upper().strip().replace(" ", "")
+                            if col_normalized == "PENALTY":
+                                penalty_col = col
+                                break
+
+                    # If not found, try case-insensitive partial match
+                    if penalty_col is None:
+                        for col in cod_df.columns:
+                            col_upper = str(col).upper().strip()
+                            if "PENALTY" in col_upper:
+                                penalty_col = col
+                                break
+
+                    if penalty_col is not None:
+                        # Convert penalty values, handling comma decimal separators
+                        penalty_values = cod_rows[penalty_col].apply(
+                            lambda x: PayoutCalculator._convert_to_float(x)
+                        )
+                        penalty_amount = penalty_values.sum()
+                        penalty_breakdown['cod']['amount'] = round(float(penalty_amount), 2)
+                        penalty_breakdown['cod']['count'] = len(cod_rows)
+
         # Calculate totals (round to 2 decimal places to avoid floating-point precision issues)
         penalty_breakdown['total_amount'] = round(
             penalty_breakdown['duitnow']['amount'] +
             penalty_breakdown['ldr']['amount'] +
-            penalty_breakdown['fake_attempt']['amount'],
+            penalty_breakdown['fake_attempt']['amount'] +
+            penalty_breakdown['cod']['amount'],
             2
         )
         penalty_breakdown['total_count'] = (
             penalty_breakdown['ldr']['count'] +
-            penalty_breakdown['fake_attempt']['count']
+            penalty_breakdown['fake_attempt']['count'] +
+            penalty_breakdown['cod']['count']
         )
 
         return penalty_breakdown
@@ -1115,7 +1202,8 @@ class PayoutCalculator:
                               attendance_config: dict, currency_symbol: str,
                               duitnow_df: Optional[pd.DataFrame] = None,
                               ldr_df: Optional[pd.DataFrame] = None,
-                              fake_df: Optional[pd.DataFrame] = None) -> Tuple:
+                              fake_df: Optional[pd.DataFrame] = None,
+                              cod_df: Optional[pd.DataFrame] = None) -> Tuple:
         """Calculate payout for tiered daily mode with KPI bonus, attendance bonus, and special rates."""
         tiers = []
         for tier in tiers_config:
@@ -1458,6 +1546,7 @@ class PayoutCalculator:
         penalty_breakdown = {'duitnow': {'amount': 0.0, 'waybills': []},
                            'ldr': {'amount': 0.0, 'count': 0, 'waybills': []},
                            'fake_attempt': {'amount': 0.0, 'count': 0, 'waybills': []},
+                           'cod': {'amount': 0.0, 'count': 0},
                            'total_amount': 0.0, 'total_count': 0}
 
         # Extract dispatcher_id with flexible column name matching
@@ -1472,7 +1561,7 @@ class PayoutCalculator:
 
         if dispatcher_id:
             penalty_breakdown = PayoutCalculator.calculate_penalty(
-                str(dispatcher_id), duitnow_df, ldr_df, fake_df
+                str(dispatcher_id), duitnow_df, ldr_df, fake_df, cod_df
             )
 
         # Calculate gross payout (base + bonuses - penalties) - round to 2 decimal places
@@ -1901,6 +1990,15 @@ class InvoiceGenerator:
                         </div>
                         """
 
+                # COD penalties
+                if penalty_breakdown['cod']['count'] > 0:
+                    html_content += f"""
+                        <div class="penalty-item">
+                            <span><strong>COD:</strong> {penalty_breakdown['cod']['count']} record(s)</span>
+                            <span>- {currency_symbol} {penalty_breakdown['cod']['amount']:,.2f}</span>
+                        </div>
+                    """
+
                 html_content += """
                         </div>
                     </div>
@@ -1995,6 +2093,13 @@ class InvoiceGenerator:
                     <div class="payout-row penalty-detail-row" style="font-size: 12px; padding-left: 40px;">
                         <span style="color: var(--text-secondary);">Waybills: {waybills_display}</span>
                     </div>"""
+
+            if penalty_breakdown['cod']['count'] > 0:
+                html_content += f"""
+                <div class="payout-row penalty-detail-row">
+                    <span>↳ COD ({penalty_breakdown['cod']['count']} record(s)):</span>
+                    <span>- {currency_symbol} {penalty_breakdown['cod']['amount']:,.2f}</span>
+                </div>"""
 
         # Add gross payout calculation
         html_content += f"""
@@ -2233,48 +2338,20 @@ def main():
     # Convert Delivery Signature to datetime
     df[delivery_sig_col] = pd.to_datetime(df[delivery_sig_col], errors="coerce")
 
-    # Sidebar for date selection
-    st.sidebar.title("📅 Date Range Selection")
-
-    # Get date range from data
+    # Get date range from data - use full range automatically
     valid_dates = df[delivery_sig_col].dropna()
     if not valid_dates.empty:
         min_date = valid_dates.min().date()
         max_date = valid_dates.max().date()
-        # Default to FULL RANGE to include ALL waybills
-        # User can adjust the date range if needed, but by default show everything
-        default_start = min_date
-        default_end = max_date
+        start_date = min_date
+        end_date = max_date
     else:
         # Fallback if no valid dates
         today = datetime.now().date()
         min_date = today - pd.Timedelta(days=365)
         max_date = today
-        default_start = min_date
-        default_end = max_date
-
-    start_date = st.sidebar.date_input(
-        "Start Date",
-        value=default_start,
-        min_value=min_date,
-        max_value=max_date,
-        help="Select the start date for the payout period"
-    )
-
-    end_date = st.sidebar.date_input(
-        "End Date",
-        value=default_end,
-        min_value=min_date,
-        max_value=max_date,
-        help="Select the end date for the payout period"
-    )
-
-    # Validate date range
-    if start_date > end_date:
-        st.sidebar.error("⚠️ Start date must be before end date")
-        add_footer()
-        return
-
+        start_date = min_date
+        end_date = max_date
 
     # Filter data by date range - but INCLUDE waybills with invalid/missing dates
     # This ensures ALL waybills are available, even if their dates can't be parsed
@@ -2294,11 +2371,11 @@ def main():
     df = df.drop(columns=["__delivery_date"], errors="ignore")
 
     if df.empty:
-        st.warning(f"No records found for the selected date range ({start_date.strftime('%B %d, %Y')} to {end_date.strftime('%B %d, %Y')}).")
+        st.warning(f"No records found in the data.")
         add_footer()
         return
 
-    st.caption(f"Showing deliveries from {start_date.strftime('%B %d, %Y')} to {end_date.strftime('%B %d, %Y')}.")
+    st.caption(f"Showing all deliveries from {start_date.strftime('%B %d, %Y')} to {end_date.strftime('%B %d, %Y')}.")
 
     st.subheader("👤 Dispatcher Selection")
     dispatcher_mapping = {}
@@ -2359,6 +2436,7 @@ def main():
     duitnow_df = DataSource.load_duitnow_penalty_data(config)
     ldr_df = DataSource.load_ldr_penalty_data(config)
     fake_attempt_df = DataSource.load_fake_attempt_penalty_data(config)
+    cod_df = DataSource.load_cod_penalty_data(config)
 
     # Calculate payout
     st.subheader(f"💰 Payout Calculation for {selected_dispatcher_name or selected_dispatcher_id}")
@@ -2390,6 +2468,7 @@ def main():
     penalty_breakdown = {'duitnow': {'amount': 0.0, 'waybills': []},
                         'ldr': {'amount': 0.0, 'count': 0, 'waybills': []},
                         'fake_attempt': {'amount': 0.0, 'count': 0, 'waybills': []},
+                        'cod': {'amount': 0.0, 'count': 0},
                         'total_amount': 0.0, 'total_count': 0}
     per_day_df = pd.DataFrame()
     pickup_filtered_df = pd.DataFrame()
@@ -2413,7 +2492,8 @@ def main():
                 config["currency_symbol"],
                 duitnow_df,
                 ldr_df,
-                fake_attempt_df
+                fake_attempt_df,
+                cod_df
             )
 
             # Calculate pickup payout (assuming RM1.00 per pickup parcel)
@@ -2784,7 +2864,7 @@ def main():
             # Display penalty details if any
             if penalty_breakdown['total_amount'] > 0:
                 with st.expander("⚠️ Penalty Details"):
-                    penalty_col1, penalty_col2, penalty_col3 = st.columns(3)
+                    penalty_col1, penalty_col2, penalty_col3, penalty_col4 = st.columns(4)
 
                     with penalty_col1:
                         if penalty_breakdown['duitnow']['amount'] > 0:
@@ -2801,6 +2881,10 @@ def main():
                             st.error(f"**Fake Attempt:** {penalty_breakdown['fake_attempt']['count']} parcel(s) - {config['currency_symbol']}{penalty_breakdown['fake_attempt']['amount']:,.2f}")
                             if penalty_breakdown['fake_attempt']['waybills']:
                                 st.caption(f"Waybills: {', '.join(penalty_breakdown['fake_attempt']['waybills'][:5])}")
+
+                    with penalty_col4:
+                        if penalty_breakdown['cod']['count'] > 0:
+                            st.error(f"**COD:** {penalty_breakdown['cod']['count']} record(s) - {config['currency_symbol']}{penalty_breakdown['cod']['amount']:,.2f}")
 
             # Display payout breakdown
             st.subheader("💰 Payout Breakdown")
