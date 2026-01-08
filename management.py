@@ -251,6 +251,8 @@ class DataSource:
                 column_mapping = {}  # No mapping needed, use original column names
             elif table_name == 'fake_attempt_penalty' or table_name.endswith('fake_attempt_penalty'):
                 column_mapping = {}  # No mapping needed, use original column names
+            elif table_name == 'cod_penalty' or table_name.endswith('cod_penalty'):
+                column_mapping = {}  # No mapping needed, use original column names
             elif table_name == 'qr_order' or table_name.endswith('qr_order'):
                 column_mapping = {}  # No mapping needed, use original column names
             elif table_name == 'return' or table_name.endswith('return'):
@@ -378,7 +380,7 @@ class DataSource:
         """Load penalty data from all penalty tables.
 
         Returns:
-            Dictionary with keys: 'duitnow', 'ldr', 'fake_attempt'
+            Dictionary with keys: 'duitnow', 'ldr', 'fake_attempt', 'cod'
         """
         engine = DataSource.get_postgres_engine()
         if not engine:
@@ -409,6 +411,14 @@ class DataSource:
                 penalty_data['fake_attempt'] = fake_attempt_df
         except Exception as exc:
             st.warning(f"Could not load Fake Attempt penalty data: {exc}")
+
+        # Load COD penalty
+        try:
+            cod_df = DataSource.read_postgres_table(engine, 'cod_penalty')
+            if not cod_df.empty:
+                penalty_data['cod'] = cod_df
+        except Exception as exc:
+            st.warning(f"Could not load COD penalty data: {exc}")
 
         return penalty_data if penalty_data else None
 
@@ -606,6 +616,23 @@ class PayoutCalculator:
                 if dispatcher_id_col:
                     df_processed['_dispatcher_id_normalized'] = df_processed[dispatcher_id_col].astype(str).str.strip().str.lower()
 
+            # Pre-process COD penalty data
+            elif penalty_type == 'cod':
+                dispatcher_id_col = next((col for col in df.columns if col.lower() == 'dispatcher_id'), None)
+                penalty_col = next((col for col in df.columns if col.lower() == 'penalty'), None)
+
+                if dispatcher_id_col:
+                    df_processed['_dispatcher_id_normalized'] = df_processed[dispatcher_id_col].astype(str).str.strip().str.lower()
+
+                if penalty_col:
+                    # Pre-convert penalty column to Decimal once (COD penalty is bigint, convert to Decimal for precision)
+                    if 'penalty_numeric' not in df_processed.columns:
+                        df_processed['penalty_numeric'] = df_processed[penalty_col].apply(
+                            lambda x: Decimal(str(x)) if pd.notna(x) else Decimal('0')
+                        )
+                    # Pre-filter positive penalties
+                    df_processed = df_processed[df_processed['penalty_numeric'] > 0].copy()
+
             processed[penalty_type] = df_processed
 
         return processed
@@ -717,6 +744,33 @@ class PayoutCalculator:
                     total_penalty += fake_attempt_penalty
                     total_count += waybill_count
 
+        # 4. COD Penalty: dispatcher_id column = dispatcher_id, penalty amount from penalty column (only positive amounts)
+        if 'cod' in penalty_data:
+            cod_df = penalty_data['cod']
+            if not cod_df.empty:
+                # Use pre-processed data if available
+                if '_dispatcher_id_normalized' in cod_df.columns:
+                    cod_records = cod_df[cod_df['_dispatcher_id_normalized'] == dispatcher_id_clean]
+                else:
+                    # Fallback to original logic if not pre-processed
+                    dispatcher_id_col = next((col for col in cod_df.columns if col.lower() == 'dispatcher_id'), None)
+                    if dispatcher_id_col:
+                        dispatcher_series = cod_df[dispatcher_id_col].astype(str).str.strip().str.lower()
+                        cod_records = cod_df[dispatcher_series == dispatcher_id_clean]
+                    else:
+                        cod_records = pd.DataFrame()
+
+                if not cod_records.empty and 'penalty_numeric' in cod_records.columns:
+                    # Round each penalty value first, then sum (matching SQL: SUM((FLOOR((penalty * 100) + 0.5) / 100)))
+                    # This ensures individual dispatcher totals match SQL calculation
+                    rounded_penalties = [
+                        penalty.quantize(Decimal('0.01'), rounding='ROUND_HALF_UP')
+                        for penalty in cod_records['penalty_numeric'].tolist()
+                    ]
+                    cod_penalty_rounded = sum(rounded_penalties)
+                    total_penalty += float(cod_penalty_rounded)  # Convert to float only at the end
+                    total_count += len(cod_records)
+
         return float(total_penalty), total_count, waybill_numbers
 
     @staticmethod
@@ -729,12 +783,13 @@ class PayoutCalculator:
             penalty_data: Dictionary containing penalty dataframes from all penalty tables
 
         Returns:
-            Dictionary with keys: 'duitnow', 'ldr', 'fake_attempt' and their penalty amounts
+            Dictionary with keys: 'duitnow', 'ldr', 'fake_attempt', 'cod' and their penalty amounts
         """
         breakdown = {
             'duitnow': 0.0,
             'ldr': 0.0,
-            'fake_attempt': 0.0
+            'fake_attempt': 0.0,
+            'cod': 0.0
         }
 
         if penalty_data is None or not penalty_data:
@@ -817,6 +872,31 @@ class PayoutCalculator:
 
                     breakdown['fake_attempt'] = waybill_count * 1.0  # RM 1.00 per waybill
 
+        # 4. COD Penalty: dispatcher_id column = dispatcher_id, penalty amount from penalty column (only positive amounts)
+        if 'cod' in penalty_data:
+            cod_df = penalty_data['cod']
+            if not cod_df.empty:
+                # Use pre-processed data if available
+                if '_dispatcher_id_normalized' in cod_df.columns:
+                    cod_records = cod_df[cod_df['_dispatcher_id_normalized'] == dispatcher_id_clean]
+                else:
+                    # Fallback to original logic if not pre-processed
+                    dispatcher_id_col = next((col for col in cod_df.columns if col.lower() == 'dispatcher_id'), None)
+                    if dispatcher_id_col:
+                        dispatcher_series = cod_df[dispatcher_id_col].astype(str).str.strip().str.lower()
+                        cod_records = cod_df[dispatcher_series == dispatcher_id_clean]
+                    else:
+                        cod_records = pd.DataFrame()
+
+                if not cod_records.empty and 'penalty_numeric' in cod_records.columns:
+                    # Round each penalty value first, then sum (matching SQL: SUM((FLOOR((penalty * 100) + 0.5) / 100)))
+                    # This ensures individual dispatcher totals match SQL calculation
+                    rounded_penalties = [
+                        penalty.quantize(Decimal('0.01'), rounding='ROUND_HALF_UP')
+                        for penalty in cod_records['penalty_numeric'].tolist()
+                    ]
+                    breakdown['cod'] = float(sum(rounded_penalties))
+
         return breakdown
 
     @staticmethod
@@ -828,12 +908,13 @@ class PayoutCalculator:
             penalty_data: Dictionary containing penalty dataframes from all penalty tables
 
         Returns:
-            Dictionary with keys: 'duitnow', 'ldr', 'fake_attempt' and their total amounts
+            Dictionary with keys: 'duitnow', 'ldr', 'fake_attempt', 'cod' and their total amounts
         """
         penalty_totals = {
             'duitnow': 0.0,
             'ldr': 0.0,
-            'fake_attempt': 0.0
+            'fake_attempt': 0.0,
+            'cod': 0.0
         }
 
         if penalty_data is None or not penalty_data:
@@ -911,6 +992,47 @@ class PayoutCalculator:
                 waybill_count = len(fake_attempt_df)
 
             penalty_totals['fake_attempt'] = waybill_count * 1.0  # RM 1.00 per waybill
+
+        # 4. COD Penalty: sum all penalty amounts (only positive amounts)
+        if 'cod' in penalty_data:
+            cod_df = penalty_data['cod']
+
+            # Check if dataframe is empty (might have been filtered out by date range)
+            if cod_df is None or cod_df.empty:
+                st.warning("⚠️ COD penalty dataframe is empty (may have been filtered out by date range)")
+                penalty_totals['cod'] = 0.0
+            else:
+                penalty_col = None
+                for col in cod_df.columns:
+                    if col.lower() == 'penalty':
+                        penalty_col = col
+                        break
+
+                if penalty_col:
+                    # Filter to only include records with positive penalty amounts
+                    # Use Decimal to preserve exact precision
+                    cod_df['penalty_numeric'] = cod_df[penalty_col].apply(
+                        lambda x: Decimal(str(x)) if pd.notna(x) else Decimal('0')
+                    )
+                    cod_filtered = cod_df[cod_df['penalty_numeric'] > 0]
+
+                    # Round each penalty value first, then sum (matching SQL: SUM((FLOOR((penalty * 100) + 0.5) / 100)))
+                    # This ensures the total matches SQL exactly
+                    if len(cod_filtered) > 0:
+                        rounded_penalties = [
+                            penalty.quantize(Decimal('0.01'), rounding='ROUND_HALF_UP')
+                            for penalty in cod_filtered['penalty_numeric'].tolist()
+                        ]
+                        penalty_totals['cod'] = float(sum(rounded_penalties))
+                    else:
+                        # Show diagnostic info if no positive penalties found
+                        total_records = len(cod_df)
+                        sample_penalties = cod_df[penalty_col].head(5).tolist()
+                        st.warning(f"⚠️ No positive penalty amounts found in COD data. Total records: {total_records}, Sample values: {sample_penalties}")
+                        penalty_totals['cod'] = 0.0
+                else:
+                    st.error(f"❌ 'penalty' column not found in COD data. Available columns: {list(cod_df.columns)}")
+                    penalty_totals['cod'] = 0.0
 
         return penalty_totals
 
@@ -1219,6 +1341,7 @@ class PayoutCalculator:
         grouped['duitnow_penalty'] = 0.0
         grouped['ldr_penalty'] = 0.0
         grouped['fake_attempt_penalty'] = 0.0
+        grouped['cod_penalty'] = 0.0
 
         if penalty_data is not None:
             # Pre-process penalty dataframes once for better performance
@@ -1239,12 +1362,13 @@ class PayoutCalculator:
                     'penalty_waybills': ', '.join(penalty_waybills) if penalty_waybills else '',
                     'duitnow_penalty': penalty_breakdown['duitnow'],
                     'ldr_penalty': penalty_breakdown['ldr'],
-                    'fake_attempt_penalty': penalty_breakdown['fake_attempt']
+                    'fake_attempt_penalty': penalty_breakdown['fake_attempt'],
+                    'cod_penalty': penalty_breakdown['cod']
                 })
 
             penalty_results = grouped.apply(calculate_penalties, axis=1)
             grouped[['penalty_amount', 'penalty_count', 'penalty_waybills',
-                     'duitnow_penalty', 'ldr_penalty', 'fake_attempt_penalty']] = penalty_results
+                     'duitnow_penalty', 'ldr_penalty', 'fake_attempt_penalty', 'cod_penalty']] = penalty_results
 
         # Calculate pickup payout
         grouped = PayoutCalculator.calculate_pickup_payout(pickup_df, grouped, pickup_payout_per_parcel)
@@ -1274,6 +1398,7 @@ class PayoutCalculator:
             "duitnow_penalty": "DuitNow Penalty",
             "ldr_penalty": "LDR Penalty",
             "fake_attempt_penalty": "Fake Attempt Penalty",
+            "cod_penalty": "COD Penalty",
             "pickup_parcels": "Pickup Parcels",
             "pickup_payout": "Pickup Payout",
             "qr_order_count": "QR Orders",
@@ -1299,6 +1424,8 @@ class PayoutCalculator:
             display_df["LDR Penalty"] = display_df["LDR Penalty"].apply(lambda x: f"-{currency_symbol}{x:,.2f}" if x > 0 else f"{currency_symbol}0.00")
         if "Fake Attempt Penalty" in display_df.columns:
             display_df["Fake Attempt Penalty"] = display_df["Fake Attempt Penalty"].apply(lambda x: f"-{currency_symbol}{x:,.2f}" if x > 0 else f"{currency_symbol}0.00")
+        if "COD Penalty" in display_df.columns:
+            display_df["COD Penalty"] = display_df["COD Penalty"].apply(lambda x: f"-{currency_symbol}{x:,.2f}" if x > 0 else f"{currency_symbol}0.00")
         display_df["Pickup Payout"] = display_df["Pickup Payout"].apply(lambda x: f"{currency_symbol}{x:,.2f}")
         if "QR Order Payout" in display_df.columns:
             display_df["QR Order Payout"] = display_df["QR Order Payout"].apply(lambda x: f"{currency_symbol}{x:,.2f}")
@@ -2150,6 +2277,40 @@ def main():
                 else:
                     st.warning("⚠️ Fake Attempt penalty table has no detectable date column; penalties are not filtered by date range.")
 
+            # Filter COD penalty
+            if 'cod' in penalty_data and penalty_data['cod'] is not None and not penalty_data['cod'].empty:
+                cod_df = penalty_data['cod']
+                cod_date_col = None
+                # Try to find date column (prefer 'date' column, fallback to 'created_at')
+                if 'date' in cod_df.columns:
+                    cod_date_col = 'date'
+                elif 'created_at' in cod_df.columns:
+                    cod_date_col = 'created_at'
+                else:
+                    # Try case-insensitive search
+                    for col in cod_df.columns:
+                        col_lower = str(col).lower()
+                        if col_lower in ['date', 'created_at']:
+                            cod_date_col = col
+                            break
+                        elif any(k in col_lower for k in ["date", "time", "delivery", "signature", "updated_at"]):
+                            cod_date_col = col
+                            break
+
+                if cod_date_col is not None:
+                    cod_df[cod_date_col] = pd.to_datetime(cod_df[cod_date_col], errors="coerce")
+                    initial_cod_count = len(cod_df)
+                    cod_df = cod_df[
+                        (cod_df[cod_date_col].dt.date >= start_date) &
+                        (cod_df[cod_date_col].dt.date <= end_date)
+                    ]
+                    filtered_cod_count = len(cod_df)
+                    penalty_data['cod'] = cod_df
+                    if initial_cod_count != filtered_cod_count:
+                        st.info(f"⚠️ Filtered COD penalty: {initial_cod_count:,} → {filtered_cod_count:,} records")
+                else:
+                    st.warning("⚠️ COD penalty table has no detectable date column; penalties are not filtered by date range.")
+
             # Filter QR order data by selected date range
             if qr_order_df is not None and not qr_order_df.empty:
                 qr_order_date_col = None
@@ -2278,7 +2439,7 @@ def main():
     total_penalty = numeric_df["Penalty"].sum() if "Penalty" in numeric_df.columns else 0.0
 
     # Calculate penalty breakdown by type
-    penalty_by_type = PayoutCalculator.calculate_penalty_by_type(penalty_data) if penalty_data else {'duitnow': 0.0, 'ldr': 0.0, 'fake_attempt': 0.0}
+    penalty_by_type = PayoutCalculator.calculate_penalty_by_type(penalty_data) if penalty_data else {'duitnow': 0.0, 'ldr': 0.0, 'fake_attempt': 0.0, 'cod': 0.0}
 
     col1.metric("Dispatchers", f"{len(display_df):,}")
     col2.metric("Delivery Parcels", f"{int(numeric_df['Parcels Delivered'].sum()):,}")
@@ -2293,13 +2454,15 @@ def main():
 
     # Penalty breakdown by type
     st.markdown("#### ⚠️ Penalty Breakdown by Type")
-    penalty_col1, penalty_col2, penalty_col3 = st.columns(3)
+    penalty_col1, penalty_col2, penalty_col3, penalty_col4 = st.columns(4)
     with penalty_col1:
         st.metric("DuitNow Penalty", f"-{currency} {penalty_by_type['duitnow']:,.2f}")
     with penalty_col2:
         st.metric("LDR Penalty", f"-{currency} {penalty_by_type['ldr']:,.2f}")
     with penalty_col3:
         st.metric("Fake Attempt Penalty", f"-{currency} {penalty_by_type['fake_attempt']:,.2f}")
+    with penalty_col4:
+        st.metric("COD Penalty", f"-{currency} {penalty_by_type['cod']:,.2f}")
 
     # Charts
     st.markdown("---")
@@ -2341,7 +2504,7 @@ def main():
         "Dispatch Payout", "Pickup Parcels", "Pickup Payout",
         "QR Orders", "QR Order Payout",
         "Return Parcels", "Return Payout",
-        "Penalty", "DuitNow Penalty", "LDR Penalty", "Fake Attempt Penalty",
+        "Penalty", "DuitNow Penalty", "LDR Penalty", "Fake Attempt Penalty", "COD Penalty",
         "Total Payout", "Total Weight (kg)", "Avg Weight (kg)",
         "Avg Rate per Parcel", "Parcels 0-5kg", "Parcels 5.01-10kg",
         "Parcels 10.01-30kg", "Parcels 30+kg"
