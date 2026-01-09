@@ -1260,7 +1260,8 @@ class PayoutCalculator:
                         qr_order_df: Optional[pd.DataFrame] = None,
                         qr_order_payout_per_order: float = 1.80,
                         return_df: Optional[pd.DataFrame] = None,
-                        return_payout_per_parcel: float = 1.50) -> Tuple[pd.DataFrame, pd.DataFrame, float]:
+                        return_payout_per_parcel: float = 1.50,
+                        processing_warnings: Optional[List[str]] = None) -> Tuple[pd.DataFrame, pd.DataFrame, float]:
         """Calculate payout using tier-based weight calculation."""
         # Prepare data
         df_clean = DataProcessor.prepare_dataframe(df)
@@ -1292,7 +1293,6 @@ class PayoutCalculator:
         raw_weight = df_clean['weight'].sum()
         dedup_weight = df_unique['weight'].sum()
         duplicates = len(df_clean) - len(df_unique)
-        st.info(f"Weight totals – Raw: {raw_weight:,.2f} kg | Deduplicated: {dedup_weight:,.2f} kg | Duplicate rows: {duplicates}")
 
         # Add tier columns
         tiers = Config.load().get("weight_tiers", Config.DEFAULT_CONFIG["weight_tiers"])
@@ -1390,7 +1390,7 @@ class PayoutCalculator:
             "total_weight": "Total Weight (kg)",
             "avg_weight": "Avg Weight (kg)",
             "avg_rate": "Avg Rate per Parcel",
-            "dispatch_payout": "Dispatch Payout",
+            "dispatch_payout": "Delivery Parcels Payout",
             "total_payout": "Total Payout",
             "penalty_amount": "Penalty",
             "penalty_count": "Penalty Parcels",
@@ -1400,11 +1400,11 @@ class PayoutCalculator:
             "fake_attempt_penalty": "Fake Attempt Penalty",
             "cod_penalty": "COD Penalty",
             "pickup_parcels": "Pickup Parcels",
-            "pickup_payout": "Pickup Payout",
+            "pickup_payout": "Pickup Parcels Payout",
             "qr_order_count": "QR Orders",
-            "qr_order_payout": "QR Order Payout",
+            "qr_order_payout": "QR Orders Payout",
             "return_parcels": "Return Parcels",
-            "return_payout": "Return Payout",
+            "return_payout": "Return Parcels Payout",
             "tier1_parcels": "Parcels 0-5kg",
             "tier2_parcels": "Parcels 5.01-10kg",
             "tier3_parcels": "Parcels 10.01-30kg",
@@ -1415,7 +1415,7 @@ class PayoutCalculator:
         display_df["Total Weight (kg)"] = display_df["Total Weight (kg)"].apply(lambda x: f"{x:.2f}")
         display_df["Avg Weight (kg)"] = display_df["Avg Weight (kg)"].apply(lambda x: f"{x:.2f}")
         display_df["Avg Rate per Parcel"] = display_df["Avg Rate per Parcel"].apply(lambda x: f"{currency_symbol}{x:.2f}")
-        display_df["Dispatch Payout"] = display_df["Dispatch Payout"].apply(lambda x: f"{currency_symbol}{x:,.2f}")
+        display_df["Delivery Parcels Payout"] = display_df["Delivery Parcels Payout"].apply(lambda x: f"{currency_symbol}{x:,.2f}")
         display_df["Total Payout"] = display_df["Total Payout"].apply(lambda x: f"{currency_symbol}{x:,.2f}")
         display_df["Penalty"] = display_df["Penalty"].apply(lambda x: f"-{currency_symbol}{x:,.2f}" if x > 0 else f"{currency_symbol}0.00")
         if "DuitNow Penalty" in display_df.columns:
@@ -1426,11 +1426,11 @@ class PayoutCalculator:
             display_df["Fake Attempt Penalty"] = display_df["Fake Attempt Penalty"].apply(lambda x: f"-{currency_symbol}{x:,.2f}" if x > 0 else f"{currency_symbol}0.00")
         if "COD Penalty" in display_df.columns:
             display_df["COD Penalty"] = display_df["COD Penalty"].apply(lambda x: f"-{currency_symbol}{x:,.2f}" if x > 0 else f"{currency_symbol}0.00")
-        display_df["Pickup Payout"] = display_df["Pickup Payout"].apply(lambda x: f"{currency_symbol}{x:,.2f}")
-        if "QR Order Payout" in display_df.columns:
-            display_df["QR Order Payout"] = display_df["QR Order Payout"].apply(lambda x: f"{currency_symbol}{x:,.2f}")
-        if "Return Payout" in display_df.columns:
-            display_df["Return Payout"] = display_df["Return Payout"].apply(lambda x: f"{currency_symbol}{x:,.2f}")
+        display_df["Pickup Parcels Payout"] = display_df["Pickup Parcels Payout"].apply(lambda x: f"{currency_symbol}{x:,.2f}")
+        if "QR Orders Payout" in display_df.columns:
+            display_df["QR Orders Payout"] = display_df["QR Orders Payout"].apply(lambda x: f"{currency_symbol}{x:,.2f}")
+        if "Return Parcels Payout" in display_df.columns:
+            display_df["Return Parcels Payout"] = display_df["Return Parcels Payout"].apply(lambda x: f"{currency_symbol}{x:,.2f}")
 
         # Keep Penalty Waybills and Penalty Parcels in numeric_df but remove from display_df
         if "Penalty Waybills" in display_df.columns:
@@ -1439,21 +1439,29 @@ class PayoutCalculator:
             display_df = display_df.drop(columns=["Penalty Parcels"])
 
         total_payout = numeric_df["Total Payout"].sum()
-        st.success(f"✅ Processed {len(df_unique)} unique parcels from {len(grouped)} dispatchers")
+
+        with st.expander("📊 Processing Details", expanded=False):
+            # Display any processing warnings
+            if processing_warnings:
+                for warning in processing_warnings:
+                    st.warning(warning)
+
+            st.info(f"Weight totals – Raw: {raw_weight:,.2f} kg | Deduplicated: {dedup_weight:,.2f} kg | Duplicate rows: {duplicates}")
+            st.success(f"✅ Processed {len(df_unique)} unique parcels from {len(grouped)} dispatchers")
 
         # Calculate breakdown for info message
-        total_dispatch_payout = numeric_df["Dispatch Payout"].sum()
-        total_pickup_payout = numeric_df["Pickup Payout"].sum()
-        total_qr_order_payout = numeric_df["QR Order Payout"].sum() if "QR Order Payout" in numeric_df.columns else 0.0
-        total_return_payout = numeric_df["Return Payout"].sum() if "Return Payout" in numeric_df.columns else 0.0
+        total_dispatch_payout = numeric_df["Delivery Parcels Payout"].sum()
+        total_pickup_payout = numeric_df["Pickup Parcels Payout"].sum()
+        total_qr_order_payout = numeric_df["QR Orders Payout"].sum() if "QR Orders Payout" in numeric_df.columns else 0.0
+        total_return_payout = numeric_df["Return Parcels Payout"].sum() if "Return Parcels Payout" in numeric_df.columns else 0.0
         total_penalty = numeric_df["Penalty"].sum()
 
         st.info(f"""
         💰 **Payout Breakdown:**
-        - Dispatch Payout: {currency_symbol} {total_dispatch_payout:,.2f}
-        + Pickup Payout: {currency_symbol} {total_pickup_payout:,.2f}
-        + QR Order Payout: {currency_symbol} {total_qr_order_payout:,.2f}
-        + Return Payout: {currency_symbol} {total_return_payout:,.2f}
+        - Delivery Parcels Payout: {currency_symbol} {total_dispatch_payout:,.2f}
+        + Pickup Parcels Payout: {currency_symbol} {total_pickup_payout:,.2f}
+        + QR Orders Payout: {currency_symbol} {total_qr_order_payout:,.2f}
+        + Return Parcels Payout: {currency_symbol} {total_return_payout:,.2f}
         - Penalties: {currency_symbol} {total_penalty:,.2f}
         **Total Payout: {currency_symbol} {total_payout:,.2f}**
         """)
@@ -1461,32 +1469,75 @@ class PayoutCalculator:
         return display_df, numeric_df, total_payout
 
     @staticmethod
-    def get_daily_trend(df: pd.DataFrame) -> pd.DataFrame:
+    def get_daily_trend(df: pd.DataFrame, date_col: Optional[str] = None) -> pd.DataFrame:
         """Get daily parcel delivery trend."""
-        date_col = find_column(df, 'date')
-        if date_col:
+        # If date_col is provided, use it; otherwise try to find it
+        if date_col is None:
+            date_col = find_column(df, 'date')
+
+        # If still not found, try to find any date-like column
+        if date_col is None or date_col not in df.columns:
+            # Try common date column names
+            for col in df.columns:
+                col_lower = str(col).lower()
+                if any(keyword in col_lower for keyword in ["date", "signature", "delivery_signature", "delivery_signature_date"]):
+                    # Check if it has date-like values
+                    sample = df[col].dropna().head(10)
+                    if len(sample) > 0:
+                        try:
+                            pd.to_datetime(sample, errors='raise')
+                            date_col = col
+                            break
+                        except:
+                            continue
+
+        if date_col and date_col in df.columns:
             df_copy = df.copy()
             df_copy[date_col] = pd.to_datetime(df_copy[date_col], errors="coerce")
-            daily_df = df_copy.groupby(df_copy[date_col].dt.date).size().reset_index(name='total_parcels')
-            daily_df = daily_df.rename(columns={date_col: 'signature_date'})
-            return daily_df.sort_values('signature_date')
+            # Filter out invalid dates
+            df_copy = df_copy[df_copy[date_col].notna()]
+            if not df_copy.empty:
+                daily_df = df_copy.groupby(df_copy[date_col].dt.date).size().reset_index(name='total_parcels')
+                daily_df = daily_df.rename(columns={date_col: 'signature_date'})
+                return daily_df.sort_values('signature_date')
         return pd.DataFrame()
 
     @staticmethod
-    def get_daily_payout_trend(df: pd.DataFrame) -> pd.DataFrame:
+    def get_daily_payout_trend(df: pd.DataFrame, date_col: Optional[str] = None) -> pd.DataFrame:
         """Get daily payout trend."""
-        date_col = find_column(df, 'date')
-        if date_col:
+        # If date_col is provided, use it; otherwise try to find it
+        if date_col is None:
+            date_col = find_column(df, 'date')
+
+        # If still not found, try to find any date-like column
+        if date_col is None or date_col not in df.columns:
+            # Try common date column names
+            for col in df.columns:
+                col_lower = str(col).lower()
+                if any(keyword in col_lower for keyword in ["date", "signature", "delivery_signature", "delivery_signature_date"]):
+                    # Check if it has date-like values
+                    sample = df[col].dropna().head(10)
+                    if len(sample) > 0:
+                        try:
+                            pd.to_datetime(sample, errors='raise')
+                            date_col = col
+                            break
+                        except:
+                            continue
+
+        if date_col and date_col in df.columns:
             df_copy = df.copy()
             df_copy[date_col] = pd.to_datetime(df_copy[date_col], errors="coerce")
-
-            # Calculate total payout per day (sum of all payouts)
-            daily_df = df_copy.groupby(df_copy[date_col].dt.date).agg(
-                total_payout=('payout', 'sum'),
-                parcel_count=(date_col, 'size')
-            ).reset_index()
-            daily_df = daily_df.rename(columns={date_col: 'signature_date'})
-            return daily_df.sort_values('signature_date')
+            # Filter out invalid dates
+            df_copy = df_copy[df_copy[date_col].notna()]
+            if not df_copy.empty and 'payout' in df_copy.columns:
+                # Calculate total payout per day (sum of all payouts)
+                daily_df = df_copy.groupby(df_copy[date_col].dt.date).agg(
+                    total_payout=('payout', 'sum'),
+                    parcel_count=(date_col, 'size')
+                ).reset_index()
+                daily_df = daily_df.rename(columns={date_col: 'signature_date'})
+                return daily_df.sort_values('signature_date')
         return pd.DataFrame()
 
 # =============================================================================
@@ -1652,23 +1703,26 @@ class DataVisualizer:
     @staticmethod
     def create_performers_chart(numeric_df: pd.DataFrame) -> alt.Chart:
         """Create top performers bar chart."""
-        top_10 = numeric_df.head(10)
+        # Sort by Total Payout descending and take top 10
+        top_10 = numeric_df.sort_values('Total Payout', ascending=False).head(10)
         return alt.Chart(top_10).mark_bar(color=ColorScheme.PRIMARY).encode(
             y=alt.Y('Dispatcher Name:N', title='Dispatcher', sort='-x'),
-            x=alt.X('Parcels Delivered:Q', title='Parcels Delivered'),
-            color=alt.Color('Parcels Delivered:Q', scale=alt.Scale(scheme='blues'), legend=None),
+            x=alt.X('Total Payout:Q', title='Total Payout'),
+            color=alt.Color('Total Payout:Q', scale=alt.Scale(scheme='blues'), legend=None),
             tooltip=[
                 'Dispatcher Name:N',
                 'Parcels Delivered:Q',
                 alt.Tooltip('Total Weight (kg):Q', format=',.2f'),
                 alt.Tooltip('Total Payout:Q', format=',.2f')
             ]
-        )
+        ).properties(title='Payout Performance', height=300, width=400)
 
     @staticmethod
     def create_payout_distribution(numeric_df: pd.DataFrame) -> alt.Chart:
         """Create payout distribution donut chart."""
-        return alt.Chart(numeric_df).mark_arc(innerRadius=50).encode(
+        # Sort by Total Payout descending for consistent ordering
+        sorted_df = numeric_df.sort_values('Total Payout', ascending=False)
+        return alt.Chart(sorted_df).mark_arc(innerRadius=50).encode(
             theta=alt.Theta(field="Total Payout", type="quantitative"),
             color=alt.Color(field="Dispatcher Name", type="nominal",
                           scale=alt.Scale(range=ColorScheme.CHART_COLORS),
@@ -1707,17 +1761,17 @@ class InvoiceGenerator:
             total_parcels = int(numeric_df["Parcels Delivered"].sum())
             total_dispatchers = len(numeric_df)
             total_weight = numeric_df["Total Weight (kg)"].sum()
-            total_dispatch_payout = numeric_df["Dispatch Payout"].sum() if "Dispatch Payout" in numeric_df.columns else 0.0
-            total_pickup_payout = numeric_df["Pickup Payout"].sum() if "Pickup Payout" in numeric_df.columns else 0.0
+            total_dispatch_payout = numeric_df["Delivery Parcels Payout"].sum() if "Delivery Parcels Payout" in numeric_df.columns else 0.0
+            total_pickup_payout = numeric_df["Pickup Parcels Payout"].sum() if "Pickup Parcels Payout" in numeric_df.columns else 0.0
             total_pickup_parcels = int(numeric_df["Pickup Parcels"].sum()) if "Pickup Parcels" in numeric_df.columns else 0
-            total_return_payout = numeric_df["Return Payout"].sum() if "Return Payout" in numeric_df.columns else 0.0
+            total_return_payout = numeric_df["Return Parcels Payout"].sum() if "Return Parcels Payout" in numeric_df.columns else 0.0
             total_return_parcels = int(numeric_df["Return Parcels"].sum()) if "Return Parcels" in numeric_df.columns else 0
             total_penalty = numeric_df["Penalty"].sum() if "Penalty" in numeric_df.columns else 0.0
             top_3 = display_df.head(3)
 
             table_columns = ["Dispatcher ID", "Dispatcher Name", "Parcels Delivered",
-                           "Dispatch Payout", "Pickup Parcels", "Pickup Payout",
-                           "Return Parcels", "Return Payout",
+                           "Delivery Parcels Payout", "Pickup Parcels", "Pickup Parcels Payout",
+                           "Return Parcels", "Return Parcels Payout",
                            "Penalty", "Total Payout"]
 
             html = f"""
@@ -1831,7 +1885,7 @@ class InvoiceGenerator:
                             <div class="value">{total_parcels:,}</div>
                         </div>
                         <div class="chip">
-                            <div class="label">Dispatch Payout</div>
+                            <div class="label">Delivery Parcels Payout</div>
                             <div class="value">{currency_symbol} {total_dispatch_payout:,.2f}</div>
                         </div>
                         <div class="chip">
@@ -1866,15 +1920,15 @@ class InvoiceGenerator:
                     <div style="margin-top:3rem">
                         <table style="width:100%; background:var(--surface); border-radius:8px; margin-top:2rem; border:1px solid var(--border)">
                             <tr><th style="background:var(--primary);color:white;text-align:left;">Summary</th><th style="background:var(--primary);color:white;text-align:right;">Amount</th></tr>
-                            <tr><td>Total Dispatch Payout</td><td style="text-align:right;">{currency_symbol} {total_dispatch_payout:,.2f}</td></tr>
-                            <tr><td>Pickup Payout</td><td style="text-align:right;">{currency_symbol} {total_pickup_payout:,.2f}</td></tr>
-                            <tr><td>Return Payout</td><td style="text-align:right;">{currency_symbol} {total_return_payout:,.2f}</td></tr>
+                            <tr><td>Total Delivery Parcels Payout</td><td style="text-align:right;">{currency_symbol} {total_dispatch_payout:,.2f}</td></tr>
+                            <tr><td>Pickup Parcels Payout</td><td style="text-align:right;">{currency_symbol} {total_pickup_payout:,.2f}</td></tr>
+                            <tr><td>Return Parcels Payout</td><td style="text-align:right;">{currency_symbol} {total_return_payout:,.2f}</td></tr>
                             <tr><td>Total Penalty</td><td style="text-align:right;">-{currency_symbol} {total_penalty:,.2f}</td></tr>
                             <tr><td><strong>Total Payout</strong></td><td style="text-align:right;"><strong>{currency_symbol} {total_payout:,.2f}</strong></td></tr>
                         </table>
                     </div>
                     <div class="note">
-                        Generated on {datetime.now().strftime('%Y-%m-%d at %H:%M')} • JMR Management Dashboard v2.1<br>
+                        Generated on {datetime.now().strftime('%Y-%m-%d at %H:%M')} • JMR Management Dashboard v2.2<br>
                         <em>Payout calculated using tier-based weight system + pickup parcel count</em>
                     </div>
                 </div>
@@ -1911,7 +1965,7 @@ def add_footer():
     st.markdown(f"""
     <div style="margin-top: 3rem; padding: 1.5rem; background: linear-gradient(135deg, {ColorScheme.PRIMARY}, {ColorScheme.PRIMARY_LIGHT});
                 color: white; text-align: center; border-radius: 12px;">
-        © 2025 Jemari Ventures. All rights reserved. | JMR Management Dashboard v2.1
+        © 2026 Jemari Ventures. All rights reserved. | JMR Management Dashboard v2.2
     </div>
     """, unsafe_allow_html=True)
 
@@ -1921,7 +1975,7 @@ def add_footer():
 
 def main():
     """Main application."""
-    st.set_page_config(page_title="JMR Management Dashboard", page_icon="📊", layout="wide")
+    st.set_page_config(page_title="JMR Management Dashboard", page_icon="📊", layout="wide", initial_sidebar_state="collapsed")
     apply_custom_styles()
 
     # Header
@@ -2029,13 +2083,13 @@ def main():
     - 10-30kg: RM2.70
     - 30kg+: RM4.00
 
-    **📦 Pickup Payout:**
+    **📦 Pickup Parcels Payout:**
     - RM{pickup_payout_per_parcel:.2f} per parcel
 
-    **📱 QR Order Payout:**
+    **📱 QR Orders Payout:**
     - RM{qr_order_payout_per_order:.2f} per order
 
-    **↩️ Return Payout:**
+    **↩️ Return Parcels Payout:**
     - RM{return_payout_per_parcel:.2f} per parcel
 
     **📈 Forecast Period:**
@@ -2063,6 +2117,8 @@ def main():
     # Initialize date range variables
     start_date = None
     end_date = None
+    date_col_to_use = None  # Track the date column used for filtering
+    processing_warnings = []  # Store warnings to display in Processing Details
 
     if selected_date_col != "-- None --":
         # Track dispatchers before date filtering
@@ -2125,7 +2181,8 @@ def main():
                     # Combine filtered data with dispatchers that have invalid dates
                     df = pd.concat([df_filtered, dispatchers_with_invalid_dates], ignore_index=True)
                 else:
-                    st.warning(f"⚠️ {len(lost_dispatchers)} dispatcher(s) have no valid dates in '{selected_date_col}' and will show 0 parcels: {sorted(lost_dispatchers)}")
+                    # Store warning message to be displayed in Processing Details
+                    processing_warnings.append(f"⚠️ {len(lost_dispatchers)} dispatcher(s) have no valid dates in '{selected_date_col}' and will show 0 parcels: {sorted(lost_dispatchers)}")
                     df = df_filtered
             else:
                 df = df_filtered
@@ -2145,251 +2202,255 @@ def main():
 
     # Filter all data by selected date range if a date column is selected
     if selected_date_col != "-- None --" and start_date is not None and end_date is not None:
-        # Filter pickup_df by selected month/date range
-        if pickup_df is not None and not pickup_df.empty:
-            pickup_date_col = None
-            for col in pickup_df.columns:
-                if any(k in str(col).lower() for k in ["date", "pick_up", "pickup", "signature"]):
-                    pickup_date_col = col
-                    break
-
-            if pickup_date_col is not None:
-                pickup_df[pickup_date_col] = pd.to_datetime(pickup_df[pickup_date_col], errors="coerce")
-                initial_pickup_count = len(pickup_df)
-                pickup_df = pickup_df[
-                    (pickup_df[pickup_date_col].dt.date >= start_date) &
-                    (pickup_df[pickup_date_col].dt.date <= end_date)
-                ]
-                filtered_pickup_count = len(pickup_df)
-                if initial_pickup_count != filtered_pickup_count:
-                    st.info(f"📦 Filtered pickup data: {initial_pickup_count:,} → {filtered_pickup_count:,} records")
-            else:
-                st.warning("⚠️ Pickup table has no detectable date column; pickup parcels are not filtered by date range.")
-
-        # Filter penalty data by selected date range
-        if penalty_data is not None:
-            # Filter DuitNow penalty - use created_at column for date filtering
-            if 'duitnow' in penalty_data and penalty_data['duitnow'] is not None and not penalty_data['duitnow'].empty:
-                duitnow_df = penalty_data['duitnow']
-                duitnow_date_col = None
-
-                # Explicitly look for created_at column for DuitNow penalty
-                if 'created_at' in duitnow_df.columns:
-                    duitnow_date_col = 'created_at'
-                else:
-                    # Try case-insensitive search
-                    for col in duitnow_df.columns:
-                        if str(col).lower() == "created_at":
-                            duitnow_date_col = col
-                            break
-
-                # If created_at not found, try other date columns as fallback
-                if duitnow_date_col is None:
-                    for col in duitnow_df.columns:
-                        col_lower = str(col).lower()
-                        if any(k in col_lower for k in ["date", "time", "delivery", "signature", "updated_at"]):
-                            duitnow_date_col = col
-                            break
-
-                if duitnow_date_col is not None:
-                    duitnow_df[duitnow_date_col] = pd.to_datetime(duitnow_df[duitnow_date_col], errors="coerce")
-                    initial_duitnow_count = len(duitnow_df)
-
-                    # Check for valid dates before filtering
-                    valid_dates = duitnow_df[duitnow_date_col].notna()
-                    invalid_date_count = (~valid_dates).sum()
-
-                    if invalid_date_count > 0:
-                        st.warning(f"⚠️ DuitNow: {invalid_date_count:,} records have invalid/null dates in '{duitnow_date_col}' column")
-
-                    # Show date range of data before filtering
-                    if valid_dates.any():
-                        min_date_in_data = duitnow_df[valid_dates][duitnow_date_col].min().date()
-                        max_date_in_data = duitnow_df[valid_dates][duitnow_date_col].max().date()
-                        st.info(f"📅 DuitNow date range in data: {min_date_in_data} to {max_date_in_data} (filtering: {start_date} to {end_date})")
-
-                    # Filter by date range
-                    duitnow_df = duitnow_df[
-                        (duitnow_df[duitnow_date_col].dt.date >= start_date) &
-                        (duitnow_df[duitnow_date_col].dt.date <= end_date)
-                    ]
-                    filtered_duitnow_count = len(duitnow_df)
-                    penalty_data['duitnow'] = duitnow_df
-
-                    if filtered_duitnow_count == 0:
-                        st.error(f"❌ All DuitNow penalty records filtered out! Initial: {initial_duitnow_count:,} records, after date filter: 0 records. Date range might not match data dates.")
-                    elif initial_duitnow_count != filtered_duitnow_count:
-                        st.info(f"⚠️ Filtered DuitNow penalty using '{duitnow_date_col}': {initial_duitnow_count:,} → {filtered_duitnow_count:,} records")
-                    else:
-                        st.info(f"ℹ️ DuitNow penalty filtered using '{duitnow_date_col}' column (all {initial_duitnow_count:,} records within date range)")
-                else:
-                    st.warning("⚠️ DuitNow penalty table has no 'created_at' column or other detectable date column; penalties are not filtered by date range.")
-
-            # Filter LDR penalty
-            if 'ldr' in penalty_data and penalty_data['ldr'] is not None and not penalty_data['ldr'].empty:
-                ldr_df = penalty_data['ldr']
-                ldr_date_col = None
-                # Try to find date columns in LDR data
-                for col in ldr_df.columns:
-                    col_lower = str(col).lower()
-                    if any(k in col_lower for k in ["date", "time", "delivery", "signature", "created_at", "updated_at"]):
-                        ldr_date_col = col
+        with st.expander("📋 Data Filtering Details", expanded=False):
+            # Filter pickup_df by selected month/date range
+            if pickup_df is not None and not pickup_df.empty:
+                pickup_date_col = None
+                for col in pickup_df.columns:
+                    if any(k in str(col).lower() for k in ["date", "pick_up", "pickup", "signature"]):
+                        pickup_date_col = col
                         break
 
-                if ldr_date_col is not None:
-                    ldr_df[ldr_date_col] = pd.to_datetime(ldr_df[ldr_date_col], errors="coerce")
-                    initial_ldr_count = len(ldr_df)
-                    ldr_df = ldr_df[
-                        (ldr_df[ldr_date_col].dt.date >= start_date) &
-                        (ldr_df[ldr_date_col].dt.date <= end_date)
+                if pickup_date_col is not None:
+                    pickup_df[pickup_date_col] = pd.to_datetime(pickup_df[pickup_date_col], errors="coerce")
+                    initial_pickup_count = len(pickup_df)
+                    pickup_df = pickup_df[
+                        (pickup_df[pickup_date_col].dt.date >= start_date) &
+                        (pickup_df[pickup_date_col].dt.date <= end_date)
                     ]
-                    filtered_ldr_count = len(ldr_df)
-                    penalty_data['ldr'] = ldr_df
-                    if initial_ldr_count != filtered_ldr_count:
-                        st.info(f"⚠️ Filtered LDR penalty: {initial_ldr_count:,} → {filtered_ldr_count:,} records")
+                    filtered_pickup_count = len(pickup_df)
+                    if initial_pickup_count != filtered_pickup_count:
+                        st.info(f"📦 Filtered pickup data: {initial_pickup_count:,} → {filtered_pickup_count:,} records")
                 else:
-                    st.warning("⚠️ LDR penalty table has no detectable date column; penalties are not filtered by date range.")
+                    st.warning("⚠️ Pickup table has no detectable date column; pickup parcels are not filtered by date range.")
 
-            # Filter Fake Attempt penalty
-            if 'fake_attempt' in penalty_data and penalty_data['fake_attempt'] is not None and not penalty_data['fake_attempt'].empty:
-                fake_attempt_df = penalty_data['fake_attempt']
-                fake_attempt_date_col = None
-                # Try to find time_delivery or other date columns
-                for col in fake_attempt_df.columns:
-                    col_lower = str(col).lower()
-                    if any(k in col_lower for k in ["time_delivery", "date", "time", "delivery", "signature", "created_at", "updated_at"]):
-                        fake_attempt_date_col = col
-                        # Prefer time_delivery if it exists
-                        if col_lower == "time_delivery":
-                            break
+            # Filter penalty data by selected date range
+            if penalty_data is not None:
+                # Filter DuitNow penalty - use created_at column for date filtering
+                if 'duitnow' in penalty_data and penalty_data['duitnow'] is not None and not penalty_data['duitnow'].empty:
+                    duitnow_df = penalty_data['duitnow']
+                    duitnow_date_col = None
 
-                if fake_attempt_date_col is not None:
-                    fake_attempt_df[fake_attempt_date_col] = pd.to_datetime(fake_attempt_df[fake_attempt_date_col], errors="coerce")
-                    initial_fake_count = len(fake_attempt_df)
-                    fake_attempt_df = fake_attempt_df[
-                        (fake_attempt_df[fake_attempt_date_col].dt.date >= start_date) &
-                        (fake_attempt_df[fake_attempt_date_col].dt.date <= end_date)
-                    ]
-                    filtered_fake_count = len(fake_attempt_df)
-                    penalty_data['fake_attempt'] = fake_attempt_df
-                    if initial_fake_count != filtered_fake_count:
-                        st.info(f"⚠️ Filtered Fake Attempt penalty: {initial_fake_count:,} → {filtered_fake_count:,} records")
-                else:
-                    st.warning("⚠️ Fake Attempt penalty table has no detectable date column; penalties are not filtered by date range.")
+                    # Explicitly look for created_at column for DuitNow penalty
+                    if 'created_at' in duitnow_df.columns:
+                        duitnow_date_col = 'created_at'
+                    else:
+                        # Try case-insensitive search
+                        for col in duitnow_df.columns:
+                            if str(col).lower() == "created_at":
+                                duitnow_date_col = col
+                                break
 
-            # Filter COD penalty
-            if 'cod' in penalty_data and penalty_data['cod'] is not None and not penalty_data['cod'].empty:
-                cod_df = penalty_data['cod']
-                cod_date_col = None
-                # Try to find date column (prefer 'date' column, fallback to 'created_at')
-                if 'date' in cod_df.columns:
-                    cod_date_col = 'date'
-                elif 'created_at' in cod_df.columns:
-                    cod_date_col = 'created_at'
-                else:
-                    # Try case-insensitive search
-                    for col in cod_df.columns:
+                    # If created_at not found, try other date columns as fallback
+                    if duitnow_date_col is None:
+                        for col in duitnow_df.columns:
+                            col_lower = str(col).lower()
+                            if any(k in col_lower for k in ["date", "time", "delivery", "signature", "updated_at"]):
+                                duitnow_date_col = col
+                                break
+
+                    if duitnow_date_col is not None:
+                        duitnow_df[duitnow_date_col] = pd.to_datetime(duitnow_df[duitnow_date_col], errors="coerce")
+                        initial_duitnow_count = len(duitnow_df)
+
+                        # Check for valid dates before filtering
+                        valid_dates = duitnow_df[duitnow_date_col].notna()
+                        invalid_date_count = (~valid_dates).sum()
+
+                        if invalid_date_count > 0:
+                            st.warning(f"⚠️ DuitNow: {invalid_date_count:,} records have invalid/null dates in '{duitnow_date_col}' column")
+
+                        # Show date range of data before filtering
+                        if valid_dates.any():
+                            min_date_in_data = duitnow_df[valid_dates][duitnow_date_col].min().date()
+                            max_date_in_data = duitnow_df[valid_dates][duitnow_date_col].max().date()
+                            st.info(f"📅 DuitNow date range in data: {min_date_in_data} to {max_date_in_data} (filtering: {start_date} to {end_date})")
+
+                        # Filter by date range
+                        duitnow_df = duitnow_df[
+                            (duitnow_df[duitnow_date_col].dt.date >= start_date) &
+                            (duitnow_df[duitnow_date_col].dt.date <= end_date)
+                        ]
+                        filtered_duitnow_count = len(duitnow_df)
+                        penalty_data['duitnow'] = duitnow_df
+
+                        if filtered_duitnow_count == 0:
+                            st.error(f"❌ All DuitNow penalty records filtered out! Initial: {initial_duitnow_count:,} records, after date filter: 0 records. Date range might not match data dates.")
+                        elif initial_duitnow_count != filtered_duitnow_count:
+                            st.info(f"⚠️ Filtered DuitNow penalty using '{duitnow_date_col}': {initial_duitnow_count:,} → {filtered_duitnow_count:,} records")
+                        else:
+                            st.info(f"ℹ️ DuitNow penalty filtered using '{duitnow_date_col}' column (all {initial_duitnow_count:,} records within date range)")
+                    else:
+                        st.warning("⚠️ DuitNow penalty table has no 'created_at' column or other detectable date column; penalties are not filtered by date range.")
+
+                # Filter LDR penalty
+                if 'ldr' in penalty_data and penalty_data['ldr'] is not None and not penalty_data['ldr'].empty:
+                    ldr_df = penalty_data['ldr']
+                    ldr_date_col = None
+                    # Try to find date columns in LDR data
+                    for col in ldr_df.columns:
                         col_lower = str(col).lower()
-                        if col_lower in ['date', 'created_at']:
-                            cod_date_col = col
-                            break
-                        elif any(k in col_lower for k in ["date", "time", "delivery", "signature", "updated_at"]):
-                            cod_date_col = col
+                        if any(k in col_lower for k in ["date", "time", "delivery", "signature", "created_at", "updated_at"]):
+                            ldr_date_col = col
                             break
 
-                if cod_date_col is not None:
-                    cod_df[cod_date_col] = pd.to_datetime(cod_df[cod_date_col], errors="coerce")
-                    initial_cod_count = len(cod_df)
-                    cod_df = cod_df[
-                        (cod_df[cod_date_col].dt.date >= start_date) &
-                        (cod_df[cod_date_col].dt.date <= end_date)
-                    ]
-                    filtered_cod_count = len(cod_df)
-                    penalty_data['cod'] = cod_df
-                    if initial_cod_count != filtered_cod_count:
-                        st.info(f"⚠️ Filtered COD penalty: {initial_cod_count:,} → {filtered_cod_count:,} records")
-                else:
-                    st.warning("⚠️ COD penalty table has no detectable date column; penalties are not filtered by date range.")
+                    if ldr_date_col is not None:
+                        ldr_df[ldr_date_col] = pd.to_datetime(ldr_df[ldr_date_col], errors="coerce")
+                        initial_ldr_count = len(ldr_df)
+                        ldr_df = ldr_df[
+                            (ldr_df[ldr_date_col].dt.date >= start_date) &
+                            (ldr_df[ldr_date_col].dt.date <= end_date)
+                        ]
+                        filtered_ldr_count = len(ldr_df)
+                        penalty_data['ldr'] = ldr_df
+                        if initial_ldr_count != filtered_ldr_count:
+                            st.info(f"⚠️ Filtered LDR penalty: {initial_ldr_count:,} → {filtered_ldr_count:,} records")
+                    else:
+                        st.warning("⚠️ LDR penalty table has no detectable date column; penalties are not filtered by date range.")
 
-            # Filter QR order data by selected date range
-            if qr_order_df is not None and not qr_order_df.empty:
-                qr_order_date_col = None
-                # Explicitly look for created_at column for QR orders
-                if 'created_at' in qr_order_df.columns:
-                    qr_order_date_col = 'created_at'
-                else:
-                    # Try case-insensitive search
-                    for col in qr_order_df.columns:
-                        if str(col).lower() == "created_at":
-                            qr_order_date_col = col
-                            break
+                # Filter Fake Attempt penalty
+                if 'fake_attempt' in penalty_data and penalty_data['fake_attempt'] is not None and not penalty_data['fake_attempt'].empty:
+                    fake_attempt_df = penalty_data['fake_attempt']
+                    fake_attempt_date_col = None
+                    # Try to find time_delivery or other date columns
+                    for col in fake_attempt_df.columns:
+                        col_lower = str(col).lower()
+                        if any(k in col_lower for k in ["time_delivery", "date", "time", "delivery", "signature", "created_at", "updated_at"]):
+                            fake_attempt_date_col = col
+                            # Prefer time_delivery if it exists
+                            if col_lower == "time_delivery":
+                                break
 
-                if qr_order_date_col is not None:
-                    qr_order_df[qr_order_date_col] = pd.to_datetime(qr_order_df[qr_order_date_col], errors="coerce")
-                    initial_qr_count = len(qr_order_df)
+                    if fake_attempt_date_col is not None:
+                        fake_attempt_df[fake_attempt_date_col] = pd.to_datetime(fake_attempt_df[fake_attempt_date_col], errors="coerce")
+                        initial_fake_count = len(fake_attempt_df)
+                        fake_attempt_df = fake_attempt_df[
+                            (fake_attempt_df[fake_attempt_date_col].dt.date >= start_date) &
+                            (fake_attempt_df[fake_attempt_date_col].dt.date <= end_date)
+                        ]
+                        filtered_fake_count = len(fake_attempt_df)
+                        penalty_data['fake_attempt'] = fake_attempt_df
+                        if initial_fake_count != filtered_fake_count:
+                            st.info(f"⚠️ Filtered Fake Attempt penalty: {initial_fake_count:,} → {filtered_fake_count:,} records")
+                    else:
+                        st.warning("⚠️ Fake Attempt penalty table has no detectable date column; penalties are not filtered by date range.")
 
-                    # Check for valid dates before filtering
-                    valid_dates = qr_order_df[qr_order_date_col].notna()
-                    invalid_date_count = (~valid_dates).sum()
+                # Filter COD penalty
+                if 'cod' in penalty_data and penalty_data['cod'] is not None and not penalty_data['cod'].empty:
+                    cod_df = penalty_data['cod']
+                    cod_date_col = None
+                    # Try to find date column (prefer 'date' column, fallback to 'created_at')
+                    if 'date' in cod_df.columns:
+                        cod_date_col = 'date'
+                    elif 'created_at' in cod_df.columns:
+                        cod_date_col = 'created_at'
+                    else:
+                        # Try case-insensitive search
+                        for col in cod_df.columns:
+                            col_lower = str(col).lower()
+                            if col_lower in ['date', 'created_at']:
+                                cod_date_col = col
+                                break
+                            elif any(k in col_lower for k in ["date", "time", "delivery", "signature", "updated_at"]):
+                                cod_date_col = col
+                                break
 
-                    if invalid_date_count > 0:
-                        st.warning(f"⚠️ QR Orders: {invalid_date_count:,} records have invalid/null dates in '{qr_order_date_col}' column")
+                    if cod_date_col is not None:
+                        cod_df[cod_date_col] = pd.to_datetime(cod_df[cod_date_col], errors="coerce")
+                        initial_cod_count = len(cod_df)
+                        cod_df = cod_df[
+                            (cod_df[cod_date_col].dt.date >= start_date) &
+                            (cod_df[cod_date_col].dt.date <= end_date)
+                        ]
+                        filtered_cod_count = len(cod_df)
+                        penalty_data['cod'] = cod_df
+                        if initial_cod_count != filtered_cod_count:
+                            st.info(f"⚠️ Filtered COD penalty: {initial_cod_count:,} → {filtered_cod_count:,} records")
+                    else:
+                        st.warning("⚠️ COD penalty table has no detectable date column; penalties are not filtered by date range.")
 
-                    # Filter by date range
-                    qr_order_df = qr_order_df[
-                        (qr_order_df[qr_order_date_col].dt.date >= start_date) &
-                        (qr_order_df[qr_order_date_col].dt.date <= end_date)
-                    ]
-                    filtered_qr_count = len(qr_order_df)
+                # Filter QR order data by selected date range
+                if qr_order_df is not None and not qr_order_df.empty:
+                    qr_order_date_col = None
+                    # Explicitly look for created_at column for QR orders
+                    if 'created_at' in qr_order_df.columns:
+                        qr_order_date_col = 'created_at'
+                    else:
+                        # Try case-insensitive search
+                        for col in qr_order_df.columns:
+                            if str(col).lower() == "created_at":
+                                qr_order_date_col = col
+                                break
 
-                    if filtered_qr_count == 0:
-                        st.error(f"❌ All QR order records filtered out! Initial: {initial_qr_count:,} records, after date filter: 0 records.")
-                    elif initial_qr_count != filtered_qr_count:
-                        st.info(f"📦 Filtered QR orders using '{qr_order_date_col}': {initial_qr_count:,} → {filtered_qr_count:,} records")
-                else:
-                    st.warning("⚠️ QR order table has no 'created_at' column; QR orders are not filtered by date range.")
+                    if qr_order_date_col is not None:
+                        qr_order_df[qr_order_date_col] = pd.to_datetime(qr_order_df[qr_order_date_col], errors="coerce")
+                        initial_qr_count = len(qr_order_df)
 
-            # Filter return data by selected date range
-            if return_df is not None and not return_df.empty:
-                return_date_col = None
-                # Explicitly look for created_at column for returns
-                if 'created_at' in return_df.columns:
-                    return_date_col = 'created_at'
-                else:
-                    # Try case-insensitive search
-                    for col in return_df.columns:
-                        if str(col).lower() == "created_at":
-                            return_date_col = col
-                            break
+                        # Check for valid dates before filtering
+                        valid_dates = qr_order_df[qr_order_date_col].notna()
+                        invalid_date_count = (~valid_dates).sum()
 
-                if return_date_col is not None:
-                    return_df[return_date_col] = pd.to_datetime(return_df[return_date_col], errors="coerce")
-                    initial_return_count = len(return_df)
+                        if invalid_date_count > 0:
+                            st.warning(f"⚠️ QR Orders: {invalid_date_count:,} records have invalid/null dates in '{qr_order_date_col}' column")
 
-                    # Check for valid dates before filtering
-                    valid_dates = return_df[return_date_col].notna()
-                    invalid_date_count = (~valid_dates).sum()
+                        # Filter by date range
+                        qr_order_df = qr_order_df[
+                            (qr_order_df[qr_order_date_col].dt.date >= start_date) &
+                            (qr_order_df[qr_order_date_col].dt.date <= end_date)
+                        ]
+                        filtered_qr_count = len(qr_order_df)
 
-                    if invalid_date_count > 0:
-                        st.warning(f"⚠️ Returns: {invalid_date_count:,} records have invalid/null dates in '{return_date_col}' column")
+                        if filtered_qr_count == 0:
+                            st.error(f"❌ All QR order records filtered out! Initial: {initial_qr_count:,} records, after date filter: 0 records.")
+                        elif initial_qr_count != filtered_qr_count:
+                            st.info(f"📦 Filtered QR orders using '{qr_order_date_col}': {initial_qr_count:,} → {filtered_qr_count:,} records")
+                    else:
+                        st.warning("⚠️ QR order table has no 'created_at' column; QR orders are not filtered by date range.")
 
-                    # Filter by date range
-                    return_df = return_df[
-                        (return_df[return_date_col].dt.date >= start_date) &
-                        (return_df[return_date_col].dt.date <= end_date)
-                    ]
-                    filtered_return_count = len(return_df)
+                # Filter return data by selected date range
+                if return_df is not None and not return_df.empty:
+                    return_date_col = None
+                    # Check for mapped column name first (Created At), then original (created_at)
+                    if 'Created At' in return_df.columns:
+                        return_date_col = 'Created At'
+                    elif 'created_at' in return_df.columns:
+                        return_date_col = 'created_at'
+                    else:
+                        # Try case-insensitive search
+                        for col in return_df.columns:
+                            col_lower = str(col).lower()
+                            if col_lower == "created_at" or col_lower == "created at":
+                                return_date_col = col
+                                break
 
-                    if filtered_return_count == 0:
-                        st.error(f"❌ All return records filtered out! Initial: {initial_return_count:,} records, after date filter: 0 records.")
-                    elif initial_return_count != filtered_return_count:
-                        st.info(f"↩️ Filtered returns using '{return_date_col}': {initial_return_count:,} → {filtered_return_count:,} records")
-                else:
-                    st.warning("⚠️ Return table has no 'created_at' column; returns are not filtered by date range.")
+                    if return_date_col is not None:
+                        return_df[return_date_col] = pd.to_datetime(return_df[return_date_col], errors="coerce")
+                        initial_return_count = len(return_df)
 
-        # Show summary of date filtering
-        if selected_date_col != "-- None --" and start_date is not None and end_date is not None:
-            st.success(f"✅ All data filtered by date range: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
+                        # Check for valid dates before filtering
+                        valid_dates = return_df[return_date_col].notna()
+                        invalid_date_count = (~valid_dates).sum()
+
+                        if invalid_date_count > 0:
+                            st.warning(f"⚠️ Returns: {invalid_date_count:,} records have invalid/null dates in '{return_date_col}' column")
+
+                        # Filter by date range
+                        return_df = return_df[
+                            (return_df[return_date_col].dt.date >= start_date) &
+                            (return_df[return_date_col].dt.date <= end_date)
+                        ]
+                        filtered_return_count = len(return_df)
+
+                        if filtered_return_count == 0:
+                            st.error(f"❌ All return records filtered out! Initial: {initial_return_count:,} records, after date filter: 0 records.")
+                        elif initial_return_count != filtered_return_count:
+                            st.info(f"↩️ Filtered returns using '{return_date_col}': {initial_return_count:,} → {filtered_return_count:,} records")
+                    else:
+                        st.warning("⚠️ Return table has no 'created_at' column; returns are not filtered by date range.")
+
+            # Show summary of date filtering
+            if selected_date_col != "-- None --" and start_date is not None and end_date is not None:
+                st.success(f"✅ All data filtered by date range: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
 
     # Calculate payouts
     currency = config.get("currency_symbol", "RM")
@@ -2398,7 +2459,8 @@ def main():
 
     display_df, numeric_df, total_payout = PayoutCalculator.calculate_payout(
         df, currency, penalty_data, pickup_df, pickup_payout_per_parcel,
-        qr_order_df, qr_order_payout_per_order, return_df, return_payout_per_parcel
+        qr_order_df, qr_order_payout_per_order, return_df, return_payout_per_parcel,
+        processing_warnings=processing_warnings
     )
 
     if numeric_df.empty:
@@ -2407,7 +2469,15 @@ def main():
         return
 
     # Get daily trends for forecasting
-    daily_parcel_df = PayoutCalculator.get_daily_trend(df)
+    # Use the date column that was used for filtering, or try to find it
+    forecast_date_col = date_col_to_use if date_col_to_use and date_col_to_use in df.columns else None
+    daily_parcel_df = PayoutCalculator.get_daily_trend(df, forecast_date_col)
+
+    # Debug info
+    if daily_parcel_df.empty:
+        st.warning(f"⚠️ No daily trend data available. Date column used: {forecast_date_col if forecast_date_col else 'auto-detected'}. Total rows in df: {len(df)}")
+    elif len(daily_parcel_df) < 7:
+        st.warning(f"⚠️ Only {len(daily_parcel_df)} unique dates found in data. Need at least 7 days for forecasting.")
 
     # Calculate daily payout trend (requires additional processing)
     df_clean = DataProcessor.prepare_dataframe(df)
@@ -2420,37 +2490,50 @@ def main():
         )
         df_clean['payout'] = df_clean['payout_rate']
 
-        daily_payout_df = PayoutCalculator.get_daily_payout_trend(df_clean)
+        daily_payout_df = PayoutCalculator.get_daily_payout_trend(df_clean, forecast_date_col)
 
     # Metrics - Updated to include Pickup Payout per Parcel
     st.subheader("📈 Performance Overview")
-    col1, col2, col3, col4 = st.columns(4)
-    col5, col6, col7, col8 = st.columns(4)
-    col9, col10 = st.columns(2)
 
+    # Calculate totals
     total_pickup_parcels = int(numeric_df["Pickup Parcels"].sum()) if "Pickup Parcels" in numeric_df.columns else 0
-    total_pickup_payout = numeric_df["Pickup Payout"].sum() if "Pickup Payout" in numeric_df.columns else 0.0
+    total_pickup_payout = numeric_df["Pickup Parcels Payout"].sum() if "Pickup Parcels Payout" in numeric_df.columns else 0.0
     total_qr_orders = int(numeric_df["QR Orders"].sum()) if "QR Orders" in numeric_df.columns else 0
-    total_qr_order_payout = numeric_df["QR Order Payout"].sum() if "QR Order Payout" in numeric_df.columns else 0.0
+    total_qr_order_payout = numeric_df["QR Orders Payout"].sum() if "QR Orders Payout" in numeric_df.columns else 0.0
     total_return_parcels = int(numeric_df["Return Parcels"].sum()) if "Return Parcels" in numeric_df.columns else 0
-    total_return_payout = numeric_df["Return Payout"].sum() if "Return Payout" in numeric_df.columns else 0.0
-    total_dispatch_payout = numeric_df["Dispatch Payout"].sum() if "Dispatch Payout" in numeric_df.columns else 0.0
+    total_return_payout = numeric_df["Return Parcels Payout"].sum() if "Return Parcels Payout" in numeric_df.columns else 0.0
+    total_dispatch_payout = numeric_df["Delivery Parcels Payout"].sum() if "Delivery Parcels Payout" in numeric_df.columns else 0.0
 
     total_penalty = numeric_df["Penalty"].sum() if "Penalty" in numeric_df.columns else 0.0
 
     # Calculate penalty breakdown by type
     penalty_by_type = PayoutCalculator.calculate_penalty_by_type(penalty_data) if penalty_data else {'duitnow': 0.0, 'ldr': 0.0, 'fake_attempt': 0.0, 'cod': 0.0}
 
-    col1.metric("Dispatchers", f"{len(display_df):,}")
-    col2.metric("Delivery Parcels", f"{int(numeric_df['Parcels Delivered'].sum()):,}")
-    col3.metric("Pickup Parcels", f"{total_pickup_parcels:,}")
-    col4.metric("QR Orders", f"{total_qr_orders:,}")
-    col5.metric("Return Parcels", f"{total_return_parcels:,}")
-    col6.metric("Total Payout", f"{currency} {total_payout:,.2f}")
-    col7.metric("Dispatch Payout", f"{currency} {total_dispatch_payout:,.2f}")
-    col8.metric("Pickup Payout", f"{currency} {total_pickup_payout:,.2f}")
-    col9.metric("QR Order Payout", f"{currency} {total_qr_order_payout:,.2f}")
-    col10.metric("Return Payout", f"{currency} {total_return_payout:,.2f}")
+    # Row 1: Dispatcher | Delivery Parcels | Pickup Parcels | Return Parcels | QR Orders
+    row1_col1, row1_col2, row1_col3, row1_col4, row1_col5 = st.columns(5)
+    with row1_col1:
+        st.metric("Dispatchers", f"{len(display_df):,}")
+    with row1_col2:
+        st.metric("Delivery Parcels", f"{int(numeric_df['Parcels Delivered'].sum()):,}")
+    with row1_col3:
+        st.metric("Pickup Parcels", f"{total_pickup_parcels:,}")
+    with row1_col4:
+        st.metric("Return Parcels", f"{total_return_parcels:,}")
+    with row1_col5:
+        st.metric("QR Orders", f"{total_qr_orders:,}")
+
+    # Row 2: Total Payout | Delivery Parcels Payout | Pickup Parcels Payout | Return Parcels Payout | QR Orders Payout
+    row2_col1, row2_col2, row2_col3, row2_col4, row2_col5 = st.columns(5)
+    with row2_col1:
+        st.metric("Total Payout", f"{currency} {total_payout:,.2f}")
+    with row2_col2:
+        st.metric("Delivery Parcels Payout", f"{currency} {total_dispatch_payout:,.2f}")
+    with row2_col3:
+        st.metric("Pickup Parcels Payout", f"{currency} {total_pickup_payout:,.2f}")
+    with row2_col4:
+        st.metric("Return Parcels Payout", f"{currency} {total_return_payout:,.2f}")
+    with row2_col5:
+        st.metric("QR Orders Payout", f"{currency} {total_qr_order_payout:,.2f}")
 
     # Penalty breakdown by type
     st.markdown("#### ⚠️ Penalty Breakdown by Type")
@@ -2480,47 +2563,242 @@ def main():
         if 'payout_dist' in charts:
             st.altair_chart(charts['payout_dist'], use_container_width=True)
 
+    # Top Performers and Top Penalties side by side
+    top_col1, top_col2 = st.columns(2)
+
+    with top_col1:
         st.markdown("##### 🏆 Top Performers")
-        for _, row in numeric_df.head(5).iterrows():
-            pickup_parcels = row.get('Pickup Parcels', 0)
-            pickup_payout = row.get('Pickup Payout', 0.0)
-            dispatch_payout = row.get('Dispatch Payout', 0.0)
+        # Sort by Total Payout descending and take top 5
+        top_performers = numeric_df.sort_values('Total Payout', ascending=False).head(5)
+        for _, row in top_performers.iterrows():
+            parcels_delivered = int(row.get('Parcels Delivered', 0))
+            pickup_parcels = int(row.get('Pickup Parcels', 0))
+            return_parcels = int(row.get('Return Parcels', 0))
+            qr_orders = int(row.get('QR Orders', 0))
+            delivery_payout = float(row.get('Delivery Parcels Payout', 0.0))
+            pickup_payout = float(row.get('Pickup Parcels Payout', 0.0))
+            return_payout = float(row.get('Return Parcels Payout', 0.0))
+            qr_orders_payout = float(row.get('QR Orders Payout', 0.0))
+
             st.markdown(f"""
-            <div style="background: white; padding: 12px; border-radius: 8px; border: 1px solid #e2e8f0; margin: 8px 0;">
-                <div style="font-weight: 600; color: {ColorScheme.PRIMARY};">{row['Dispatcher Name']}</div>
-                <div style="color: #64748b; font-size: 0.9rem;">
-                    {row['Parcels Delivered']} parcels • {pickup_parcels} pickups • {currency}{dispatch_payout:,.2f} dispatch • {currency}{row['Total Payout']:,.2f} total
+            <div style="background: white; padding: 12px; border-radius: 8px; border: 1px solid #e2e8f0; margin: 8px 0; min-height: 90px; height: 90px; display: flex; flex-direction: column; justify-content: space-between;">
+                <div style="font-weight: 600; color: {ColorScheme.PRIMARY}; margin-bottom: 8px; font-size: 0.95rem;">{row['Dispatcher Name']}</div>
+                <div style="color: #64748b; font-size: 0.85rem; margin-bottom: 4px; line-height: 1.4;">
+                    <strong>Parcels:</strong> {parcels_delivered} | <strong>Pickup Parcels:</strong> {pickup_parcels} | <strong>Return Parcels:</strong> {return_parcels} | <strong>QR Orders:</strong> {qr_orders}
+                </div>
+                <div style="color: #64748b; font-size: 0.85rem; line-height: 1.4;">
+                    <strong>Parcel Payout:</strong> {currency}{delivery_payout:,.2f} | <strong>Pickup Payout:</strong> {currency}{pickup_payout:,.2f} | <strong>Return Payout:</strong> {currency}{return_payout:,.2f} | <strong>QR Orders Payout:</strong> {currency}{qr_orders_payout:,.2f}
                 </div>
             </div>
             """, unsafe_allow_html=True)
 
+    with top_col2:
+        st.markdown("##### ⚠️ Top Penalties")
+        # Filter dispatchers with penalties and sort by penalty amount descending, take top 5
+        penalty_df = numeric_df[numeric_df['Penalty'] > 0].copy() if 'Penalty' in numeric_df.columns else pd.DataFrame()
+        if not penalty_df.empty:
+            top_penalties = penalty_df.sort_values('Penalty', ascending=False).head(5)
+            for _, row in top_penalties.iterrows():
+                penalty_amount = row.get('Penalty', 0.0)
+                penalty_count = row.get('Penalty Parcels', 0) if 'Penalty Parcels' in row else 0
+                # Get penalty breakdown if available
+                duitnow_penalty = row.get('DuitNow Penalty', 0.0) if 'DuitNow Penalty' in row else 0.0
+                ldr_penalty = row.get('LDR Penalty', 0.0) if 'LDR Penalty' in row else 0.0
+                fake_attempt_penalty = row.get('Fake Attempt Penalty', 0.0) if 'Fake Attempt Penalty' in row else 0.0
+                cod_penalty = row.get('COD Penalty', 0.0) if 'COD Penalty' in row else 0.0
+
+                penalty_breakdown = []
+                if duitnow_penalty > 0:
+                    penalty_breakdown.append(f"DuitNow: {currency}{duitnow_penalty:,.2f}")
+                if ldr_penalty > 0:
+                    penalty_breakdown.append(f"LDR: {currency}{ldr_penalty:,.2f}")
+                if fake_attempt_penalty > 0:
+                    penalty_breakdown.append(f"Fake: {currency}{fake_attempt_penalty:,.2f}")
+                if cod_penalty > 0:
+                    penalty_breakdown.append(f"COD: {currency}{cod_penalty:,.2f}")
+
+                breakdown_text = " • ".join(penalty_breakdown) if penalty_breakdown else ""
+
+                st.markdown(f"""
+                <div style="background: white; padding: 12px; border-radius: 8px; border: 1px solid #e2e8f0; margin: 8px 0; min-height: 90px; height: 90px; display: flex; flex-direction: column; justify-content: space-between;">
+                    <div style="font-weight: 600; color: {ColorScheme.ERROR}; margin-bottom: 8px; font-size: 0.95rem;">{row['Dispatcher Name']}</div>
+                    <div style="color: #64748b; font-size: 0.85rem; margin-bottom: 4px; line-height: 1.4;">
+                        {penalty_count} penalty parcels • -{currency}{penalty_amount:,.2f} total
+                    </div>
+                    {f'<div style="color: #ef4444; font-size: 0.85rem; line-height: 1.4;">{breakdown_text}</div>' if breakdown_text else '<div style="min-height: 20px;"></div>'}
+                </div>
+                """, unsafe_allow_html=True)
+        else:
+            st.info("No penalties recorded")
+
     # Data table
     st.markdown("---")
-    st.subheader("👥 Dispatcher Performance Details")
 
-    # Reorder columns for better readability
-    preferred_order = [
-        "Dispatcher ID", "Dispatcher Name", "Parcels Delivered",
-        "Dispatch Payout", "Pickup Parcels", "Pickup Payout",
-        "QR Orders", "QR Order Payout",
-        "Return Parcels", "Return Payout",
-        "Penalty", "DuitNow Penalty", "LDR Penalty", "Fake Attempt Penalty", "COD Penalty",
-        "Total Payout", "Total Weight (kg)", "Avg Weight (kg)",
-        "Avg Rate per Parcel", "Parcels 0-5kg", "Parcels 5.01-10kg",
-        "Parcels 10.01-30kg", "Parcels 30+kg"
-    ]
+    with st.expander("👥 Dispatcher Performance Details", expanded=False):
+        st.subheader("👥 Dispatcher Performance Details")
 
-    # Filter to only include columns that exist in display_df
-    existing_columns = [col for col in preferred_order if col in display_df.columns]
-    remaining_columns = [col for col in display_df.columns if col not in existing_columns]
+        # Reorder columns for better readability
+        preferred_order = [
+            "Dispatcher ID", "Dispatcher Name", "Parcels Delivered",
+            "Delivery Parcels Payout", "Pickup Parcels", "Pickup Parcels Payout",
+            "QR Orders", "QR Orders Payout",
+            "Return Parcels", "Return Parcels Payout",
+            "Penalty", "DuitNow Penalty", "LDR Penalty", "Fake Attempt Penalty", "COD Penalty",
+            "Total Payout", "Total Weight (kg)", "Avg Weight (kg)",
+            "Avg Rate per Parcel", "Parcels 0-5kg", "Parcels 5.01-10kg",
+            "Parcels 10.01-30kg", "Parcels 30+kg"
+        ]
 
-    # Create final column order
-    final_columns = existing_columns + remaining_columns
+        # Filter to only include columns that exist in display_df
+        existing_columns = [col for col in preferred_order if col in display_df.columns]
+        remaining_columns = [col for col in display_df.columns if col not in existing_columns]
 
-    # Reorder the display dataframe
-    display_df_reordered = display_df[final_columns]
+        # Create final column order
+        final_columns = existing_columns + remaining_columns
 
-    st.dataframe(display_df_reordered, use_container_width=True, hide_index=True)
+        # Reorder the display dataframe
+        display_df_reordered = display_df[final_columns]
+
+        st.dataframe(display_df_reordered, use_container_width=True, hide_index=True)
+
+    # Pickup Parcels Details
+    if pickup_df is not None and not pickup_df.empty:
+        with st.expander("📦 Pickup Parcels Details", expanded=False):
+            st.subheader("📦 Pickup Parcels Details")
+            # Find pickup dispatcher ID column
+            pickup_dispatcher_col = None
+            for col in pickup_df.columns:
+                if 'pickup_dispatcher_id' in col.lower() or 'Pickup Dispatcher ID' in col:
+                    pickup_dispatcher_col = col
+                    break
+
+            # Find waybill column
+            waybill_col = None
+            for col in pickup_df.columns:
+                if 'waybill' in col.lower() or 'Waybill Number' in col:
+                    waybill_col = col
+                    break
+
+            if pickup_dispatcher_col and waybill_col:
+                # Show summary by dispatcher
+                pickup_summary = pickup_df.groupby(pickup_dispatcher_col).agg(
+                    parcel_count=(waybill_col, 'nunique')
+                ).reset_index()
+                pickup_summary = pickup_summary.rename(columns={pickup_dispatcher_col: 'Dispatcher ID', 'parcel_count': 'Pickup Parcels'})
+                pickup_summary = pickup_summary.sort_values('Pickup Parcels', ascending=False)
+                st.dataframe(pickup_summary, use_container_width=True, hide_index=True)
+
+                # Show full details
+                st.markdown("#### Full Pickup Data")
+                st.dataframe(pickup_df, use_container_width=True, hide_index=True)
+            else:
+                st.dataframe(pickup_df, use_container_width=True, hide_index=True)
+
+    # Return Parcels Details
+    if return_df is not None and not return_df.empty:
+        with st.expander("↩️ Return Parcels Details", expanded=False):
+            st.subheader("↩️ Return Parcels Details")
+            # Find dispatcher ID column
+            return_dispatcher_col = None
+            for col in return_df.columns:
+                if 'dispatcher_id' in col.lower() or 'Dispatcher ID' in col:
+                    return_dispatcher_col = col
+                    break
+
+            # Find waybill column
+            waybill_col = None
+            for col in return_df.columns:
+                if 'waybill' in col.lower() or 'Waybill Number' in col:
+                    waybill_col = col
+                    break
+
+            if return_dispatcher_col and waybill_col:
+                # Show summary by dispatcher
+                return_summary = return_df.groupby(return_dispatcher_col).agg(
+                    parcel_count=(waybill_col, 'nunique')
+                ).reset_index()
+                return_summary = return_summary.rename(columns={return_dispatcher_col: 'Dispatcher ID', 'parcel_count': 'Return Parcels'})
+                return_summary = return_summary.sort_values('Return Parcels', ascending=False)
+                st.dataframe(return_summary, use_container_width=True, hide_index=True)
+
+                # Show full details
+                st.markdown("#### Full Return Data")
+                st.dataframe(return_df, use_container_width=True, hide_index=True)
+            else:
+                st.dataframe(return_df, use_container_width=True, hide_index=True)
+
+    # QR Orders Details
+    if qr_order_df is not None and not qr_order_df.empty:
+        with st.expander("📱 QR Orders Details", expanded=False):
+            st.subheader("📱 QR Orders Details")
+            # Find dispatcher column
+            qr_dispatcher_col = None
+            for col in qr_order_df.columns:
+                if col.lower() == 'dispatcher':
+                    qr_dispatcher_col = col
+                    break
+
+            # Find order_no column
+            order_no_col = None
+            for col in qr_order_df.columns:
+                if col.lower() == 'order_no':
+                    order_no_col = col
+                    break
+
+            if qr_dispatcher_col and order_no_col:
+                # Show summary by dispatcher
+                qr_summary = qr_order_df.groupby(qr_dispatcher_col).agg(
+                    order_count=(order_no_col, 'nunique')
+                ).reset_index()
+                qr_summary = qr_summary.rename(columns={qr_dispatcher_col: 'Dispatcher ID', 'order_count': 'QR Orders'})
+                qr_summary = qr_summary.sort_values('QR Orders', ascending=False)
+                st.dataframe(qr_summary, use_container_width=True, hide_index=True)
+
+                # Show full details
+                st.markdown("#### Full QR Orders Data")
+                st.dataframe(qr_order_df, use_container_width=True, hide_index=True)
+            else:
+                st.dataframe(qr_order_df, use_container_width=True, hide_index=True)
+
+    # Penalty Details Section
+    if 'Penalty Parcels' in numeric_df.columns and numeric_df['Penalty Parcels'].sum() > 0:
+        with st.expander("⚠️ Penalty Details", expanded=False):
+            st.subheader("⚠️ Penalty Details")
+
+            penalty_rows = []
+            penalty_dispatchers = numeric_df[numeric_df['Penalty Parcels'] > 0] if 'Penalty Parcels' in numeric_df.columns else pd.DataFrame()
+            for _, row in penalty_dispatchers.iterrows():
+                dispatcher_id = row['Dispatcher ID']
+                dispatcher_name = row['Dispatcher Name']
+                penalty_amount = row.get('Penalty', 0.0)
+                # Check if we have waybills stored (they might be in the grouped dataframe before renaming)
+                waybills_str = ''
+                if 'Penalty Waybills' in numeric_df.columns:
+                    waybills_str = str(row.get('Penalty Waybills', ''))
+                waybills_list = [w.strip() for w in waybills_str.split(',') if w.strip() and w.strip().lower() != 'nan'] if waybills_str else []
+
+                if waybills_list:
+                    for waybill_number in waybills_list:
+                        penalty_rows.append({
+                            'Dispatcher ID': dispatcher_id,
+                            'Dispatcher Name': dispatcher_name,
+                            'Waybill Number': waybill_number,
+                            'Penalty Amount': f"{currency}{penalty_amount:,.2f}"
+                        })
+                else:
+                    # If no waybills, show summary
+                    penalty_rows.append({
+                        'Dispatcher ID': dispatcher_id,
+                        'Dispatcher Name': dispatcher_name,
+                        'Waybill Number': f"{int(row.get('Penalty Parcels', 0))} parcels",
+                        'Penalty Amount': f"{currency}{penalty_amount:,.2f}"
+                    })
+
+            if penalty_rows:
+                penalty_table = pd.DataFrame(penalty_rows)
+                st.dataframe(penalty_table, use_container_width=True, hide_index=True)
+            else:
+                st.info("No penalty waybill numbers available")
 
     # Forecasting Section - PARCEL FORECAST
     st.markdown("---")
@@ -2626,59 +2904,60 @@ def main():
                         )
                         st.altair_chart(payout_forecast_chart, use_container_width=True)
 
-                        # Combined forecast table
-                        st.markdown("##### 📅 Forecast Details")
+                        # Combined forecast table and insights in expander
+                        with st.expander("📅 Forecast Details", expanded=False):
+                            st.markdown("##### 📅 Forecast Details")
 
-                        # Create combined forecast table
-                        if forecast_result and payout_forecast_result:
-                            combined_forecast = forecast_summary.copy()
-                            combined_forecast['Date'] = combined_forecast['ds'].dt.strftime('%Y-%m-%d')
-                            combined_forecast['Parcels Forecast'] = combined_forecast['yhat'].round(0).astype(int)
-                            combined_forecast['Parcels Lower'] = combined_forecast['yhat_lower'].round(0).astype(int)
-                            combined_forecast['Parcels Upper'] = combined_forecast['yhat_upper'].round(0).astype(int)
+                            # Create combined forecast table
+                            if forecast_result and payout_forecast_result:
+                                combined_forecast = forecast_summary.copy()
+                                combined_forecast['Date'] = combined_forecast['ds'].dt.strftime('%Y-%m-%d')
+                                combined_forecast['Parcels Forecast'] = combined_forecast['yhat'].round(0).astype(int)
+                                combined_forecast['Parcels Lower'] = combined_forecast['yhat_lower'].round(0).astype(int)
+                                combined_forecast['Parcels Upper'] = combined_forecast['yhat_upper'].round(0).astype(int)
 
-                            # Merge with payout forecast
-                            payout_display = payout_forecast_summary.copy()
-                            payout_display['Date'] = payout_display['ds'].dt.strftime('%Y-%m-%d')
-                            payout_display['Payout Forecast'] = payout_display['yhat'].round(2)
-                            payout_display['Payout Lower'] = payout_display['yhat_lower'].round(2)
-                            payout_display['Payout Upper'] = payout_display['yhat_upper'].round(2)
+                                # Merge with payout forecast
+                                payout_display = payout_forecast_summary.copy()
+                                payout_display['Date'] = payout_display['ds'].dt.strftime('%Y-%m-%d')
+                                payout_display['Payout Forecast'] = payout_display['yhat'].round(2)
+                                payout_display['Payout Lower'] = payout_display['yhat_lower'].round(2)
+                                payout_display['Payout Upper'] = payout_display['yhat_upper'].round(2)
 
-                            combined_forecast = pd.merge(
-                                combined_forecast[['Date', 'Parcels Forecast', 'Parcels Lower', 'Parcels Upper']],
-                                payout_display[['Date', 'Payout Forecast', 'Payout Lower', 'Payout Upper']],
-                                on='Date'
-                            )
+                                combined_forecast = pd.merge(
+                                    combined_forecast[['Date', 'Parcels Forecast', 'Parcels Lower', 'Parcels Upper']],
+                                    payout_display[['Date', 'Payout Forecast', 'Payout Lower', 'Payout Upper']],
+                                    on='Date'
+                                )
 
-                            # Format currency
-                            combined_forecast['Payout Forecast'] = combined_forecast['Payout Forecast'].apply(
-                                lambda x: f"{currency} {x:,.2f}"
-                            )
-                            combined_forecast['Payout Lower'] = combined_forecast['Payout Lower'].apply(
-                                lambda x: f"{currency} {x:,.2f}"
-                            )
-                            combined_forecast['Payout Upper'] = combined_forecast['Payout Upper'].apply(
-                                lambda x: f"{currency} {x:,.2f}"
-                            )
+                                # Format currency
+                                combined_forecast['Payout Forecast'] = combined_forecast['Payout Forecast'].apply(
+                                    lambda x: f"{currency} {x:,.2f}"
+                                )
+                                combined_forecast['Payout Lower'] = combined_forecast['Payout Lower'].apply(
+                                    lambda x: f"{currency} {x:,.2f}"
+                                )
+                                combined_forecast['Payout Upper'] = combined_forecast['Payout Upper'].apply(
+                                    lambda x: f"{currency} {x:,.2f}"
+                                )
 
-                            st.dataframe(combined_forecast, use_container_width=True, hide_index=True)
+                                st.dataframe(combined_forecast, use_container_width=True, hide_index=True)
 
-                        # Forecast insights
-                        st.markdown("##### 🔮 Forecast Insights")
+                            # Forecast insights
+                            st.markdown("##### 🔮 Forecast Insights")
 
-                        if metrics['change_pct'] > 10:
-                            st.info(f"📈 **Growing Parcel Trend:** Forecast shows a {metrics['change_pct']:.1f}% increase in daily parcels.")
-                        elif metrics['change_pct'] < -10:
-                            st.warning(f"📉 **Declining Parcel Trend:** Forecast shows a {abs(metrics['change_pct']):.1f}% decrease in daily parcels.")
-                        else:
-                            st.success("📊 **Stable Parcel Trend:** Forecast shows relatively stable parcel delivery volumes.")
+                            if metrics['change_pct'] > 10:
+                                st.info(f"📈 **Growing Parcel Trend:** Forecast shows a {metrics['change_pct']:.1f}% increase in daily parcels.")
+                            elif metrics['change_pct'] < -10:
+                                st.warning(f"📉 **Declining Parcel Trend:** Forecast shows a {abs(metrics['change_pct']):.1f}% decrease in daily parcels.")
+                            else:
+                                st.success("📊 **Stable Parcel Trend:** Forecast shows relatively stable parcel delivery volumes.")
 
-                        if payout_metrics['change_pct'] > 10:
-                            st.info(f"💰 **Growing Payout Trend:** Forecast shows a {payout_metrics['change_pct']:.1f}% increase in daily payouts.")
-                        elif payout_metrics['change_pct'] < -10:
-                            st.warning(f"💸 **Declining Payout Trend:** Forecast shows a {abs(payout_metrics['change_pct']):.1f}% decrease in daily payouts.")
-                        else:
-                            st.success("💵 **Stable Payout Trend:** Forecast shows relatively stable payout volumes.")
+                            if payout_metrics['change_pct'] > 10:
+                                st.info(f"💰 **Growing Payout Trend:** Forecast shows a {payout_metrics['change_pct']:.1f}% increase in daily payouts.")
+                            elif payout_metrics['change_pct'] < -10:
+                                st.warning(f"💸 **Declining Payout Trend:** Forecast shows a {abs(payout_metrics['change_pct']):.1f}% decrease in daily payouts.")
+                            else:
+                                st.success("💵 **Stable Payout Trend:** Forecast shows relatively stable payout volumes.")
 
                     else:
                         st.warning("Could not generate payout forecast.")
@@ -2697,47 +2976,10 @@ def main():
             Alternatively, you can use the basic trend analysis shown above.
             """)
     else:
-        st.info("Insufficient historical data for forecasting. Need at least 7 days of data.")
-
-    # Penalty Details Section
-    if 'Penalty Parcels' in numeric_df.columns and numeric_df['Penalty Parcels'].sum() > 0:
-        st.markdown("---")
-        st.subheader("⚠️ Penalty Details")
-
-        penalty_rows = []
-        penalty_dispatchers = numeric_df[numeric_df['Penalty Parcels'] > 0] if 'Penalty Parcels' in numeric_df.columns else pd.DataFrame()
-        for _, row in penalty_dispatchers.iterrows():
-            dispatcher_id = row['Dispatcher ID']
-            dispatcher_name = row['Dispatcher Name']
-            penalty_amount = row.get('Penalty', 0.0)
-            # Check if we have waybills stored (they might be in the grouped dataframe before renaming)
-            waybills_str = ''
-            if 'Penalty Waybills' in numeric_df.columns:
-                waybills_str = str(row.get('Penalty Waybills', ''))
-            waybills_list = [w.strip() for w in waybills_str.split(',') if w.strip() and w.strip().lower() != 'nan'] if waybills_str else []
-
-            if waybills_list:
-                for waybill_number in waybills_list:
-                    penalty_rows.append({
-                        'Dispatcher ID': dispatcher_id,
-                        'Dispatcher Name': dispatcher_name,
-                        'Waybill Number': waybill_number,
-                        'Penalty Amount': f"{currency}{penalty_amount:,.2f}"
-                    })
-            else:
-                # If no waybills, show summary
-                penalty_rows.append({
-                    'Dispatcher ID': dispatcher_id,
-                    'Dispatcher Name': dispatcher_name,
-                    'Waybill Number': f"{int(row.get('Penalty Parcels', 0))} parcels",
-                    'Penalty Amount': f"{currency}{penalty_amount:,.2f}"
-                })
-
-        if penalty_rows:
-            penalty_table = pd.DataFrame(penalty_rows)
-            st.dataframe(penalty_table, use_container_width=True, hide_index=True)
+        if daily_parcel_df.empty:
+            st.info("⚠️ No daily trend data available for forecasting. Please check your date column selection and ensure data has valid dates.")
         else:
-            st.info("No penalty waybill numbers available")
+            st.info(f"⚠️ Insufficient historical data for forecasting. Found {len(daily_parcel_df)} unique dates, but need at least 7 days of data.")
 
     st.markdown("---")
     st.subheader("📄 Invoice Generation")
