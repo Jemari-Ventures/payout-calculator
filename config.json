@@ -88,7 +88,7 @@
     }
   ],
   "pickup_payout_per_parcel": 1.0,
-  "forecast_days": 15,
+  "forecast_days": 30,
   "qr_order_payout_per_order": 1.8,
   "return_payout_per_parcel": 0.5
 }
