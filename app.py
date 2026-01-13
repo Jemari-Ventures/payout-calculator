@@ -53,7 +53,7 @@ class Config:
     DEFAULT_CONFIG = {
         "data_source": {
             "type": "gsheet",
-            "gsheet_url": "https://docs.google.com/spreadsheets/d/1T24tNnDoRtkaE7i9tBLZrsNqWLE80An4/edit?usp=sharing&ouid=109319992457995119696&rtpof=true&sd=true",
+            "gsheet_url": "https://docs.google.com/spreadsheets/d/1rLdCtIvwCLX23-9SSBXAKIp_B75jTBts/edit?usp=sharing&ouid=109319992457995119696&rtpof=true&sd=true",
             "sheet_name": None
         },
         "tiers": [
