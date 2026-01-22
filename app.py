@@ -228,6 +228,19 @@ class DataSource:
             # This prevents pandas from doing type inference that could lose waybills
             resp_content = resp.content
 
+            # If a specific sheet name was requested but doesn't exist, Sheets returns HTML/error text.
+            # In that case, treat it as an empty sheet so downstream calculations are 0.
+            if sheet_name and str(sheet_name).strip():
+                content_sample = resp_content[:500].decode("utf-8", errors="ignore").lower().strip()
+                if (
+                    "<html" in content_sample
+                    or "<!doctype html" in content_sample
+                    or ("worksheet" in content_sample and "not found" in content_sample)
+                    or ("sheet" in content_sample and "not found" in content_sample)
+                    or ("invalid" in content_sample and "sheet" in content_sample)
+                ):
+                    return pd.DataFrame()
+
             # Read the full CSV WITHOUT forcing dtype - let pandas read it naturally
             # Then we'll convert the Waybill Number column to string immediately
             # This approach is more reliable for preserving waybills that might have mixed formats
