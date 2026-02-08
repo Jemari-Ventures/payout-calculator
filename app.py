@@ -998,7 +998,7 @@ class PayoutCalculator:
         return parcel_count, payout, valid_records
 
     @staticmethod
-    def calculate_qr_order(qr_order_df: pd.DataFrame, dispatcher_id: str, rate: float = 1.80) -> Tuple[int, float, pd.DataFrame]:
+    def calculate_qr_order(qr_order_df: pd.DataFrame, dispatcher_id: str, rate: float = 1.80, dispatcher_name: Optional[str] = None) -> Tuple[int, float, pd.DataFrame]:
         """
         Counts total QR orders for selected dispatcher based on dispatcher column matching the dispatcher_id.
         Filters out rows with empty or invalid order numbers.
@@ -1012,7 +1012,9 @@ class PayoutCalculator:
         # Find dispatcher column - handle multiple possible column name formats
         dispatcher_col = None
         possible_dispatcher_cols = [
-            "dispatcher", "Dispatcher", "DISPATCHER", "dispatcher_id", "Dispatcher ID"
+            "dispatcher_id", "Dispatcher ID", "DISPATCHER_ID", "DISPATCHER ID",
+            "dispatcher", "Dispatcher", "DISPATCHER",
+            "pickup_dispatcher_id", "Pickup Dispatcher ID"
         ]
         for col_name in possible_dispatcher_cols:
             if col_name in qr_order_df.columns:
@@ -1030,7 +1032,7 @@ class PayoutCalculator:
         # Find order number column - handle multiple possible column name formats
         order_col = None
         possible_order_cols = [
-            "order_no", "Order No", "order_number", "Order Number"
+            "no_awb", "No Awb", "No AWB", "waybill_number", "Waybill Number", "waybill", "Waybill"
         ]
         for col_name in possible_order_cols:
             if col_name in qr_order_df.columns:
@@ -1041,7 +1043,7 @@ class PayoutCalculator:
         if order_col is None:
             for col in qr_order_df.columns:
                 col_lower = str(col).lower().strip()
-                if "order" in col_lower and ("no" in col_lower or "number" in col_lower):
+                if "awb" in col_lower:
                     order_col = col
                     break
 
@@ -1049,15 +1051,36 @@ class PayoutCalculator:
         if dispatcher_col is None or order_col is None:
             return 0, 0.0, pd.DataFrame()
 
-        # Convert dispatcher_id to string for comparison
-        dispatcher_id_str = str(dispatcher_id).strip()
+        # Normalize dispatcher_id for comparison (handle numeric IDs like 1234.0)
+        def safe_dispatcher_to_string(value):
+            """Safely convert dispatcher ID to string, preserving format."""
+            if pd.isna(value):
+                return None
+            if isinstance(value, (int, float)):
+                if isinstance(value, float) and value.is_integer():
+                    return str(int(value))
+                return str(value)
+            value_str = str(value).strip()
+            if value_str == "" or value_str.lower() == "nan":
+                return None
+            return value_str
+
+        dispatcher_id_str = safe_dispatcher_to_string(dispatcher_id)
+        if dispatcher_id_str is None:
+            return 0, 0.0, pd.DataFrame()
 
         # Clean and prepare the dispatcher column
         qr_order_df = qr_order_df.copy()
-        qr_order_df[dispatcher_col] = qr_order_df[dispatcher_col].astype(str).str.strip()
+        qr_order_df[dispatcher_col] = qr_order_df[dispatcher_col].apply(safe_dispatcher_to_string)
 
         # Filter records for this dispatcher
-        matched_records = qr_order_df[qr_order_df[dispatcher_col] == dispatcher_id_str]
+        dispatcher_col_lower = str(dispatcher_col).lower().strip()
+        dispatcher_name_str = safe_dispatcher_to_string(dispatcher_name) if dispatcher_name else None
+        match_values = [dispatcher_id_str]
+        if dispatcher_name_str and "id" not in dispatcher_col_lower:
+            match_values.append(dispatcher_name_str)
+
+        matched_records = qr_order_df[qr_order_df[dispatcher_col].isin(match_values)]
 
         if matched_records.empty:
             return 0, 0.0, pd.DataFrame()
@@ -2516,7 +2539,7 @@ def main():
 
             # Calculate QR order payout (RM1.80 per QR order)
             qr_order_count, qr_order_payout, qr_order_filtered_df = PayoutCalculator.calculate_qr_order(
-                qr_order_df, selected_dispatcher_id, rate=1.80
+                qr_order_df, selected_dispatcher_id, rate=1.80, dispatcher_name=selected_dispatcher_name
             )
 
             # Calculate return payout (RM0.50 per return parcel)
@@ -2757,7 +2780,8 @@ def main():
                     # Ensure Order No is treated as string BEFORE filtering columns
                     order_col_display = None
                     for col in display_qr_order_df.columns:
-                        if "order" in str(col).lower() and ("no" in str(col).lower() or "number" in str(col).lower()):
+                        col_lower = str(col).lower()
+                        if ("order" in col_lower and ("no" in col_lower or "number" in col_lower)) or "waybill" in col_lower or "awb" in col_lower:
                             order_col_display = col
                             break
 
@@ -2791,7 +2815,8 @@ def main():
                     # Find order column after title transformation
                     order_col_final = None
                     for col in display_qr_order_df.columns:
-                        if "order" in col.lower() and ("no" in col.lower() or "number" in col.lower()):
+                        col_lower = col.lower()
+                        if ("order" in col_lower and ("no" in col_lower or "number" in col_lower)) or "waybill" in col_lower or "awb" in col_lower:
                             order_col_final = col
                             break
 
@@ -2808,6 +2833,14 @@ def main():
             else:
                 with st.expander("📱 QR Order Details", expanded=False):
                     st.info("No QR order records found for this dispatcher.")
+                    if qr_order_df is None:
+                        st.warning("QR Order sheet could not be loaded.")
+                    elif qr_order_df.empty:
+                        st.warning("QR Order sheet is empty.")
+                    else:
+                        columns_preview = ", ".join([str(col) for col in qr_order_df.columns])
+                        st.caption(f"QR Order rows: {len(qr_order_df)} | Columns: {columns_preview}")
+                        st.caption(f"Selected dispatcher ID: {selected_dispatcher_id}")
 
             # Display return details if available
             if return_count > 0 and not return_filtered_df.empty:
