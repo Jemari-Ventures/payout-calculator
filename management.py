@@ -1129,7 +1129,7 @@ class PayoutCalculator:
         dispatcher_col = None
         for col in qr_order_df.columns:
             col_lower = str(col).lower()
-            if col_lower == 'dispatcher':
+            if col_lower in ('pickup_dispatcher_id', 'dispatcher_id', 'dispatcher'):
                 dispatcher_col = col
                 break
 
@@ -1139,16 +1139,16 @@ class PayoutCalculator:
             dispatcher_summary_df['qr_order_payout'] = 0.0
             return dispatcher_summary_df
 
-        # Find order_no column (unique identifier for each order)
+        # Find waybill_number column (unique identifier for each order)
         order_no_col = None
         for col in qr_order_df.columns:
             col_lower = str(col).lower()
-            if col_lower == 'order_no' or col_lower == 'order_no':
+            if col_lower in ('waybill_number', 'no_awb'):
                 order_no_col = col
                 break
 
         if not order_no_col:
-            st.warning("⚠️ No order_no column found in QR order data")
+            st.warning("⚠️ No waybill_number column found in QR order data")
             dispatcher_summary_df['qr_order_count'] = 0
             dispatcher_summary_df['qr_order_payout'] = 0.0
             return dispatcher_summary_df
@@ -2266,10 +2266,11 @@ def main():
                             max_date_in_data = duitnow_df[valid_dates][duitnow_date_col].max().date()
                             st.info(f"📅 DuitNow date range in data: {min_date_in_data} to {max_date_in_data} (filtering: {start_date} to {end_date})")
 
-                        # Filter by date range
+                        # Filter by date range using created_at minus 1 month
+                        adjusted_duitnow_dates = (duitnow_df[duitnow_date_col] - pd.DateOffset(months=1))
                         duitnow_df = duitnow_df[
-                            (duitnow_df[duitnow_date_col].dt.date >= start_date) &
-                            (duitnow_df[duitnow_date_col].dt.date <= end_date)
+                            (adjusted_duitnow_dates.dt.date >= start_date) &
+                            (adjusted_duitnow_dates.dt.date <= end_date)
                         ]
                         filtered_duitnow_count = len(duitnow_df)
                         penalty_data['duitnow'] = duitnow_df
@@ -2372,13 +2373,16 @@ def main():
                 # Filter QR order data by selected date range
                 if qr_order_df is not None and not qr_order_df.empty:
                     qr_order_date_col = None
-                    # Explicitly look for created_at column for QR orders
-                    if 'created_at' in qr_order_df.columns:
+                    # Prefer date_pick_up for QR orders, fallback to created_at
+                    if 'date_pick_up' in qr_order_df.columns:
+                        qr_order_date_col = 'date_pick_up'
+                    elif 'created_at' in qr_order_df.columns:
                         qr_order_date_col = 'created_at'
                     else:
                         # Try case-insensitive search
                         for col in qr_order_df.columns:
-                            if str(col).lower() == "created_at":
+                            col_lower = str(col).lower()
+                            if col_lower in ("date_pick_up", "created_at"):
                                 qr_order_date_col = col
                                 break
 
@@ -2405,7 +2409,7 @@ def main():
                         elif initial_qr_count != filtered_qr_count:
                             st.info(f"📦 Filtered QR orders using '{qr_order_date_col}': {initial_qr_count:,} → {filtered_qr_count:,} records")
                     else:
-                        st.warning("⚠️ QR order table has no 'created_at' column; QR orders are not filtered by date range.")
+                        st.warning("⚠️ QR order table has no 'date_pick_up' column; QR orders are not filtered by date range.")
 
                 # Filter return data by selected date range
                 if return_df is not None and not return_df.empty:
@@ -2734,14 +2738,14 @@ def main():
             # Find dispatcher column
             qr_dispatcher_col = None
             for col in qr_order_df.columns:
-                if col.lower() == 'dispatcher':
+                if col.lower() in ('pickup_dispatcher_id', 'dispatcher_id', 'dispatcher'):
                     qr_dispatcher_col = col
                     break
 
-            # Find order_no column
+            # Find waybill_number column
             order_no_col = None
             for col in qr_order_df.columns:
-                if col.lower() == 'order_no':
+                if col.lower() in ('waybill_number', 'no_awb'):
                     order_no_col = col
                     break
 
