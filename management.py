@@ -48,7 +48,11 @@ class ColorScheme:
 # Centralized column mappings
 COLUMN_MAPPINGS = {
     'waybill': ['Waybill Number', 'Waybill', 'waybill_number', 'waybill'],
-    'date': ['Delivery Signature', 'Delivery Date', 'Date', 'signature_date', 'delivery_date', 'delivery_signature'],
+    'date': [
+        'Delivery Signature', 'Delivery Date', 'Date',
+        'signature_date', 'delivery_date', 'delivery_signature',
+        'delivery_signature_date'
+    ],
     'dispatcher_id': ['Dispatcher ID', 'Dispatcher Id', 'dispatcher_id'],
     'dispatcher_name': ['Dispatcher Name', 'Dispatcher', 'dispatcher_name'],
     'weight': ['Billing Weight', 'Weight', 'weight', 'billing_weight']
@@ -159,6 +163,28 @@ def find_column(df: pd.DataFrame, column_type: str) -> Optional[str]:
         if col in df.columns:
             return col
     return None
+
+
+def normalize_dispatcher_id(value) -> str:
+    """Normalize dispatcher/employee ID to a stable comparable token."""
+    if pd.isna(value):
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    text = str(value).strip()
+    if re.fullmatch(r"\d+\.0", text):
+        text = text[:-2]
+    text = re.sub(r"[^A-Za-z0-9]", "", text)
+    text = text.upper()
+    # Strip known prefixes (e.g., JMR001 -> 001) when followed by digits
+    for prefix in DISPATCHER_PREFIXES:
+        if text.startswith(prefix) and text[len(prefix):].isdigit():
+            text = text[len(prefix):]
+            break
+    # Normalize purely numeric IDs by trimming leading zeros
+    if text.isdigit():
+        text = text.lstrip("0") or "0"
+    return text
 
 
 def clean_dispatcher_name(name: str) -> str:
@@ -852,19 +878,19 @@ class PayoutCalculator:
                     # Pre-filter positive penalties
                     df_processed = df_processed[df_processed['penalty_numeric'] > 0].copy()
                     # Pre-normalize rider IDs
-                    df_processed['_rider_normalized'] = df_processed[rider_col].astype(str).str.strip().str.lower()
+                    df_processed['_rider_normalized'] = df_processed[rider_col].apply(normalize_dispatcher_id)
 
             # Pre-process LDR penalty data
             elif penalty_type == 'ldr':
                 employee_id_col = next((col for col in df.columns if col.lower() == 'employee_id'), None)
                 if employee_id_col:
-                    df_processed['_employee_id_normalized'] = df_processed[employee_id_col].astype(str).str.strip().str.lower()
+                    df_processed['_employee_id_normalized'] = df_processed[employee_id_col].apply(normalize_dispatcher_id)
 
             # Pre-process Fake Attempt penalty data
             elif penalty_type == 'fake_attempt':
                 dispatcher_id_col = next((col for col in df.columns if col.lower() == 'dispatcher_id'), None)
                 if dispatcher_id_col:
-                    df_processed['_dispatcher_id_normalized'] = df_processed[dispatcher_id_col].astype(str).str.strip().str.lower()
+                    df_processed['_dispatcher_id_normalized'] = df_processed[dispatcher_id_col].apply(normalize_dispatcher_id)
 
             # Pre-process COD penalty data
             elif penalty_type == 'cod':
@@ -872,7 +898,7 @@ class PayoutCalculator:
                 penalty_col = next((col for col in df.columns if col.lower() == 'penalty'), None)
 
                 if dispatcher_id_col:
-                    df_processed['_dispatcher_id_normalized'] = df_processed[dispatcher_id_col].astype(str).str.strip().str.lower()
+                    df_processed['_dispatcher_id_normalized'] = df_processed[dispatcher_id_col].apply(normalize_dispatcher_id)
 
                 if penalty_col:
                     # Pre-convert penalty column to Decimal once (COD penalty is bigint, convert to Decimal for precision)
@@ -912,7 +938,7 @@ class PayoutCalculator:
         total_penalty = 0.0
         total_count = 0
         waybill_numbers = []
-        dispatcher_id_clean = str(dispatcher_id).strip().lower()
+        dispatcher_id_clean = normalize_dispatcher_id(dispatcher_id)
 
         # 1. DuitNow Penalty: rider column = dispatcher_id, penalty amount from penalty column (only positive amounts)
         if 'duitnow' in penalty_data:
@@ -925,7 +951,7 @@ class PayoutCalculator:
                     # Fallback to original logic if not pre-processed
                     rider_col = next((col for col in duitnow_df.columns if col.lower() == 'rider'), None)
                     if rider_col:
-                        rider_series = duitnow_df[rider_col].astype(str).str.strip().str.lower()
+                        rider_series = duitnow_df[rider_col].apply(normalize_dispatcher_id)
                         duitnow_records = duitnow_df[rider_series == dispatcher_id_clean]
                     else:
                         duitnow_records = pd.DataFrame()
@@ -952,7 +978,7 @@ class PayoutCalculator:
                     # Fallback to original logic
                     employee_id_col = next((col for col in ldr_df.columns if col.lower() == 'employee_id'), None)
                     if employee_id_col:
-                        employee_series = ldr_df[employee_id_col].astype(str).str.strip().str.lower()
+                        employee_series = ldr_df[employee_id_col].apply(normalize_dispatcher_id)
                         ldr_records = ldr_df[employee_series == dispatcher_id_clean]
                     else:
                         ldr_records = pd.DataFrame()
@@ -982,7 +1008,7 @@ class PayoutCalculator:
                     # Fallback to original logic
                     dispatcher_id_col = next((col for col in fake_attempt_df.columns if col.lower() == 'dispatcher_id'), None)
                     if dispatcher_id_col:
-                        dispatcher_series = fake_attempt_df[dispatcher_id_col].astype(str).str.strip().str.lower()
+                        dispatcher_series = fake_attempt_df[dispatcher_id_col].apply(normalize_dispatcher_id)
                         fake_attempt_records = fake_attempt_df[dispatcher_series == dispatcher_id_clean]
                     else:
                         fake_attempt_records = pd.DataFrame()
@@ -1013,7 +1039,7 @@ class PayoutCalculator:
                     # Fallback to original logic if not pre-processed
                     dispatcher_id_col = next((col for col in cod_df.columns if col.lower() == 'dispatcher_id'), None)
                     if dispatcher_id_col:
-                        dispatcher_series = cod_df[dispatcher_id_col].astype(str).str.strip().str.lower()
+                        dispatcher_series = cod_df[dispatcher_id_col].apply(normalize_dispatcher_id)
                         cod_records = cod_df[dispatcher_series == dispatcher_id_clean]
                     else:
                         cod_records = pd.DataFrame()
@@ -1066,7 +1092,7 @@ class PayoutCalculator:
         if penalty_data is None or not penalty_data:
             return breakdown
 
-        dispatcher_id_clean = str(dispatcher_id).strip().lower()
+        dispatcher_id_clean = normalize_dispatcher_id(dispatcher_id)
 
         # 1. DuitNow Penalty: rider column = dispatcher_id, penalty amount from penalty column (only positive amounts)
         if 'duitnow' in penalty_data:
@@ -1079,7 +1105,7 @@ class PayoutCalculator:
                     # Fallback to original logic if not pre-processed
                     rider_col = next((col for col in duitnow_df.columns if col.lower() == 'rider'), None)
                     if rider_col:
-                        rider_series = duitnow_df[rider_col].astype(str).str.strip().str.lower()
+                        rider_series = duitnow_df[rider_col].apply(normalize_dispatcher_id)
                         duitnow_records = duitnow_df[rider_series == dispatcher_id_clean]
                     else:
                         duitnow_records = pd.DataFrame()
@@ -1104,7 +1130,7 @@ class PayoutCalculator:
                     # Fallback to original logic
                     employee_id_col = next((col for col in ldr_df.columns if col.lower() == 'employee_id'), None)
                     if employee_id_col:
-                        employee_series = ldr_df[employee_id_col].astype(str).str.strip().str.lower()
+                        employee_series = ldr_df[employee_id_col].apply(normalize_dispatcher_id)
                         ldr_records = ldr_df[employee_series == dispatcher_id_clean]
                     else:
                         ldr_records = pd.DataFrame()
@@ -1129,7 +1155,7 @@ class PayoutCalculator:
                     # Fallback to original logic
                     dispatcher_id_col = next((col for col in fake_attempt_df.columns if col.lower() == 'dispatcher_id'), None)
                     if dispatcher_id_col:
-                        dispatcher_series = fake_attempt_df[dispatcher_id_col].astype(str).str.strip().str.lower()
+                        dispatcher_series = fake_attempt_df[dispatcher_id_col].apply(normalize_dispatcher_id)
                         fake_attempt_records = fake_attempt_df[dispatcher_series == dispatcher_id_clean]
                     else:
                         fake_attempt_records = pd.DataFrame()
@@ -1155,7 +1181,7 @@ class PayoutCalculator:
                     # Fallback to original logic if not pre-processed
                     dispatcher_id_col = next((col for col in cod_df.columns if col.lower() == 'dispatcher_id'), None)
                     if dispatcher_id_col:
-                        dispatcher_series = cod_df[dispatcher_id_col].astype(str).str.strip().str.lower()
+                        dispatcher_series = cod_df[dispatcher_id_col].apply(normalize_dispatcher_id)
                         cod_records = cod_df[dispatcher_series == dispatcher_id_clean]
                     else:
                         cod_records = pd.DataFrame()
@@ -1566,17 +1592,6 @@ class PayoutCalculator:
                 break
         date_col = delivery_sig_col or ('date' if 'date' in df_clean.columns else find_column(df_clean, 'date'))
         df_unique = df_clean.copy()
-
-        def normalize_dispatcher_id(value) -> str:
-            if pd.isna(value):
-                return ""
-            if isinstance(value, float) and value.is_integer():
-                value = int(value)
-            text = str(value).strip()
-            if re.fullmatch(r"\d+\.0", text):
-                text = text[:-2]
-            text = re.sub(r"[^A-Za-z0-9]", "", text)
-            return text.upper()
 
         # Working days per dispatcher (based on unique delivery dates from dispatch sheet)
         working_days_map = {}
@@ -2751,15 +2766,32 @@ def main():
                 if 'ldr' in penalty_data and penalty_data['ldr'] is not None and not penalty_data['ldr'].empty:
                     ldr_df = penalty_data['ldr']
                     ldr_date_col = None
-                    # Try to find date columns in LDR data
-                    for col in ldr_df.columns:
-                        col_lower = str(col).lower()
-                        if any(k in col_lower for k in ["date", "time", "delivery", "signature", "created_at", "updated_at"]):
-                            ldr_date_col = col
-                            break
+                    # Prefer audit timestamps if present
+                    if 'created_at' in ldr_df.columns:
+                        ldr_date_col = 'created_at'
+                    elif 'updated_at' in ldr_df.columns:
+                        ldr_date_col = 'updated_at'
+                    else:
+                        # Fallback: find any date/time-like column
+                        for col in ldr_df.columns:
+                            col_lower = str(col).lower()
+                            if any(k in col_lower for k in ["date", "time", "delivery", "signature"]):
+                                ldr_date_col = col
+                                break
 
                     if ldr_date_col is not None:
-                        ldr_df[ldr_date_col] = pd.to_datetime(ldr_df[ldr_date_col], errors="coerce")
+                        ldr_parsed = pd.to_datetime(ldr_df[ldr_date_col], errors="coerce")
+                        # If parsing fails and column is numeric, try Excel serial date
+                        if ldr_parsed.notna().sum() == 0:
+                            numeric_series = pd.to_numeric(ldr_df[ldr_date_col], errors="coerce")
+                            if numeric_series.notna().sum() > 0:
+                                ldr_parsed = pd.to_datetime(
+                                    numeric_series,
+                                    unit='D',
+                                    origin='1899-12-30',
+                                    errors='coerce'
+                                )
+                        ldr_df[ldr_date_col] = ldr_parsed
                         initial_ldr_count = len(ldr_df)
                         ldr_df = ldr_df[
                             (ldr_df[ldr_date_col].dt.date >= start_date) &
