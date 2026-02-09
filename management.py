@@ -963,7 +963,7 @@ class PayoutCalculator:
                         penalty.quantize(Decimal('0.01'), rounding='ROUND_HALF_UP')
                         for penalty in duitnow_records['penalty_numeric'].tolist()
                     ]
-                    duitnow_penalty_rounded = sum(rounded_penalties)
+                    duitnow_penalty_rounded = sum(rounded_penalties).quantize(Decimal('0.01'), rounding='ROUND_HALF_UP')
                     total_penalty += float(duitnow_penalty_rounded)  # Convert to float only at the end
                     total_count += len(duitnow_records)
 
@@ -1117,7 +1117,9 @@ class PayoutCalculator:
                         penalty.quantize(Decimal('0.01'), rounding='ROUND_HALF_UP')
                         for penalty in duitnow_records['penalty_numeric'].tolist()
                     ]
-                    breakdown['duitnow'] = float(sum(rounded_penalties))
+                    breakdown['duitnow'] = float(
+                        sum(rounded_penalties).quantize(Decimal('0.01'), rounding='ROUND_HALF_UP')
+                    )
 
         # 2. LDR Penalty: employee_id column = dispatcher_id, penalty = waybill count * RM 100
         if 'ldr' in penalty_data:
