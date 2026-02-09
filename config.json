@@ -1,9 +1,21 @@
 {
   "data_source": {
     "type": "postgres",
-    "gsheet_url": "https://docs.google.com/spreadsheets/d/1rLdCtIvwCLX23-9SSBXAKIp_B75jTBts/edit?usp=sharing&ouid=109319992457995119696&rtpof=true&sd=true",
+    "gsheet_url": "https://docs.google.com/spreadsheets/d/1rLdCtIvwCLX23-9SSBXAKIp_B75jTBts/edit?gid=830451308#gid=830451308",
     "postgres_table": "dispatch",
-    "pickup_table": "pickup"
+    "pickup_table": "pickup",
+    "excel_file": "",
+    "excel_sheets": {
+      "dispatch": "Dispatch",
+      "pickup": "Pickup",
+      "duitnow": "DuitNow",
+      "ldr": "LDR",
+      "fake_attempt": "Fake Attempt",
+      "cod": "COD",
+      "qr_order": "QR Order",
+      "return": "Return",
+      "attendance": "Attendance"
+    }
   },
   "database": {
     "table_name": "dispatch"
