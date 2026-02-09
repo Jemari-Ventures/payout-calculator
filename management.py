@@ -93,7 +93,8 @@ class Config:
         "currency_symbol": "RM",
         "forecast_days": 30,
         "qr_order_payout_per_order": 1.80,
-        "return_payout_per_parcel": 1.50
+        "return_payout_per_parcel": 1.50,
+        "fake_attempt_penalty_per_parcel": 1.00
     }
 
     _cache = None
@@ -125,6 +126,8 @@ class Config:
                         config["qr_order_payout_per_order"] = 1.80
                     if "return_payout_per_parcel" not in config:
                         config["return_payout_per_parcel"] = 1.50
+                    if "fake_attempt_penalty_per_parcel" not in config:
+                        config["fake_attempt_penalty_per_parcel"] = 1.00
                     cls._cache = config
                     return cls._cache
             except Exception as e:
@@ -994,7 +997,8 @@ class PayoutCalculator:
                     else:
                         waybill_count = len(fake_attempt_records)
 
-                    fake_attempt_penalty = waybill_count * 1.0  # RM 1.00 per waybill
+                    fake_attempt_rate = Config.load().get("fake_attempt_penalty_per_parcel", 1.00)
+                    fake_attempt_penalty = waybill_count * float(fake_attempt_rate)
                     total_penalty += fake_attempt_penalty
                     total_count += waybill_count
 
@@ -1137,7 +1141,8 @@ class PayoutCalculator:
                     else:
                         waybill_count = len(fake_attempt_records)
 
-                    breakdown['fake_attempt'] = waybill_count * 1.0  # RM 1.00 per waybill
+                    fake_attempt_rate = Config.load().get("fake_attempt_penalty_per_parcel", 1.00)
+                    breakdown['fake_attempt'] = waybill_count * float(fake_attempt_rate)
 
         # 4. COD Penalty: dispatcher_id column = dispatcher_id, penalty amount from penalty column (only positive amounts)
         if 'cod' in penalty_data:
@@ -1259,7 +1264,8 @@ class PayoutCalculator:
             else:
                 waybill_count = len(fake_attempt_df)
 
-            penalty_totals['fake_attempt'] = waybill_count * 1.0  # RM 1.00 per waybill
+            fake_attempt_rate = Config.load().get("fake_attempt_penalty_per_parcel", 1.00)
+            penalty_totals['fake_attempt'] = waybill_count * float(fake_attempt_rate)
 
         # 4. COD Penalty: sum all penalty amounts (only positive amounts)
         if 'cod' in penalty_data:
@@ -1589,7 +1595,7 @@ class PayoutCalculator:
                 if date_parsed.notna().sum() == 0:
                     date_numeric = pd.to_numeric(date_raw, errors='coerce')
                     if date_numeric.notna().sum() > 0:
-                        date_parsed = pd.to_datetime(date_numeric, unit='d', origin='1899-12-30', errors='coerce')
+                        date_parsed = pd.to_datetime(date_numeric, unit='D', origin='1899-12-30', errors='coerce')
 
                 date_series = df_clean.copy()
                 date_series['_working_date'] = date_parsed.dt.date
@@ -2136,7 +2142,16 @@ class InvoiceGenerator:
             total_pickup_parcels = int(numeric_df["Pickup Parcels"].sum()) if "Pickup Parcels" in numeric_df.columns else 0
             total_return_payout = numeric_df["Return Parcels Payout"].sum() if "Return Parcels Payout" in numeric_df.columns else 0.0
             total_return_parcels = int(numeric_df["Return Parcels"].sum()) if "Return Parcels" in numeric_df.columns else 0
+            total_qr_orders = int(numeric_df["QR Orders"].sum()) if "QR Orders" in numeric_df.columns else 0
+            total_qr_order_payout = numeric_df["QR Orders Payout"].sum() if "QR Orders Payout" in numeric_df.columns else 0.0
             total_penalty = numeric_df["Penalty"].sum() if "Penalty" in numeric_df.columns else 0.0
+            penalty_by_type = {
+                'duitnow': numeric_df["DuitNow Penalty"].sum() if "DuitNow Penalty" in numeric_df.columns else 0.0,
+                'ldr': numeric_df["LDR Penalty"].sum() if "LDR Penalty" in numeric_df.columns else 0.0,
+                'fake_attempt': numeric_df["Fake Attempt Penalty"].sum() if "Fake Attempt Penalty" in numeric_df.columns else 0.0,
+                'cod': numeric_df["COD Penalty"].sum() if "COD Penalty" in numeric_df.columns else 0.0,
+                'attendance': numeric_df["Attendance Penalty"].sum() if "Attendance Penalty" in numeric_df.columns else 0.0
+            }
             top_3 = display_df.head(3)
 
             table_columns = ["Dispatcher ID", "Dispatcher Name", "Parcels Delivered",
@@ -2183,13 +2198,17 @@ class InvoiceGenerator:
                 .total-badge .label {{ font-size: 12px; opacity: 0.9; margin-bottom: 4px; }}
                 .total-badge .value {{ font-size: 28px; font-weight: 800; }}
                 .summary {{
-                  margin-top: 24px; display: flex; gap: 12px; flex-wrap: wrap; justify-content: center;
+                  margin-top: 24px;
+                }}
+                .summary-row {{
+                  display: flex; gap: 12px; flex-wrap: wrap; justify-content: center; margin-bottom: 12px;
                 }}
                 .chip {{
                   border: 1px solid var(--border); border-radius: 12px;
                   padding: 16px; background: var(--surface); min-width: 180px;
                   box-shadow: 0 1px 3px rgba(0,0,0,0.1);
                   transition: transform 0.2s, box-shadow 0.2s;
+                  text-align: center;
                 }}
                 .chip:hover {{
                   transform: translateY(-2px);
@@ -2199,6 +2218,7 @@ class InvoiceGenerator:
                 .chip .label {{ color: var(--text-secondary); font-size: 12px; text-transform: uppercase;
                                letter-spacing: 0.5px; font-weight: 600; }}
                 .chip .value {{ font-size: 18px; font-weight: 700; margin-top: 6px; color: var(--primary); }}
+                .chip .subtext {{ margin-top: 8px; font-size: 12px; color: var(--text-secondary); line-height: 1.4; }}
                 table {{
                   border-collapse: collapse; width: 100%; margin-top: 24px;
                   box-shadow: 0 1px 3px rgba(0,0,0,0.1);
@@ -2246,6 +2266,7 @@ class InvoiceGenerator:
                     </div>
 
                     <div class="summary">
+                        <div class="summary-row">
                         <div class="chip">
                             <div class="label">Total Dispatchers</div>
                             <div class="value">{total_dispatchers}</div>
@@ -2253,10 +2274,6 @@ class InvoiceGenerator:
                         <div class="chip">
                             <div class="label">Total Parcels</div>
                             <div class="value">{total_parcels:,}</div>
-                        </div>
-                        <div class="chip">
-                            <div class="label">Delivery Parcels Payout</div>
-                            <div class="value">{currency_symbol} {total_dispatch_payout:,.2f}</div>
                         </div>
                         <div class="chip">
                             <div class="label">Pickup Parcels</div>
@@ -2267,8 +2284,31 @@ class InvoiceGenerator:
                             <div class="value">{total_return_parcels:,}</div>
                         </div>
                         <div class="chip">
-                            <div class="label">Total Penalty</div>
-                            <div class="value">-{currency_symbol} {total_penalty:,.2f}</div>
+                            <div class="label">QR Orders</div>
+                            <div class="value">{total_qr_orders:,}</div>
+                        </div>
+                        </div>
+                        <div class="summary-row">
+                            <div class="chip">
+                                <div class="label">Delivery Parcels Payout</div>
+                                <div class="value">{currency_symbol} {total_dispatch_payout:,.2f}</div>
+                                <div class="subtext">
+                                    Pickup: {currency_symbol} {total_pickup_payout:,.2f} ·
+                                    Return: {currency_symbol} {total_return_payout:,.2f} ·
+                                    QR Orders: {currency_symbol} {total_qr_order_payout:,.2f}
+                                </div>
+                            </div>
+                            <div class="chip">
+                                <div class="label">Total Penalty</div>
+                                <div class="value">-{currency_symbol} {total_penalty:,.2f}</div>
+                                <div class="subtext">
+                                    DuitNow: -{currency_symbol} {penalty_by_type['duitnow']:,.2f} ·
+                                    LDR: -{currency_symbol} {penalty_by_type['ldr']:,.2f} ·
+                                    Fake: -{currency_symbol} {penalty_by_type['fake_attempt']:,.2f} ·
+                                    COD: -{currency_symbol} {penalty_by_type['cod']:,.2f} ·
+                                    Attendance: -{currency_symbol} {penalty_by_type['attendance']:,.2f}
+                                </div>
+                            </div>
                         </div>
                     </div>
 
@@ -2465,6 +2505,21 @@ def main():
         config["return_payout_per_parcel"] = return_payout_per_parcel
         Config.save(config)
 
+    # Add configuration for fake attempt penalty per parcel
+    fake_attempt_penalty_per_parcel = st.sidebar.number_input(
+        "Fake Attempt Penalty per Parcel",
+        min_value=0.0,
+        max_value=100.0,
+        value=config.get("fake_attempt_penalty_per_parcel", 1.00),
+        step=0.10,
+        help="Penalty amount per fake attempt waybill"
+    )
+
+    # Update config with new value
+    if fake_attempt_penalty_per_parcel != config.get("fake_attempt_penalty_per_parcel", 1.00):
+        config["fake_attempt_penalty_per_parcel"] = fake_attempt_penalty_per_parcel
+        Config.save(config)
+
     # Add configuration for forecast days
     forecast_days = st.sidebar.number_input(
         "Forecast Period (days)",
@@ -2495,6 +2550,9 @@ def main():
 
     **↩️ Return Parcels Payout:**
     - RM{return_payout_per_parcel:.2f} per parcel
+
+    **🚫 Fake Attempt Penalty:**
+    - RM{fake_attempt_penalty_per_parcel:.2f} per parcel
 
     **📈 Forecast Period:**
     - {forecast_days} days
@@ -3438,11 +3496,14 @@ def main():
         st.markdown("---")
         st.subheader("📄 Invoice Generation")
         invoice_html = InvoiceGenerator.build_invoice_html(display_df, numeric_df, total_payout, currency, pickup_payout_per_parcel)
+        st.components.v1.html(invoice_html, height=1200, scrolling=True)
+
         st.download_button(
             label="📥 Download Invoice (HTML)",
             data=invoice_html.encode("utf-8"),
             file_name=f"invoice_{datetime.now().strftime('%Y%m%d')}.html",
-            mime="text/html"
+            mime="text/html",
+            use_container_width=True
         )
 
         st.markdown("---")
