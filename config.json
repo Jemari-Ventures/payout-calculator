@@ -1,6 +1,6 @@
 {
   "data_source": {
-    "type": "postgres",
+    "type": "excel",
     "gsheet_url": "https://docs.google.com/spreadsheets/d/1rLdCtIvwCLX23-9SSBXAKIp_B75jTBts/edit?gid=830451308#gid=830451308",
     "postgres_table": "dispatch",
     "pickup_table": "pickup",

@@ -557,7 +557,7 @@ class PayoutCalculator:
             'ldr': {'amount': 0.0, 'count': 0, 'waybills': []},
             'fake_attempt': {'amount': 0.0, 'count': 0, 'waybills': []},
             'cod': {'amount': 0.0, 'count': 0},
-            'attendance': {'amount': 0.0, 'missing_days': 0, 'working_days': 0, 'attendance_days': 0},
+            'attendance': {'amount': 0.0, 'count': 0},
             'total_amount': 0.0,
             'total_count': 0
         }
@@ -884,8 +884,8 @@ class PayoutCalculator:
                         penalty_breakdown['cod']['amount'] = round(float(penalty_amount), 2)
                         penalty_breakdown['cod']['count'] = len(cod_rows)
 
-        # 5. Process Attendance penalty (Attendance sheet)
-        if attendance_df is not None and not attendance_df.empty and working_days is not None:
+        # 5. Process Attendance penalty (Attendance sheet) - direct penalty column sum by employee_id
+        if attendance_df is not None and not attendance_df.empty:
             emp_id_col = find_column(attendance_df, ["Employee ID", "employee_id", "EMPLOYEE ID", "EMPLOYEE_ID"])
             if emp_id_col:
                 attendance_df_copy = attendance_df.copy()
@@ -894,25 +894,14 @@ class PayoutCalculator:
                     attendance_df_copy[emp_id_col] == dispatcher_id_normalized
                 ]
 
-                attendance_days = 0
                 if not attendance_rows.empty:
-                    date_col = find_column(attendance_rows, ["Attendance Record Date", "attendance_record_date",
-                                                             "Attendance Date", "attendance_date"])
-                    if date_col:
-                        attendance_days = attendance_rows[date_col].dropna().nunique()
-                    else:
-                        attendance_days = len(attendance_rows)
-
-                working_days_int = max(int(working_days), 0)
-                missing_days = max(working_days_int - attendance_days, 0)
-
-                penalty_breakdown['attendance']['working_days'] = working_days_int
-                penalty_breakdown['attendance']['attendance_days'] = attendance_days
-                penalty_breakdown['attendance']['missing_days'] = missing_days
-
-                if missing_days > 0:
-                    penalty_amount = 10.0 if missing_days < 10 else 20.0
-                    penalty_breakdown['attendance']['amount'] = round(float(penalty_amount), 2)
+                    penalty_col = find_column(attendance_rows, ["Penalty", "penalty", "ATTENDANCE PENALTY", "attendance_penalty", "attendance penalty"])
+                    if penalty_col:
+                        penalty_values = attendance_rows[penalty_col].apply(
+                            lambda x: PayoutCalculator._convert_to_float(x)
+                        )
+                        penalty_breakdown['attendance']['amount'] = round(float(penalty_values.sum()), 2)
+                        penalty_breakdown['attendance']['count'] = int((penalty_values > 0).sum())
 
         # Calculate totals (round to 2 decimal places to avoid floating-point precision issues)
         penalty_breakdown['total_amount'] = round(
@@ -927,7 +916,7 @@ class PayoutCalculator:
             penalty_breakdown['ldr']['count'] +
             penalty_breakdown['fake_attempt']['count'] +
             penalty_breakdown['cod']['count'] +
-            penalty_breakdown['attendance']['missing_days']
+            penalty_breakdown['attendance']['count']
         )
 
         return penalty_breakdown
@@ -1633,7 +1622,7 @@ class PayoutCalculator:
                            'ldr': {'amount': 0.0, 'count': 0, 'waybills': []},
                            'fake_attempt': {'amount': 0.0, 'count': 0, 'waybills': []},
                            'cod': {'amount': 0.0, 'count': 0},
-                           'attendance': {'amount': 0.0, 'missing_days': 0, 'working_days': 0, 'attendance_days': 0},
+                           'attendance': {'amount': 0.0, 'count': 0},
                            'total_amount': 0.0, 'total_count': 0}
 
         # Extract dispatcher_id with flexible column name matching
@@ -1828,13 +1817,14 @@ class InvoiceGenerator:
             .brand {{ font-weight: 700; font-size: 24px; letter-spacing: -0.5px; }}
             .idline {{ opacity: 0.9; font-size: 14px; margin-top: 4px; }}
             .summary {{
-              margin-top: 24px; display: flex; gap: 12px; flex-wrap: wrap;
+              margin-top: 24px; display: flex; gap: 12px; flex-wrap: wrap; justify-content: center;
             }}
             .chip {{
               border: 1px solid var(--border); border-radius: 12px;
               padding: 16px; background: var(--surface); min-width: 160px;
               box-shadow: 0 1px 3px rgba(0,0,0,0.1);
               transition: transform 0.2s, box-shadow 0.2s;
+              text-align: center;
             }}
             .chip:hover {{
               transform: translateY(-2px);
@@ -2097,7 +2087,7 @@ class InvoiceGenerator:
                 if penalty_breakdown['attendance']['amount'] > 0:
                     html_content += f"""
                         <div class="penalty-item">
-                            <span><strong>Attendance:</strong> {penalty_breakdown['attendance']['missing_days']} day(s) missing clock-in</span>
+                            <span><strong>Attendance:</strong> Missing Clock-in</span>
                             <span>- {currency_symbol} {penalty_breakdown['attendance']['amount']:,.2f}</span>
                         </div>
                     """
@@ -2207,7 +2197,7 @@ class InvoiceGenerator:
             if penalty_breakdown['attendance']['amount'] > 0:
                 html_content += f"""
                 <div class="payout-row penalty-detail-row">
-                    <span>↳ Attendance ({penalty_breakdown['attendance']['missing_days']} day(s) missing clock-in):</span>
+                    <span>↳ Attendance (Missing Clock-in):</span>
                     <span>- {currency_symbol} {penalty_breakdown['attendance']['amount']:,.2f}</span>
                 </div>"""
 
@@ -2580,7 +2570,7 @@ def main():
                         'ldr': {'amount': 0.0, 'count': 0, 'waybills': []},
                         'fake_attempt': {'amount': 0.0, 'count': 0, 'waybills': []},
                         'cod': {'amount': 0.0, 'count': 0},
-                        'attendance': {'amount': 0.0, 'missing_days': 0, 'working_days': 0, 'attendance_days': 0},
+                        'attendance': {'amount': 0.0, 'count': 0},
                         'total_amount': 0.0, 'total_count': 0}
     per_day_df = pd.DataFrame()
     pickup_filtered_df = pd.DataFrame()
@@ -3011,8 +3001,7 @@ def main():
 
                     with penalty_col5:
                         if penalty_breakdown['attendance']['amount'] > 0:
-                            missing_days = penalty_breakdown['attendance']['missing_days']
-                            st.error(f"**Attendance:** {missing_days} day(s) missing clock-in - {config['currency_symbol']}{penalty_breakdown['attendance']['amount']:,.2f}")
+                            st.error(f"**Attendance:** Missing Clock-in - {config['currency_symbol']}{penalty_breakdown['attendance']['amount']:,.2f}")
 
             # Display payout breakdown
             st.subheader("💰 Payout Breakdown")

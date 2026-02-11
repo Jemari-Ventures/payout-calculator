@@ -885,6 +885,14 @@ class PayoutCalculator:
                 employee_id_col = next((col for col in df.columns if col.lower() == 'employee_id'), None)
                 if employee_id_col:
                     df_processed['_employee_id_normalized'] = df_processed[employee_id_col].apply(normalize_dispatcher_id)
+                ldr_penalty_col = next((col for col in df.columns if col.lower() in ['penalty', 'amount']), None)
+                if ldr_penalty_col:
+                    # Use explicit penalty column when provided by source sheet
+                    if 'penalty_numeric' not in df_processed.columns:
+                        df_processed['penalty_numeric'] = df_processed[ldr_penalty_col].apply(
+                            lambda x: Decimal(str(x)) if pd.notna(x) else Decimal('0')
+                        )
+                    df_processed = df_processed[df_processed['penalty_numeric'] > 0].copy()
 
             # Pre-process Fake Attempt penalty data
             elif penalty_type == 'fake_attempt':
@@ -915,25 +923,21 @@ class PayoutCalculator:
 
     @staticmethod
     def calculate_penalty(dispatcher_id: str, penalty_data: Optional[Dict[str, pd.DataFrame]],
-                          attendance_days: int = 0, working_days: int = 0) -> Tuple[float, int, List[str], int, float]:
+                          attendance_penalty_amount: float = 0.0) -> Tuple[float, int, List[str], float]:
         """
         Calculate total penalty for a dispatcher from all penalty types.
 
         Args:
             dispatcher_id: Dispatcher ID to calculate penalty for
             penalty_data: Dictionary containing penalty dataframes from all penalty tables
-            attendance_days: Unique attendance days for dispatcher
-            working_days: Total working days for dispatcher
+            attendance_penalty_amount: Attendance penalty amount for dispatcher
 
         Returns:
-            (total_penalty_amount, total_penalty_count, waybill_numbers, missing_days, attendance_penalty)
+            (total_penalty_amount, total_penalty_count, waybill_numbers, attendance_penalty)
         """
         if penalty_data is None or not penalty_data:
-            missing_days = max(int(working_days) - int(attendance_days), 0)
-            attendance_penalty = 0.0
-            if missing_days > 0:
-                attendance_penalty = 10.0 if missing_days < 10 else 20.0
-            return attendance_penalty, 0, [], missing_days, attendance_penalty
+            attendance_penalty = float(attendance_penalty_amount)
+            return attendance_penalty, 0, [], attendance_penalty
 
         total_penalty = 0.0
         total_count = 0
@@ -967,7 +971,7 @@ class PayoutCalculator:
                     total_penalty += float(duitnow_penalty_rounded)  # Convert to float only at the end
                     total_count += len(duitnow_records)
 
-        # 2. LDR Penalty: employee_id column = dispatcher_id, penalty = waybill count * RM 100
+        # 2. LDR Penalty: employee_id column = dispatcher_id, penalty from penalty/amount column
         if 'ldr' in penalty_data:
             ldr_df = penalty_data['ldr']
             if not ldr_df.empty:
@@ -984,18 +988,29 @@ class PayoutCalculator:
                         ldr_records = pd.DataFrame()
 
                 if not ldr_records.empty:
-                    # Count unique waybills (using ticket_no or no_awb if available)
                     waybill_col = next((col for col in ldr_df.columns if col.lower() in ['ticket_no', 'no_awb', 'waybill_number']), None)
                     if waybill_col:
-                        waybill_count = ldr_records[waybill_col].nunique()
                         waybill_list = ldr_records[waybill_col].dropna().astype(str).unique().tolist()
                         waybill_numbers.extend([wb for wb in waybill_list if wb and wb.lower() != 'nan'])
-                    else:
-                        waybill_count = len(ldr_records)
 
-                    ldr_penalty = waybill_count * 100.0  # RM 100 per waybill
+                    if 'penalty_numeric' in ldr_records.columns:
+                        rounded_penalties = [
+                            penalty.quantize(Decimal('0.01'), rounding='ROUND_HALF_UP')
+                            for penalty in ldr_records['penalty_numeric'].tolist()
+                        ]
+                        ldr_penalty = float(
+                            sum(rounded_penalties).quantize(Decimal('0.01'), rounding='ROUND_HALF_UP')
+                        )
+                    else:
+                        # Fallback for legacy datasets without penalty column
+                        if waybill_col:
+                            waybill_count = ldr_records[waybill_col].nunique()
+                        else:
+                            waybill_count = len(ldr_records)
+                        ldr_penalty = waybill_count * 100.0
+
                     total_penalty += ldr_penalty
-                    total_count += waybill_count
+                    total_count += len(ldr_records)
 
         # 3. Fake Attempt Penalty: dispatcher_id column = dispatcher_id, penalty = waybill count * RM 1.00
         if 'fake_attempt' in penalty_data:
@@ -1055,18 +1070,14 @@ class PayoutCalculator:
                     total_penalty += float(cod_penalty_rounded)  # Convert to float only at the end
                     total_count += len(cod_records)
 
-        missing_days = max(int(working_days) - int(attendance_days), 0)
-        attendance_penalty = 0.0
-        if missing_days > 0:
-            attendance_penalty = 10.0 if missing_days < 10 else 20.0
+        attendance_penalty = float(attendance_penalty_amount)
+        total_penalty += attendance_penalty
 
-        total_penalty += float(attendance_penalty)
-
-        return float(total_penalty), total_count, waybill_numbers, missing_days, float(attendance_penalty)
+        return float(total_penalty), total_count, waybill_numbers, attendance_penalty
 
     @staticmethod
     def calculate_penalty_breakdown(dispatcher_id: str, penalty_data: Optional[Dict[str, pd.DataFrame]],
-                                    attendance_days: int = 0, working_days: int = 0) -> Dict[str, float]:
+                                    attendance_penalty_amount: float = 0.0) -> Dict[str, float]:
         """
         Calculate penalty breakdown by type for a dispatcher.
 
@@ -1085,9 +1096,7 @@ class PayoutCalculator:
             'attendance': 0.0
         }
 
-        missing_days = max(int(working_days) - int(attendance_days), 0)
-        if missing_days > 0:
-            breakdown['attendance'] = 10.0 if missing_days < 10 else 20.0
+        breakdown['attendance'] = float(attendance_penalty_amount)
 
         if penalty_data is None or not penalty_data:
             return breakdown
@@ -1121,7 +1130,7 @@ class PayoutCalculator:
                         sum(rounded_penalties).quantize(Decimal('0.01'), rounding='ROUND_HALF_UP')
                     )
 
-        # 2. LDR Penalty: employee_id column = dispatcher_id, penalty = waybill count * RM 100
+        # 2. LDR Penalty: employee_id column = dispatcher_id, penalty from penalty/amount column
         if 'ldr' in penalty_data:
             ldr_df = penalty_data['ldr']
             if not ldr_df.empty:
@@ -1138,13 +1147,22 @@ class PayoutCalculator:
                         ldr_records = pd.DataFrame()
 
                 if not ldr_records.empty:
-                    waybill_col = next((col for col in ldr_df.columns if col.lower() in ['ticket_no', 'no_awb', 'waybill_number']), None)
-                    if waybill_col:
-                        waybill_count = ldr_records[waybill_col].nunique()
+                    if 'penalty_numeric' in ldr_records.columns:
+                        rounded_penalties = [
+                            penalty.quantize(Decimal('0.01'), rounding='ROUND_HALF_UP')
+                            for penalty in ldr_records['penalty_numeric'].tolist()
+                        ]
+                        breakdown['ldr'] = float(
+                            sum(rounded_penalties).quantize(Decimal('0.01'), rounding='ROUND_HALF_UP')
+                        )
                     else:
-                        waybill_count = len(ldr_records)
-
-                    breakdown['ldr'] = waybill_count * 100.0  # RM 100 per waybill
+                        # Fallback for legacy datasets without penalty column
+                        waybill_col = next((col for col in ldr_df.columns if col.lower() in ['ticket_no', 'no_awb', 'waybill_number']), None)
+                        if waybill_col:
+                            waybill_count = ldr_records[waybill_col].nunique()
+                        else:
+                            waybill_count = len(ldr_records)
+                        breakdown['ldr'] = waybill_count * 100.0
 
         # 3. Fake Attempt Penalty: dispatcher_id column = dispatcher_id, penalty = waybill count * RM 1.00
         if 'fake_attempt' in penalty_data:
@@ -1262,21 +1280,38 @@ class PayoutCalculator:
                     st.error(f"❌ 'penalty' column not found in DuitNow data. Available columns: {list(duitnow_df.columns)}")
                     penalty_totals['duitnow'] = 0.0
 
-        # 2. LDR Penalty: count waybills * RM 100
+        # 2. LDR Penalty: sum penalty column (fallback to legacy count-based)
         if 'ldr' in penalty_data:
             ldr_df = penalty_data['ldr']
-            waybill_col = None
-            for col in ldr_df.columns:
-                if col.lower() in ['ticket_no', 'no_awb', 'waybill_number']:
-                    waybill_col = col
-                    break
-
-            if waybill_col:
-                waybill_count = ldr_df[waybill_col].nunique()
+            ldr_penalty_col = next((col for col in ldr_df.columns if col.lower() in ['penalty', 'amount']), None)
+            if ldr_penalty_col:
+                ldr_df = ldr_df.copy()
+                ldr_df['penalty_numeric'] = ldr_df[ldr_penalty_col].apply(
+                    lambda x: Decimal(str(x)) if pd.notna(x) else Decimal('0')
+                )
+                ldr_filtered = ldr_df[ldr_df['penalty_numeric'] > 0]
+                if len(ldr_filtered) > 0:
+                    rounded_penalties = [
+                        penalty.quantize(Decimal('0.01'), rounding='ROUND_HALF_UP')
+                        for penalty in ldr_filtered['penalty_numeric'].tolist()
+                    ]
+                    penalty_totals['ldr'] = float(
+                        sum(rounded_penalties).quantize(Decimal('0.01'), rounding='ROUND_HALF_UP')
+                    )
+                else:
+                    penalty_totals['ldr'] = 0.0
             else:
-                waybill_count = len(ldr_df)
-
-            penalty_totals['ldr'] = waybill_count * 100.0  # RM 100 per waybill
+                # Fallback for legacy datasets without penalty column
+                waybill_col = None
+                for col in ldr_df.columns:
+                    if col.lower() in ['ticket_no', 'no_awb', 'waybill_number']:
+                        waybill_col = col
+                        break
+                if waybill_col:
+                    waybill_count = ldr_df[waybill_col].nunique()
+                else:
+                    waybill_count = len(ldr_df)
+                penalty_totals['ldr'] = waybill_count * 100.0
 
         # 3. Fake Attempt Penalty: count waybills * RM 1.00
         if 'fake_attempt' in penalty_data:
@@ -1595,47 +1630,22 @@ class PayoutCalculator:
         date_col = delivery_sig_col or ('date' if 'date' in df_clean.columns else find_column(df_clean, 'date'))
         df_unique = df_clean.copy()
 
-        # Working days per dispatcher (based on unique delivery dates from dispatch sheet)
-        working_days_map = {}
-        if date_col:
-            if delivery_sig_col and delivery_sig_col in df.columns:
-                date_raw = df[delivery_sig_col]
-            elif date_col in df_clean.columns:
-                date_raw = df_clean[date_col]
-            else:
-                date_raw = None
-
-            if date_raw is not None:
-                date_parsed = pd.to_datetime(date_raw, errors='coerce')
-                if date_parsed.notna().sum() == 0:
-                    date_parsed = pd.to_datetime(date_raw, errors='coerce', dayfirst=True)
-                if date_parsed.notna().sum() == 0:
-                    date_numeric = pd.to_numeric(date_raw, errors='coerce')
-                    if date_numeric.notna().sum() > 0:
-                        date_parsed = pd.to_datetime(date_numeric, unit='D', origin='1899-12-30', errors='coerce')
-
-                date_series = df_clean.copy()
-                date_series['_working_date'] = date_parsed.dt.date
-                date_series = date_series.dropna(subset=['_working_date'])
-            else:
-                date_series = pd.DataFrame()
-
-            if not date_series.empty:
-                date_series['dispatcher_id_norm'] = date_series['dispatcher_id'].apply(normalize_dispatcher_id)
-                working_days_map = (
-                    date_series.groupby('dispatcher_id_norm')['_working_date']
-                    .nunique()
-                    .to_dict()
-                )
-
-        # Attendance clock-in count per dispatcher (count of rows)
-        attendance_days_map = {}
+        # Attendance penalty map per dispatcher (sum of attendance penalty column)
+        attendance_penalty_map = {}
         if attendance_df is not None and not attendance_df.empty:
             emp_id_col = next((col for col in attendance_df.columns if str(col).strip().lower() in ['employee id', 'employee_id', 'employee id.']), None)
-            if emp_id_col:
+            penalty_col = next((col for col in attendance_df.columns if str(col).strip().lower() in ['penalty', 'attendance_penalty', 'attendance penalty']), None)
+            if emp_id_col and penalty_col:
                 attendance_copy = attendance_df.copy()
                 attendance_copy['_emp_id'] = attendance_copy[emp_id_col].apply(normalize_dispatcher_id)
-                attendance_days_map = attendance_copy.groupby('_emp_id').size().to_dict()
+                attendance_copy['_penalty_amount'] = pd.to_numeric(attendance_copy[penalty_col], errors='coerce').fillna(0.0)
+                attendance_copy = attendance_copy[attendance_copy['_penalty_amount'] > 0]
+                attendance_penalty_map = (
+                    attendance_copy.groupby('_emp_id')['_penalty_amount']
+                    .sum()
+                    .round(2)
+                    .to_dict()
+                )
 
         # Diagnostics
         raw_weight = df_clean['weight'].sum()
@@ -1683,16 +1693,12 @@ class PayoutCalculator:
         # Calculate penalties
         grouped['penalty_amount'] = 0.0
         grouped['penalty_count'] = 0
-        grouped['attendance_penalty_count'] = 0
         grouped['penalty_waybills'] = ''
         grouped['duitnow_penalty'] = 0.0
         grouped['ldr_penalty'] = 0.0
         grouped['fake_attempt_penalty'] = 0.0
         grouped['cod_penalty'] = 0.0
         grouped['attendance_penalty'] = 0.0
-        grouped['attendance_missing_days'] = 0
-        grouped['working_days'] = 0
-        grouped['clock_in_attendance'] = 0
 
         # Pre-process penalty dataframes once for better performance
         penalty_data_processed = PayoutCalculator._preprocess_penalty_data(penalty_data) if penalty_data else None
@@ -1701,14 +1707,13 @@ class PayoutCalculator:
         def calculate_penalties(row):
             dispatcher_id = str(row['dispatcher_id'])
             dispatcher_key = normalize_dispatcher_id(dispatcher_id)
-            working_days = int(working_days_map.get(dispatcher_key, 0))
-            attendance_days = int(attendance_days_map.get(dispatcher_key, 0))
+            attendance_penalty = float(attendance_penalty_map.get(dispatcher_key, 0.0))
 
-            penalty_amount, penalty_count, penalty_waybills, missing_days, attendance_penalty = PayoutCalculator.calculate_penalty(
-                dispatcher_id, penalty_data_processed, attendance_days, working_days
+            penalty_amount, penalty_count, penalty_waybills, attendance_penalty = PayoutCalculator.calculate_penalty(
+                dispatcher_id, penalty_data_processed, attendance_penalty
             )
             penalty_breakdown = PayoutCalculator.calculate_penalty_breakdown(
-                dispatcher_id, penalty_data_processed, attendance_days, working_days
+                dispatcher_id, penalty_data_processed, attendance_penalty
             )
             return pd.Series({
                 'penalty_amount': penalty_amount,
@@ -1718,18 +1723,13 @@ class PayoutCalculator:
                 'ldr_penalty': penalty_breakdown['ldr'],
                 'fake_attempt_penalty': penalty_breakdown['fake_attempt'],
                 'cod_penalty': penalty_breakdown['cod'],
-                'attendance_penalty': attendance_penalty,
-                'attendance_missing_days': missing_days,
-                'working_days': working_days,
-                'clock_in_attendance': attendance_days,
-                'attendance_penalty_count': missing_days
+                'attendance_penalty': attendance_penalty
             })
 
         penalty_results = grouped.apply(calculate_penalties, axis=1)
         grouped[['penalty_amount', 'penalty_count', 'penalty_waybills',
                  'duitnow_penalty', 'ldr_penalty', 'fake_attempt_penalty', 'cod_penalty',
-                 'attendance_penalty', 'attendance_missing_days', 'working_days', 'clock_in_attendance',
-                 'attendance_penalty_count']] = penalty_results
+                 'attendance_penalty']] = penalty_results
 
         # Calculate pickup payout
         grouped = PayoutCalculator.calculate_pickup_payout(pickup_df, grouped, pickup_payout_per_parcel)
@@ -1741,7 +1741,6 @@ class PayoutCalculator:
         grouped = PayoutCalculator.calculate_return_payout(return_df, grouped, return_payout_per_parcel)
 
         # Calculate total payout: dispatch payout - penalty + pickup payout + QR order payout + return payout
-        grouped['penalty_count'] = grouped['penalty_count'] + grouped['attendance_penalty_count']
         grouped['total_payout'] = grouped['dispatch_payout'] - grouped['penalty_amount'] + grouped['pickup_payout'] + grouped['qr_order_payout'] + grouped['return_payout']
 
         # Create display and numeric dataframes
@@ -1762,10 +1761,6 @@ class PayoutCalculator:
             "fake_attempt_penalty": "Fake Attempt Penalty",
             "cod_penalty": "COD Penalty",
             "attendance_penalty": "Attendance Penalty",
-            "attendance_missing_days": "Attendance Missing Days",
-            "attendance_penalty_count": "Attendance Penalty Count",
-            "working_days": "Working Days",
-            "clock_in_attendance": "Clock-in Attendance",
             "pickup_parcels": "Pickup Parcels",
             "pickup_payout": "Pickup Parcels Payout",
             "qr_order_count": "QR Orders",
@@ -1819,13 +1814,14 @@ class PayoutCalculator:
             st.success(f"✅ Processed {len(df_unique)} parcels from {len(grouped)} dispatchers")
             if attendance_df is not None:
                 total_att_rows = len(attendance_df)
-                matched_dispatchers = len(set(attendance_days_map.keys()) & set(working_days_map.keys()))
-                st.info(f"Attendance rows loaded: {total_att_rows:,} | Matched dispatchers: {matched_dispatchers:,}")
+                dispatch_ids = {normalize_dispatcher_id(x) for x in grouped['dispatcher_id'].tolist()}
+                matched_dispatchers = len(set(attendance_penalty_map.keys()) & dispatch_ids)
+                st.info(f"Attendance rows loaded: {total_att_rows:,} | Dispatchers with attendance penalty: {matched_dispatchers:,}")
                 st.info(
-                    f"Attendance IDs: {len(attendance_days_map):,} | "
-                    f"Dispatch IDs: {len(working_days_map):,} | "
-                    f"Sample attendance IDs: {list(attendance_days_map.keys())[:10]} | "
-                    f"Sample dispatch IDs: {list(working_days_map.keys())[:10]}"
+                    f"Attendance penalty IDs: {len(attendance_penalty_map):,} | "
+                    f"Dispatch IDs: {len(dispatch_ids):,} | "
+                    f"Sample attendance IDs: {list(attendance_penalty_map.keys())[:10]} | "
+                    f"Sample dispatch IDs: {list(dispatch_ids)[:10]}"
                 )
                 if date_col:
                     if delivery_sig_col and delivery_sig_col in df.columns:
@@ -3185,8 +3181,7 @@ def main():
                 "Delivery Parcels Payout", "Pickup Parcels", "Pickup Parcels Payout",
                 "QR Orders", "QR Orders Payout",
                 "Return Parcels", "Return Parcels Payout",
-            "Working Days", "Clock-in Attendance", "Attendance Penalty Count",
-                "Penalty", "DuitNow Penalty", "LDR Penalty", "Fake Attempt Penalty", "COD Penalty", "Attendance Penalty", "Attendance Missing Days",
+                "Penalty", "DuitNow Penalty", "LDR Penalty", "Fake Attempt Penalty", "COD Penalty", "Attendance Penalty",
                 "Total Payout", "Total Weight (kg)", "Avg Weight (kg)",
                 "Avg Rate per Parcel", "Parcels 0-5kg", "Parcels 5.01-10kg",
                 "Parcels 10.01-30kg", "Parcels 30+kg"
