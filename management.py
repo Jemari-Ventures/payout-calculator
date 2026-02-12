@@ -83,7 +83,8 @@ class Config:
                 "cod": "COD",
                 "qr_order": "QR Order",
                 "return": "Return",
-                "attendance": "Attendance"
+                "attendance": "Attendance",
+                "reward": "Reward"
             }
         },
         "database": {"table_name": "dispatch"},
@@ -122,6 +123,8 @@ class Config:
                         config["data_source"]["excel_file"] = ""
                     if "excel_sheets" not in config.get("data_source", {}):
                         config["data_source"]["excel_sheets"] = Config.DEFAULT_CONFIG["data_source"]["excel_sheets"]
+                    elif "reward" not in config["data_source"]["excel_sheets"]:
+                        config["data_source"]["excel_sheets"]["reward"] = "Reward"
                     if "pickup_payout_per_parcel" not in config:
                         config["pickup_payout_per_parcel"] = 1.50
                     if "forecast_days" not in config:
@@ -760,6 +763,37 @@ class DataSource:
             return df
         except Exception as exc:
             st.warning(f"Could not load attendance data from PostgreSQL table 'attendance': {exc}")
+            return None
+
+    @staticmethod
+    def load_reward_data(config: dict, excel_source=None) -> Optional[pd.DataFrame]:
+        """Load reward data from reward table or Excel sheet."""
+        data_source = config.get("data_source", {})
+        source_type = data_source.get("type", "postgres")
+
+        if source_type == "excel":
+            try:
+                sheet_name = DataSource._get_excel_sheet_name(config, "reward", "Reward")
+                gsheet_url = data_source.get("gsheet_url")
+                if not gsheet_url:
+                    return None
+                df = DataSource.read_google_sheet(gsheet_url, sheet_name=sheet_name)
+                if df.empty and sheet_name != sheet_name.upper():
+                    df = DataSource.read_google_sheet(gsheet_url, sheet_name=sheet_name.upper())
+                return df
+            except Exception as exc:
+                st.warning(f"Could not load reward data from Excel sheet '{sheet_name}': {exc}")
+                return None
+
+        engine = DataSource.get_postgres_engine()
+        if not engine:
+            return None
+
+        try:
+            df = DataSource.read_postgres_table(engine, 'reward')
+            return df
+        except Exception as exc:
+            st.warning(f"Could not load reward data from PostgreSQL table 'reward': {exc}")
             return None
 
 # =============================================================================
@@ -1598,6 +1632,7 @@ class PayoutCalculator:
                         qr_order_payout_per_order: float = 1.80,
                         return_df: Optional[pd.DataFrame] = None,
                         return_payout_per_parcel: float = 1.50,
+                        reward_df: Optional[pd.DataFrame] = None,
                         attendance_df: Optional[pd.DataFrame] = None,
                         processing_warnings: Optional[List[str]] = None) -> Tuple[pd.DataFrame, pd.DataFrame, float]:
         """Calculate payout using tier-based weight calculation."""
@@ -1642,6 +1677,21 @@ class PayoutCalculator:
                 attendance_copy = attendance_copy[attendance_copy['_penalty_amount'] > 0]
                 attendance_penalty_map = (
                     attendance_copy.groupby('_emp_id')['_penalty_amount']
+                    .sum()
+                    .round(2)
+                    .to_dict()
+                )
+
+        reward_map = {}
+        if reward_df is not None and not reward_df.empty:
+            reward_emp_id_col = next((col for col in reward_df.columns if str(col).strip().lower() in ['employee id', 'employee_id', 'employee id.']), None)
+            reward_amount_col = next((col for col in reward_df.columns if str(col).strip().lower() in ['amount', 'reward', 'reward_amount']), None)
+            if reward_emp_id_col and reward_amount_col:
+                reward_copy = reward_df.copy()
+                reward_copy['_emp_id'] = reward_copy[reward_emp_id_col].apply(normalize_dispatcher_id)
+                reward_copy['_reward_amount'] = pd.to_numeric(reward_copy[reward_amount_col], errors='coerce').fillna(0.0)
+                reward_map = (
+                    reward_copy.groupby('_emp_id')['_reward_amount']
                     .sum()
                     .round(2)
                     .to_dict()
@@ -1731,6 +1781,10 @@ class PayoutCalculator:
                  'duitnow_penalty', 'ldr_penalty', 'fake_attempt_penalty', 'cod_penalty',
                  'attendance_penalty']] = penalty_results
 
+        grouped['reward'] = grouped['dispatcher_id'].apply(
+            lambda x: float(reward_map.get(normalize_dispatcher_id(str(x)), 0.0))
+        )
+
         # Calculate pickup payout
         grouped = PayoutCalculator.calculate_pickup_payout(pickup_df, grouped, pickup_payout_per_parcel)
 
@@ -1740,8 +1794,15 @@ class PayoutCalculator:
         # Calculate return payout
         grouped = PayoutCalculator.calculate_return_payout(return_df, grouped, return_payout_per_parcel)
 
-        # Calculate total payout: dispatch payout - penalty + pickup payout + QR order payout + return payout
-        grouped['total_payout'] = grouped['dispatch_payout'] - grouped['penalty_amount'] + grouped['pickup_payout'] + grouped['qr_order_payout'] + grouped['return_payout']
+        # Calculate total payout: dispatch payout - penalty + pickup payout + QR order payout + return payout + reward
+        grouped['total_payout'] = (
+            grouped['dispatch_payout']
+            - grouped['penalty_amount']
+            + grouped['pickup_payout']
+            + grouped['qr_order_payout']
+            + grouped['return_payout']
+            + grouped['reward']
+        )
 
         # Create display and numeric dataframes
         numeric_df = grouped.rename(columns={
@@ -1767,6 +1828,7 @@ class PayoutCalculator:
             "qr_order_payout": "QR Orders Payout",
             "return_parcels": "Return Parcels",
             "return_payout": "Return Parcels Payout",
+            "reward": "Reward",
             "tier1_parcels": "Parcels 0-5kg",
             "tier2_parcels": "Parcels 5.01-10kg",
             "tier3_parcels": "Parcels 10.01-30kg",
@@ -1795,6 +1857,8 @@ class PayoutCalculator:
             display_df["QR Orders Payout"] = display_df["QR Orders Payout"].apply(lambda x: f"{currency_symbol}{x:,.2f}")
         if "Return Parcels Payout" in display_df.columns:
             display_df["Return Parcels Payout"] = display_df["Return Parcels Payout"].apply(lambda x: f"{currency_symbol}{x:,.2f}")
+        if "Reward" in display_df.columns:
+            display_df["Reward"] = display_df["Reward"].apply(lambda x: f"{currency_symbol}{x:,.2f}")
 
         # Keep Penalty Waybills and Penalty Parcels in numeric_df but remove from display_df
         if "Penalty Waybills" in display_df.columns:
@@ -1843,6 +1907,7 @@ class PayoutCalculator:
         total_pickup_payout = numeric_df["Pickup Parcels Payout"].sum()
         total_qr_order_payout = numeric_df["QR Orders Payout"].sum() if "QR Orders Payout" in numeric_df.columns else 0.0
         total_return_payout = numeric_df["Return Parcels Payout"].sum() if "Return Parcels Payout" in numeric_df.columns else 0.0
+        total_reward = numeric_df["Reward"].sum() if "Reward" in numeric_df.columns else 0.0
         total_penalty = numeric_df["Penalty"].sum()
 
         st.info(f"""
@@ -1851,6 +1916,7 @@ class PayoutCalculator:
         + Pickup Parcels Payout: {currency_symbol} {total_pickup_payout:,.2f}
         + QR Orders Payout: {currency_symbol} {total_qr_order_payout:,.2f}
         + Return Parcels Payout: {currency_symbol} {total_return_payout:,.2f}
+        + Reward: {currency_symbol} {total_reward:,.2f}
         - Penalties: {currency_symbol} {total_penalty:,.2f}
         **Total Payout: {currency_symbol} {total_payout:,.2f}**
         """)
@@ -2157,6 +2223,7 @@ class InvoiceGenerator:
             total_return_parcels = int(numeric_df["Return Parcels"].sum()) if "Return Parcels" in numeric_df.columns else 0
             total_qr_orders = int(numeric_df["QR Orders"].sum()) if "QR Orders" in numeric_df.columns else 0
             total_qr_order_payout = numeric_df["QR Orders Payout"].sum() if "QR Orders Payout" in numeric_df.columns else 0.0
+            total_reward = numeric_df["Reward"].sum() if "Reward" in numeric_df.columns else 0.0
             total_penalty = numeric_df["Penalty"].sum() if "Penalty" in numeric_df.columns else 0.0
             penalty_by_type = {
                 'duitnow': numeric_df["DuitNow Penalty"].sum() if "DuitNow Penalty" in numeric_df.columns else 0.0,
@@ -2170,7 +2237,7 @@ class InvoiceGenerator:
             table_columns = ["Dispatcher ID", "Dispatcher Name", "Parcels Delivered",
                            "Delivery Parcels Payout", "Pickup Parcels", "Pickup Parcels Payout",
                            "Return Parcels", "Return Parcels Payout",
-                           "Penalty", "Total Payout"]
+                           "Reward", "Penalty", "Total Payout"]
 
             html = f"""
             <html>
@@ -2308,7 +2375,8 @@ class InvoiceGenerator:
                                 <div class="subtext">
                                     Pickup: {currency_symbol} {total_pickup_payout:,.2f} ·
                                     Return: {currency_symbol} {total_return_payout:,.2f} ·
-                                    QR Orders: {currency_symbol} {total_qr_order_payout:,.2f}
+                                    QR Orders: {currency_symbol} {total_qr_order_payout:,.2f} ·
+                                    Reward: {currency_symbol} {total_reward:,.2f}
                                 </div>
                             </div>
                             <div class="chip">
@@ -2346,6 +2414,7 @@ class InvoiceGenerator:
                             <tr><td>Total Delivery Parcels Payout</td><td style="text-align:right;">{currency_symbol} {total_dispatch_payout:,.2f}</td></tr>
                             <tr><td>Pickup Parcels Payout</td><td style="text-align:right;">{currency_symbol} {total_pickup_payout:,.2f}</td></tr>
                             <tr><td>Return Parcels Payout</td><td style="text-align:right;">{currency_symbol} {total_return_payout:,.2f}</td></tr>
+                            <tr><td>Total Reward</td><td style="text-align:right;">{currency_symbol} {total_reward:,.2f}</td></tr>
                             <tr><td>Total Penalty</td><td style="text-align:right;">-{currency_symbol} {total_penalty:,.2f}</td></tr>
                             <tr><td><strong>Total Payout</strong></td><td style="text-align:right;"><strong>{currency_symbol} {total_payout:,.2f}</strong></td></tr>
                         </table>
@@ -2669,11 +2738,12 @@ def main():
         else:
             st.sidebar.warning("Selected date column has no valid date values; showing all data.")
 
-    # Load penalty, pickup, QR order, return, and attendance data
+    # Load penalty, pickup, QR order, return, reward, and attendance data
     penalty_data = DataSource.load_penalty_data(config, excel_source)
     pickup_df = DataSource.load_pickup_data(config, excel_source)
     qr_order_df = DataSource.load_qr_order_data(config, excel_source)
     return_df = DataSource.load_return_data(config, excel_source)
+    reward_df = DataSource.load_reward_data(config, excel_source)
     attendance_df = DataSource.load_attendance_data(config, excel_source)
 
     # Filter all data by selected date range if a date column is selected
@@ -2979,6 +3049,7 @@ def main():
     display_df, numeric_df, total_payout = PayoutCalculator.calculate_payout(
         df, currency, penalty_data, pickup_df, pickup_payout_per_parcel,
         qr_order_df, qr_order_payout_per_order, return_df, return_payout_per_parcel,
+        reward_df=reward_df,
         attendance_df=attendance_df,
         processing_warnings=processing_warnings
     )
@@ -3013,7 +3084,7 @@ def main():
         daily_payout_df = PayoutCalculator.get_daily_payout_trend(df_clean, forecast_date_col)
 
     # Tabs layout
-    tab_overview, tab_analytics, tab_details = st.tabs(["📊 Overview", "📈 Analytics", "🧾 Details"])
+    tab_overview, tab_analytics, tab_details, tab_invoice = st.tabs(["📊 Overview", "📈 Analytics", "🧾 Details", "📄 Invoice"])
 
     # Metrics - Updated to include Pickup Payout per Parcel
     with tab_overview:
@@ -3027,6 +3098,7 @@ def main():
         total_return_parcels = int(numeric_df["Return Parcels"].sum()) if "Return Parcels" in numeric_df.columns else 0
         total_return_payout = numeric_df["Return Parcels Payout"].sum() if "Return Parcels Payout" in numeric_df.columns else 0.0
         total_dispatch_payout = numeric_df["Delivery Parcels Payout"].sum() if "Delivery Parcels Payout" in numeric_df.columns else 0.0
+        total_reward = numeric_df["Reward"].sum() if "Reward" in numeric_df.columns else 0.0
 
         total_penalty = numeric_df["Penalty"].sum() if "Penalty" in numeric_df.columns else 0.0
 
@@ -3059,10 +3131,14 @@ def main():
         with row2_col2:
             st.metric("Delivery Parcels Payout", f"{currency} {total_dispatch_payout:,.2f}")
         with row2_col3:
-            st.metric("Pickup Parcels Payout", f"{currency} {total_pickup_payout:,.2f}")
+            st.metric("Reward", f"{currency} {total_reward:,.2f}")
         with row2_col4:
-            st.metric("Return Parcels Payout", f"{currency} {total_return_payout:,.2f}")
+            st.metric("Pickup Parcels Payout", f"{currency} {total_pickup_payout:,.2f}")
         with row2_col5:
+            st.metric("Return Parcels Payout", f"{currency} {total_return_payout:,.2f}")
+
+        row3_cols = st.columns(5)
+        with row3_cols[0]:
             st.metric("QR Orders Payout", f"{currency} {total_qr_order_payout:,.2f}")
 
         # Penalty breakdown by type
@@ -3113,6 +3189,7 @@ def main():
                 pickup_payout = float(row.get('Pickup Parcels Payout', 0.0))
                 return_payout = float(row.get('Return Parcels Payout', 0.0))
                 qr_orders_payout = float(row.get('QR Orders Payout', 0.0))
+                reward_amount = float(row.get('Reward', 0.0))
 
                 st.markdown(f"""
                 <div style="background: white; padding: 12px; border-radius: 8px; border: 1px solid #e2e8f0; margin: 8px 0; min-height: 90px; height: 90px; display: flex; flex-direction: column; justify-content: space-between;">
@@ -3121,7 +3198,7 @@ def main():
                         <strong>Parcels:</strong> {parcels_delivered} | <strong>Pickup Parcels:</strong> {pickup_parcels} | <strong>Return Parcels:</strong> {return_parcels} | <strong>QR Orders:</strong> {qr_orders}
                     </div>
                     <div style="color: #64748b; font-size: 0.85rem; line-height: 1.4;">
-                        <strong>Parcel Payout:</strong> {currency}{delivery_payout:,.2f} | <strong>Pickup Payout:</strong> {currency}{pickup_payout:,.2f} | <strong>Return Payout:</strong> {currency}{return_payout:,.2f} | <strong>QR Orders Payout:</strong> {currency}{qr_orders_payout:,.2f}
+                        <strong>Parcel Payout:</strong> {currency}{delivery_payout:,.2f} | <strong>Pickup Payout:</strong> {currency}{pickup_payout:,.2f} | <strong>Return Payout:</strong> {currency}{return_payout:,.2f} | <strong>QR Orders Payout:</strong> {currency}{qr_orders_payout:,.2f} | <strong>Reward:</strong> {currency}{reward_amount:,.2f}
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
@@ -3181,6 +3258,7 @@ def main():
                 "Delivery Parcels Payout", "Pickup Parcels", "Pickup Parcels Payout",
                 "QR Orders", "QR Orders Payout",
                 "Return Parcels", "Return Parcels Payout",
+                "Reward",
                 "Penalty", "DuitNow Penalty", "LDR Penalty", "Fake Attempt Penalty", "COD Penalty", "Attendance Penalty",
                 "Total Payout", "Total Weight (kg)", "Avg Weight (kg)",
                 "Avg Rate per Parcel", "Parcels 0-5kg", "Parcels 5.01-10kg",
@@ -3521,7 +3599,7 @@ def main():
             else:
                 st.info(f"⚠️ Insufficient historical data for forecasting. Found {len(daily_parcel_df)} unique dates, but need at least 7 days of data.")
 
-    with tab_details:
+    with tab_invoice:
         st.markdown("---")
         st.subheader("📄 Invoice Generation")
         invoice_html = InvoiceGenerator.build_invoice_html(display_df, numeric_df, total_payout, currency, pickup_payout_per_parcel)
@@ -3535,6 +3613,7 @@ def main():
             use_container_width=True
         )
 
+    with tab_details:
         st.markdown("---")
         st.subheader("📥 Export Data")
         col1, col2, col3 = st.columns(3)
