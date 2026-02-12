@@ -2224,7 +2224,6 @@ class InvoiceGenerator:
             total_qr_orders = int(numeric_df["QR Orders"].sum()) if "QR Orders" in numeric_df.columns else 0
             total_qr_order_payout = numeric_df["QR Orders Payout"].sum() if "QR Orders Payout" in numeric_df.columns else 0.0
             total_reward = numeric_df["Reward"].sum() if "Reward" in numeric_df.columns else 0.0
-            total_penalty = numeric_df["Penalty"].sum() if "Penalty" in numeric_df.columns else 0.0
             penalty_by_type = {
                 'duitnow': numeric_df["DuitNow Penalty"].sum() if "DuitNow Penalty" in numeric_df.columns else 0.0,
                 'ldr': numeric_df["LDR Penalty"].sum() if "LDR Penalty" in numeric_df.columns else 0.0,
@@ -2232,6 +2231,16 @@ class InvoiceGenerator:
                 'cod': numeric_df["COD Penalty"].sum() if "COD Penalty" in numeric_df.columns else 0.0,
                 'attendance': numeric_df["Attendance Penalty"].sum() if "Attendance Penalty" in numeric_df.columns else 0.0
             }
+            # Keep summary math consistent with line items shown in invoice.
+            total_penalty = sum(penalty_by_type.values())
+            invoice_total_payout = (
+                total_dispatch_payout
+                + total_pickup_payout
+                + total_return_payout
+                + total_qr_order_payout
+                + total_reward
+            )
+            gross_payout = invoice_total_payout - total_penalty
             top_3 = display_df.head(3)
 
             table_columns = ["Dispatcher ID", "Dispatcher Name", "Parcels Delivered",
@@ -2340,8 +2349,8 @@ class InvoiceGenerator:
                             <div class="idline">Period: {(datetime.now().replace(day=1) - pd.Timedelta(days=1)).strftime('%B %Y')}</div>
                         </div>
                         <div class="total-badge">
-                            <div class="label">Total Payout (Inclusive)</div>
-                            <div class="value">{currency_symbol} {total_payout:,.2f}</div>
+                            <div class="label">Gross Payout</div>
+                            <div class="value">{currency_symbol} {gross_payout:,.2f}</div>
                         </div>
                     </div>
 
@@ -2370,11 +2379,12 @@ class InvoiceGenerator:
                         </div>
                         <div class="summary-row">
                             <div class="chip">
-                                <div class="label">Delivery Parcels Payout</div>
-                                <div class="value">{currency_symbol} {total_dispatch_payout:,.2f}</div>
+                                <div class="label">Total Payout</div>
+                                <div class="value">{currency_symbol} {invoice_total_payout:,.2f}</div>
                                 <div class="subtext">
+                                    Delivery: {currency_symbol} {total_dispatch_payout:,.2f} ·
                                     Pickup: {currency_symbol} {total_pickup_payout:,.2f} ·
-                                    Return: {currency_symbol} {total_return_payout:,.2f} ·
+                                    Return: {currency_symbol} {total_return_payout:,.2f}<br>
                                     QR Orders: {currency_symbol} {total_qr_order_payout:,.2f} ·
                                     Reward: {currency_symbol} {total_reward:,.2f}
                                 </div>
@@ -2385,7 +2395,7 @@ class InvoiceGenerator:
                                 <div class="subtext">
                                     DuitNow: -{currency_symbol} {penalty_by_type['duitnow']:,.2f} ·
                                     LDR: -{currency_symbol} {penalty_by_type['ldr']:,.2f} ·
-                                    Fake: -{currency_symbol} {penalty_by_type['fake_attempt']:,.2f} ·
+                                    Fake: -{currency_symbol} {penalty_by_type['fake_attempt']:,.2f}<br>
                                     COD: -{currency_symbol} {penalty_by_type['cod']:,.2f} ·
                                     Attendance: -{currency_symbol} {penalty_by_type['attendance']:,.2f}
                                 </div>
@@ -2411,12 +2421,14 @@ class InvoiceGenerator:
                     <div style="margin-top:3rem">
                         <table style="width:100%; background:var(--surface); border-radius:8px; margin-top:2rem; border:1px solid var(--border)">
                             <tr><th style="background:var(--primary);color:white;text-align:left;">Summary</th><th style="background:var(--primary);color:white;text-align:right;">Amount</th></tr>
-                            <tr><td>Total Delivery Parcels Payout</td><td style="text-align:right;">{currency_symbol} {total_dispatch_payout:,.2f}</td></tr>
+                            <tr><td>Delivery Parcels Payout</td><td style="text-align:right;">{currency_symbol} {total_dispatch_payout:,.2f}</td></tr>
                             <tr><td>Pickup Parcels Payout</td><td style="text-align:right;">{currency_symbol} {total_pickup_payout:,.2f}</td></tr>
                             <tr><td>Return Parcels Payout</td><td style="text-align:right;">{currency_symbol} {total_return_payout:,.2f}</td></tr>
+                            <tr><td>QR Orders Payout</td><td style="text-align:right;">{currency_symbol} {total_qr_order_payout:,.2f}</td></tr>
                             <tr><td>Total Reward</td><td style="text-align:right;">{currency_symbol} {total_reward:,.2f}</td></tr>
+                            <tr><td><strong>Total Payout</strong></td><td style="text-align:right;"><strong>{currency_symbol} {invoice_total_payout:,.2f}</strong></td></tr>
                             <tr><td>Total Penalty</td><td style="text-align:right;">-{currency_symbol} {total_penalty:,.2f}</td></tr>
-                            <tr><td><strong>Total Payout</strong></td><td style="text-align:right;"><strong>{currency_symbol} {total_payout:,.2f}</strong></td></tr>
+                            <tr><td><strong>Gross Payout</strong></td><td style="text-align:right;"><strong>{currency_symbol} {gross_payout:,.2f}</strong></td></tr>
                         </table>
                     </div>
                     <div class="note">
