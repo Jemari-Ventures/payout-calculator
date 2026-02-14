@@ -262,7 +262,20 @@ class DataSource:
             raise ValueError("Invalid Google Sheet URL or ID.")
         csv_url = DataSource._build_gsheet_csv_url(spreadsheet_id, sheet_name, gid)
         resp = requests.get(csv_url, timeout=30)
-        resp.raise_for_status()
+        try:
+            resp.raise_for_status()
+        except requests.exceptions.HTTPError:
+            if sheet_name and str(sheet_name).strip() and resp.status_code in (400, 404):
+                error_sample = (resp.text or "")[:1000].lower()
+                if (
+                    "worksheet" in error_sample
+                    or "sheet" in error_sample
+                    or "unable to parse range" in error_sample
+                    or "not found" in error_sample
+                    or "invalid" in error_sample
+                ):
+                    return pd.DataFrame()
+            raise
 
         resp_content = resp.content
         if sheet_name and str(sheet_name).strip():
@@ -289,6 +302,51 @@ class DataSource:
             df[waybill_col] = df[waybill_col].astype(str)
 
         return df
+
+    @staticmethod
+    def _normalize_compare_value(value):
+        """Normalize a cell value for cross-sheet fallback comparison."""
+        if pd.isna(value):
+            return ""
+        value_str = str(value).strip()
+        if not value_str:
+            return ""
+        try:
+            num = float(value_str)
+            if num.is_integer():
+                return str(int(num))
+        except Exception:
+            pass
+        return value_str
+
+    @staticmethod
+    def _is_fallback_dispatch_sheet(candidate_df: Optional[pd.DataFrame], dispatch_df: Optional[pd.DataFrame]) -> bool:
+        """Detect missing-tab fallback where Google returns Dispatch data."""
+        if candidate_df is None or dispatch_df is None or candidate_df.empty or dispatch_df.empty:
+            return False
+
+        candidate_cols = [str(c).strip().lower() for c in candidate_df.columns]
+        dispatch_cols = [str(c).strip().lower() for c in dispatch_df.columns]
+        if candidate_cols != dispatch_cols:
+            return False
+
+        sample_size = min(10, len(candidate_df), len(dispatch_df))
+        if sample_size <= 0:
+            return False
+
+        candidate_sample = (
+            candidate_df.head(sample_size)
+            .fillna("")
+            .applymap(DataSource._normalize_compare_value)
+            .astype(str)
+        )
+        dispatch_sample = (
+            dispatch_df.head(sample_size)
+            .fillna("")
+            .applymap(DataSource._normalize_compare_value)
+            .astype(str)
+        )
+        return candidate_sample.equals(dispatch_sample)
 
     @staticmethod
     def _get_postgres_connection():
@@ -685,10 +743,15 @@ class DataSource:
         if source_type == "excel":
             try:
                 sheet_name = DataSource._get_excel_sheet_name(config, "qr_order", "QR Order")
+                dispatch_sheet_name = DataSource._get_excel_sheet_name(config, "dispatch", "Dispatch")
                 gsheet_url = data_source.get("gsheet_url")
                 if not gsheet_url:
                     return None
-                return DataSource.read_google_sheet(gsheet_url, sheet_name=sheet_name)
+                qr_df = DataSource.read_google_sheet(gsheet_url, sheet_name=sheet_name)
+                dispatch_df = DataSource.read_google_sheet(gsheet_url, sheet_name=dispatch_sheet_name)
+                if DataSource._is_fallback_dispatch_sheet(qr_df, dispatch_df):
+                    return pd.DataFrame()
+                return qr_df
             except Exception as exc:
                 st.warning(f"Could not load QR order data from Excel sheet '{sheet_name}': {exc}")
                 return None
@@ -714,10 +777,15 @@ class DataSource:
         if source_type == "excel":
             try:
                 sheet_name = DataSource._get_excel_sheet_name(config, "return", "Return")
+                dispatch_sheet_name = DataSource._get_excel_sheet_name(config, "dispatch", "Dispatch")
                 gsheet_url = data_source.get("gsheet_url")
                 if not gsheet_url:
                     return None
-                return DataSource.read_google_sheet(gsheet_url, sheet_name=sheet_name)
+                return_df = DataSource.read_google_sheet(gsheet_url, sheet_name=sheet_name)
+                dispatch_df = DataSource.read_google_sheet(gsheet_url, sheet_name=dispatch_sheet_name)
+                if DataSource._is_fallback_dispatch_sheet(return_df, dispatch_df):
+                    return pd.DataFrame()
+                return return_df
             except Exception as exc:
                 st.warning(f"Could not load return data from Excel sheet '{sheet_name}': {exc}")
                 return None
@@ -2709,11 +2777,21 @@ def main():
                 start_date, end_date = selected_range
             else:
                 start_date = end_date = selected_range
+            start_ts = pd.Timestamp(start_date)
+            end_ts = pd.Timestamp(end_date)
+
+            def normalize_series_for_date_compare(series: pd.Series) -> pd.Series:
+                """Normalize date series to tz-naive midnight timestamps for safe comparisons."""
+                parsed = pd.to_datetime(series, errors="coerce")
+                series_tz = getattr(parsed.dt, "tz", None)
+                if series_tz is not None:
+                    parsed = parsed.dt.tz_convert(None)
+                return parsed.dt.normalize()
 
             # Filter by date range
             df_filtered = df[
-                (df[date_col_to_use].dt.date >= start_date) &
-                (df[date_col_to_use].dt.date <= end_date)
+                (normalize_series_for_date_compare(df[date_col_to_use]) >= start_ts) &
+                (normalize_series_for_date_compare(df[date_col_to_use]) <= end_ts)
             ]
 
             # Track dispatchers after filtering
@@ -2773,8 +2851,8 @@ def main():
                     pickup_df[pickup_date_col] = pd.to_datetime(pickup_df[pickup_date_col], errors="coerce")
                     initial_pickup_count = len(pickup_df)
                     pickup_df = pickup_df[
-                        (pickup_df[pickup_date_col].dt.date >= start_date) &
-                        (pickup_df[pickup_date_col].dt.date <= end_date)
+                        (normalize_series_for_date_compare(pickup_df[pickup_date_col]) >= start_ts) &
+                        (normalize_series_for_date_compare(pickup_df[pickup_date_col]) <= end_ts)
                     ]
                     filtered_pickup_count = len(pickup_df)
                     if initial_pickup_count != filtered_pickup_count:
@@ -2799,14 +2877,6 @@ def main():
                                 duitnow_date_col = col
                                 break
 
-                    # If created_at not found, try other date columns as fallback
-                    if duitnow_date_col is None:
-                        for col in duitnow_df.columns:
-                            col_lower = str(col).lower()
-                            if any(k in col_lower for k in ["date", "time", "delivery", "signature", "updated_at"]):
-                                duitnow_date_col = col
-                                break
-
                     if duitnow_date_col is not None:
                         duitnow_df[duitnow_date_col] = pd.to_datetime(duitnow_df[duitnow_date_col], errors="coerce")
                         initial_duitnow_count = len(duitnow_df)
@@ -2824,11 +2894,10 @@ def main():
                             max_date_in_data = duitnow_df[valid_dates][duitnow_date_col].max().date()
                             st.info(f"📅 DuitNow date range in data: {min_date_in_data} to {max_date_in_data} (filtering: {start_date} to {end_date})")
 
-                        # Filter by date range using created_at minus 1 month
-                        adjusted_duitnow_dates = (duitnow_df[duitnow_date_col] - pd.DateOffset(months=1))
+                        # Filter by date range using created_at directly
                         duitnow_df = duitnow_df[
-                            (adjusted_duitnow_dates.dt.date >= start_date) &
-                            (adjusted_duitnow_dates.dt.date <= end_date)
+                            (normalize_series_for_date_compare(duitnow_df[duitnow_date_col]) >= start_ts) &
+                            (normalize_series_for_date_compare(duitnow_df[duitnow_date_col]) <= end_ts)
                         ]
                         filtered_duitnow_count = len(duitnow_df)
                         penalty_data['duitnow'] = duitnow_df
@@ -2840,94 +2909,77 @@ def main():
                         else:
                             st.info(f"ℹ️ DuitNow penalty filtered using '{duitnow_date_col}' column (all {initial_duitnow_count:,} records within date range)")
                     else:
-                        st.warning("⚠️ DuitNow penalty table has no 'created_at' column or other detectable date column; penalties are not filtered by date range.")
+                        st.warning("⚠️ DuitNow penalty table has no 'created_at' column; penalties are not filtered by date range.")
 
                 # Filter LDR penalty
                 if 'ldr' in penalty_data and penalty_data['ldr'] is not None and not penalty_data['ldr'].empty:
                     ldr_df = penalty_data['ldr']
                     ldr_date_col = None
-                    # Prefer audit timestamps if present
+                    # Use created_at specifically for LDR penalty filtering
                     if 'created_at' in ldr_df.columns:
                         ldr_date_col = 'created_at'
-                    elif 'updated_at' in ldr_df.columns:
-                        ldr_date_col = 'updated_at'
                     else:
-                        # Fallback: find any date/time-like column
+                        # Case-insensitive match for created_at only
                         for col in ldr_df.columns:
                             col_lower = str(col).lower()
-                            if any(k in col_lower for k in ["date", "time", "delivery", "signature"]):
+                            if col_lower == "created_at":
                                 ldr_date_col = col
                                 break
 
                     if ldr_date_col is not None:
                         ldr_parsed = pd.to_datetime(ldr_df[ldr_date_col], errors="coerce")
-                        # If parsing fails and column is numeric, try Excel serial date
-                        if ldr_parsed.notna().sum() == 0:
-                            numeric_series = pd.to_numeric(ldr_df[ldr_date_col], errors="coerce")
-                            if numeric_series.notna().sum() > 0:
-                                ldr_parsed = pd.to_datetime(
-                                    numeric_series,
-                                    unit='D',
-                                    origin='1899-12-30',
-                                    errors='coerce'
-                                )
                         ldr_df[ldr_date_col] = ldr_parsed
                         initial_ldr_count = len(ldr_df)
                         ldr_df = ldr_df[
-                            (ldr_df[ldr_date_col].dt.date >= start_date) &
-                            (ldr_df[ldr_date_col].dt.date <= end_date)
+                            (normalize_series_for_date_compare(ldr_df[ldr_date_col]) >= start_ts) &
+                            (normalize_series_for_date_compare(ldr_df[ldr_date_col]) <= end_ts)
                         ]
                         filtered_ldr_count = len(ldr_df)
                         penalty_data['ldr'] = ldr_df
                         if initial_ldr_count != filtered_ldr_count:
                             st.info(f"⚠️ Filtered LDR penalty: {initial_ldr_count:,} → {filtered_ldr_count:,} records")
                     else:
-                        st.warning("⚠️ LDR penalty table has no detectable date column; penalties are not filtered by date range.")
+                        st.warning("⚠️ LDR penalty table has no 'created_at' column; penalties are not filtered by date range.")
 
                 # Filter Fake Attempt penalty
                 if 'fake_attempt' in penalty_data and penalty_data['fake_attempt'] is not None and not penalty_data['fake_attempt'].empty:
                     fake_attempt_df = penalty_data['fake_attempt']
                     fake_attempt_date_col = None
-                    # Try to find time_delivery or other date columns
-                    for col in fake_attempt_df.columns:
-                        col_lower = str(col).lower()
-                        if any(k in col_lower for k in ["time_delivery", "date", "time", "delivery", "signature", "created_at", "updated_at"]):
-                            fake_attempt_date_col = col
-                            # Prefer time_delivery if it exists
-                            if col_lower == "time_delivery":
+                    # Fake Attempt uses 'date' column specifically
+                    if 'date' in fake_attempt_df.columns:
+                        fake_attempt_date_col = 'date'
+                    else:
+                        for col in fake_attempt_df.columns:
+                            if str(col).lower() == "date":
+                                fake_attempt_date_col = col
                                 break
 
                     if fake_attempt_date_col is not None:
                         fake_attempt_df[fake_attempt_date_col] = pd.to_datetime(fake_attempt_df[fake_attempt_date_col], errors="coerce")
                         initial_fake_count = len(fake_attempt_df)
                         fake_attempt_df = fake_attempt_df[
-                            (fake_attempt_df[fake_attempt_date_col].dt.date >= start_date) &
-                            (fake_attempt_df[fake_attempt_date_col].dt.date <= end_date)
+                            (normalize_series_for_date_compare(fake_attempt_df[fake_attempt_date_col]) >= start_ts) &
+                            (normalize_series_for_date_compare(fake_attempt_df[fake_attempt_date_col]) <= end_ts)
                         ]
                         filtered_fake_count = len(fake_attempt_df)
                         penalty_data['fake_attempt'] = fake_attempt_df
                         if initial_fake_count != filtered_fake_count:
                             st.info(f"⚠️ Filtered Fake Attempt penalty: {initial_fake_count:,} → {filtered_fake_count:,} records")
                     else:
-                        st.warning("⚠️ Fake Attempt penalty table has no detectable date column; penalties are not filtered by date range.")
+                        st.warning("⚠️ Fake Attempt penalty table has no 'date' column; penalties are not filtered by date range.")
 
                 # Filter COD penalty
                 if 'cod' in penalty_data and penalty_data['cod'] is not None and not penalty_data['cod'].empty:
                     cod_df = penalty_data['cod']
                     cod_date_col = None
-                    # Try to find date column (prefer 'date' column, fallback to 'created_at')
-                    if 'date' in cod_df.columns:
-                        cod_date_col = 'date'
-                    elif 'created_at' in cod_df.columns:
+                    # COD penalty uses created_at only
+                    if 'created_at' in cod_df.columns:
                         cod_date_col = 'created_at'
                     else:
-                        # Try case-insensitive search
+                        # Case-insensitive search for created_at only
                         for col in cod_df.columns:
                             col_lower = str(col).lower()
-                            if col_lower in ['date', 'created_at']:
-                                cod_date_col = col
-                                break
-                            elif any(k in col_lower for k in ["date", "time", "delivery", "signature", "updated_at"]):
+                            if col_lower == 'created_at':
                                 cod_date_col = col
                                 break
 
@@ -2935,15 +2987,15 @@ def main():
                         cod_df[cod_date_col] = pd.to_datetime(cod_df[cod_date_col], errors="coerce")
                         initial_cod_count = len(cod_df)
                         cod_df = cod_df[
-                            (cod_df[cod_date_col].dt.date >= start_date) &
-                            (cod_df[cod_date_col].dt.date <= end_date)
+                            (normalize_series_for_date_compare(cod_df[cod_date_col]) >= start_ts) &
+                            (normalize_series_for_date_compare(cod_df[cod_date_col]) <= end_ts)
                         ]
                         filtered_cod_count = len(cod_df)
                         penalty_data['cod'] = cod_df
                         if initial_cod_count != filtered_cod_count:
                             st.info(f"⚠️ Filtered COD penalty: {initial_cod_count:,} → {filtered_cod_count:,} records")
                     else:
-                        st.warning("⚠️ COD penalty table has no detectable date column; penalties are not filtered by date range.")
+                        st.warning("⚠️ COD penalty table has no 'created_at' column; penalties are not filtered by date range.")
 
                 # Filter QR order data by selected date range
                 if qr_order_df is not None and not qr_order_df.empty:
@@ -2974,8 +3026,8 @@ def main():
 
                         # Filter by date range
                         qr_order_df = qr_order_df[
-                            (qr_order_df[qr_order_date_col].dt.date >= start_date) &
-                            (qr_order_df[qr_order_date_col].dt.date <= end_date)
+                            (normalize_series_for_date_compare(qr_order_df[qr_order_date_col]) >= start_ts) &
+                            (normalize_series_for_date_compare(qr_order_df[qr_order_date_col]) <= end_ts)
                         ]
                         filtered_qr_count = len(qr_order_df)
 
@@ -3015,8 +3067,8 @@ def main():
 
                         # Filter by date range
                         return_df = return_df[
-                            (return_df[return_date_col].dt.date >= start_date) &
-                            (return_df[return_date_col].dt.date <= end_date)
+                            (normalize_series_for_date_compare(return_df[return_date_col]) >= start_ts) &
+                            (normalize_series_for_date_compare(return_df[return_date_col]) <= end_ts)
                         ]
                         filtered_return_count = len(return_df)
 
@@ -3030,24 +3082,61 @@ def main():
                 # Filter attendance data by selected date range
                 if attendance_df is not None and not attendance_df.empty:
                     attendance_date_col = None
+                    # Prefer explicit attendance date, fallback to created_at when unavailable
                     for col in attendance_df.columns:
                         col_lower = str(col).lower().strip()
                         if col_lower in ["attendance record date", "attendance_record_date", "attendance date", "attendance_date"]:
                             attendance_date_col = col
                             break
+                    if attendance_date_col is None:
+                        if 'created_at' in attendance_df.columns:
+                            attendance_date_col = 'created_at'
+                        else:
+                            for col in attendance_df.columns:
+                                if str(col).lower().strip() == "created_at":
+                                    attendance_date_col = col
+                                    break
 
                     if attendance_date_col is not None:
                         attendance_df[attendance_date_col] = pd.to_datetime(attendance_df[attendance_date_col], errors="coerce")
                         initial_attendance_count = len(attendance_df)
                         attendance_df = attendance_df[
-                            (attendance_df[attendance_date_col].dt.date >= start_date) &
-                            (attendance_df[attendance_date_col].dt.date <= end_date)
+                            (normalize_series_for_date_compare(attendance_df[attendance_date_col]) >= start_ts) &
+                            (normalize_series_for_date_compare(attendance_df[attendance_date_col]) <= end_ts)
                         ]
                         filtered_attendance_count = len(attendance_df)
                         if initial_attendance_count != filtered_attendance_count:
-                            st.info(f"🕒 Filtered attendance data: {initial_attendance_count:,} → {filtered_attendance_count:,} records")
+                            st.info(f"🕒 Filtered attendance data using '{attendance_date_col}': {initial_attendance_count:,} → {filtered_attendance_count:,} records")
                     else:
-                        st.warning("⚠️ Attendance table has no 'Attendance Record Date' column; attendance is not filtered by date range.")
+                        st.warning("⚠️ Attendance table has no 'Attendance Record Date' or 'created_at' column; attendance penalties are set to 0 for this range.")
+                        attendance_df = pd.DataFrame()
+
+                # Filter reward data by selected date range (created_at only)
+                if reward_df is not None and not reward_df.empty:
+                    reward_date_col = None
+                    if 'created_at' in reward_df.columns:
+                        reward_date_col = 'created_at'
+                    elif 'Created At' in reward_df.columns:
+                        reward_date_col = 'Created At'
+                    else:
+                        for col in reward_df.columns:
+                            col_lower = str(col).lower().strip()
+                            if col_lower in ["created_at", "created at"]:
+                                reward_date_col = col
+                                break
+
+                    if reward_date_col is not None:
+                        reward_df[reward_date_col] = pd.to_datetime(reward_df[reward_date_col], errors="coerce")
+                        initial_reward_count = len(reward_df)
+                        reward_df = reward_df[
+                            (normalize_series_for_date_compare(reward_df[reward_date_col]) >= start_ts) &
+                            (normalize_series_for_date_compare(reward_df[reward_date_col]) <= end_ts)
+                        ]
+                        filtered_reward_count = len(reward_df)
+                        if initial_reward_count != filtered_reward_count:
+                            st.info(f"🎁 Filtered reward data using '{reward_date_col}': {initial_reward_count:,} → {filtered_reward_count:,} records")
+                    else:
+                        st.warning("⚠️ Reward table has no 'created_at' column; rewards are not filtered by date range.")
 
             # Show summary of date filtering
             if selected_date_col != "-- None --" and start_date is not None and end_date is not None:

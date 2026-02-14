@@ -53,7 +53,7 @@ class Config:
     DEFAULT_CONFIG = {
         "data_source": {
             "type": "gsheet",
-            "gsheet_url": "https://docs.google.com/spreadsheets/d/1rLdCtIvwCLX23-9SSBXAKIp_B75jTBts/edit?usp=sharing&ouid=109319992457995119696&rtpof=true&sd=true",
+            "gsheet_url": "",
             "sheet_name": None
         },
         "tiers": [
@@ -221,7 +221,22 @@ class DataSource:
         csv_url = DataSource._build_gsheet_csv_url(spreadsheet_id, sheet_name, gid)
         try:
             resp = requests.get(csv_url, timeout=30)
-            resp.raise_for_status()
+            try:
+                resp.raise_for_status()
+            except requests.exceptions.HTTPError:
+                # Missing/non-existent worksheet often returns 400/404. Treat it as empty data
+                # so downstream payout calculations evaluate to 0 instead of hard-failing.
+                if sheet_name and str(sheet_name).strip() and resp.status_code in (400, 404):
+                    error_sample = (resp.text or "")[:1000].lower()
+                    if (
+                        "worksheet" in error_sample
+                        or "sheet" in error_sample
+                        or "unable to parse range" in error_sample
+                        or "not found" in error_sample
+                        or "invalid" in error_sample
+                    ):
+                        return pd.DataFrame()
+                raise
 
             # CRITICAL: Read CSV and preserve waybills exactly as they appear
             # Strategy: Read WITHOUT dtype specification first, then convert to string immediately
@@ -326,6 +341,55 @@ class DataSource:
             raise
 
     @staticmethod
+    def _normalize_compare_value(value):
+        """Normalize a cell value for cross-sheet fallback comparison."""
+        if pd.isna(value):
+            return ""
+        value_str = str(value).strip()
+        if not value_str:
+            return ""
+        # Normalize integer-like floats (e.g. 123.0 -> 123) for stable matching
+        try:
+            num = float(value_str)
+            if num.is_integer():
+                return str(int(num))
+        except Exception:
+            pass
+        return value_str
+
+    @staticmethod
+    def _is_fallback_dispatch_sheet(candidate_df: Optional[pd.DataFrame], dispatch_df: Optional[pd.DataFrame]) -> bool:
+        """
+        Detect Google Sheets fallback behavior where requesting a missing tab returns Dispatch.
+        Uses column set + first rows fingerprint to avoid false positives.
+        """
+        if candidate_df is None or dispatch_df is None or candidate_df.empty or dispatch_df.empty:
+            return False
+
+        candidate_cols = [str(c).strip().lower() for c in candidate_df.columns]
+        dispatch_cols = [str(c).strip().lower() for c in dispatch_df.columns]
+        if candidate_cols != dispatch_cols:
+            return False
+
+        sample_size = min(10, len(candidate_df), len(dispatch_df))
+        if sample_size <= 0:
+            return False
+
+        candidate_sample = (
+            candidate_df.head(sample_size)
+            .fillna("")
+            .applymap(DataSource._normalize_compare_value)
+            .astype(str)
+        )
+        dispatch_sample = (
+            dispatch_df.head(sample_size)
+            .fillna("")
+            .applymap(DataSource._normalize_compare_value)
+            .astype(str)
+        )
+        return candidate_sample.equals(dispatch_sample)
+
+    @staticmethod
     def load_data(config: dict) -> Optional[pd.DataFrame]:
         """Load dispatcher delivery data from Sheet1."""
         data_source = config["data_source"]
@@ -404,7 +468,11 @@ class DataSource:
         data_source = config["data_source"]
         if data_source["type"] == "gsheet" and data_source["gsheet_url"]:
             try:
-                return DataSource.read_google_sheet(data_source["gsheet_url"], sheet_name="QR Order")
+                qr_df = DataSource.read_google_sheet(data_source["gsheet_url"], sheet_name="QR Order")
+                dispatch_df = DataSource.read_google_sheet(data_source["gsheet_url"], sheet_name="Dispatch")
+                if DataSource._is_fallback_dispatch_sheet(qr_df, dispatch_df):
+                    return pd.DataFrame()
+                return qr_df
             except Exception as exc:
                 st.warning(f"Could not load QR Order data: {exc}")
                 return None
@@ -416,7 +484,11 @@ class DataSource:
         data_source = config["data_source"]
         if data_source["type"] == "gsheet" and data_source["gsheet_url"]:
             try:
-                return DataSource.read_google_sheet(data_source["gsheet_url"], sheet_name="Return")
+                return_df = DataSource.read_google_sheet(data_source["gsheet_url"], sheet_name="Return")
+                dispatch_df = DataSource.read_google_sheet(data_source["gsheet_url"], sheet_name="Dispatch")
+                if DataSource._is_fallback_dispatch_sheet(return_df, dispatch_df):
+                    return pd.DataFrame()
+                return return_df
             except Exception as exc:
                 st.warning(f"Could not load Return data: {exc}")
                 return None
@@ -1047,6 +1119,21 @@ class PayoutCalculator:
         if qr_order_df is None or qr_order_df.empty or not dispatcher_id:
             return 0, 0.0, pd.DataFrame()
 
+        # Guard: if requested QR sheet falls back to Dispatch data (when tab is missing),
+        # do not count delivery rows as QR orders.
+        qr_cols_lower = {str(c).strip().lower() for c in qr_order_df.columns}
+        has_dispatch_signature = (
+            "delivery signature" in qr_cols_lower and
+            ("waybill number" in qr_cols_lower or "waybill" in qr_cols_lower) and
+            ("dispatcher id" in qr_cols_lower or "dispatcher_id" in qr_cols_lower)
+        )
+        has_qr_markers = any(
+            ("qr" in col) or ("order" in col) or ("awb" in col)
+            for col in qr_cols_lower
+        )
+        if has_dispatch_signature and not has_qr_markers:
+            return 0, 0.0, pd.DataFrame()
+
         # Find dispatcher column - handle multiple possible column name formats
         dispatcher_col = None
         possible_dispatcher_cols = [
@@ -1070,7 +1157,8 @@ class PayoutCalculator:
         # Find order number column - handle multiple possible column name formats
         order_col = None
         possible_order_cols = [
-            "no_awb", "No Awb", "No AWB", "waybill_number", "Waybill Number", "waybill", "Waybill"
+            "no_awb", "No Awb", "No AWB",
+            "order_no", "Order No", "Order Number", "order_number"
         ]
         for col_name in possible_order_cols:
             if col_name in qr_order_df.columns:
@@ -1081,7 +1169,7 @@ class PayoutCalculator:
         if order_col is None:
             for col in qr_order_df.columns:
                 col_lower = str(col).lower().strip()
-                if "awb" in col_lower:
+                if "awb" in col_lower or "order" in col_lower:
                     order_col = col
                     break
 
@@ -1174,6 +1262,18 @@ class PayoutCalculator:
             Tuple of (return_count, payout, filtered_return_df)
         """
         if return_df is None or return_df.empty or not dispatcher_id:
+            return 0, 0.0, pd.DataFrame()
+
+        # Guard: if requested Return sheet falls back to Dispatch data (when tab is missing),
+        # do not count delivery rows as returns.
+        return_cols_lower = {str(c).strip().lower() for c in return_df.columns}
+        has_dispatch_signature = (
+            "delivery signature" in return_cols_lower and
+            ("waybill number" in return_cols_lower or "waybill" in return_cols_lower) and
+            ("dispatcher id" in return_cols_lower or "dispatcher_id" in return_cols_lower)
+        )
+        has_return_markers = any("return" in col for col in return_cols_lower)
+        if has_dispatch_signature and not has_return_markers:
             return 0, 0.0, pd.DataFrame()
 
         # Find dispatcher column - handle multiple possible column name formats

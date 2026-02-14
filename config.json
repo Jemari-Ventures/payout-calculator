@@ -1,7 +1,7 @@
 {
   "data_source": {
-    "type": "excel",
-    "gsheet_url": "https://docs.google.com/spreadsheets/d/1rLdCtIvwCLX23-9SSBXAKIp_B75jTBts/edit?gid=830451308#gid=830451308",
+    "type": "postgres",
+    "gsheet_url": "https://docs.google.com/spreadsheets/d/1tQ_WqZEbDEJQtG2XxEeCffAmwxl30H4crAHzV6oimR0/edit?gid=0#gid=0",
     "postgres_table": "dispatch",
     "pickup_table": "pickup",
     "excel_file": "",
@@ -14,7 +14,8 @@
       "cod": "COD",
       "qr_order": "QR Order",
       "return": "Return",
-      "attendance": "Attendance"
+      "attendance": "Attendance",
+      "reward": "Reward"
     }
   },
   "database": {
