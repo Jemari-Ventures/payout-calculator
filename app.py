@@ -609,7 +609,8 @@ class PayoutCalculator:
                          fake_df: Optional[pd.DataFrame] = None,
                          cod_df: Optional[pd.DataFrame] = None,
                          attendance_df: Optional[pd.DataFrame] = None,
-                         working_days: Optional[int] = None) -> Dict:
+                         working_days: Optional[int] = None,
+                         fake_attempt_penalty_per_parcel: float = 2.0) -> Dict:
         """Calculate total penalty for a dispatcher from penalty sheets.
 
         Args:
@@ -852,8 +853,8 @@ class PayoutCalculator:
                 ]
 
                 if not fake_rows.empty:
-                    # Fixed RM1.00 per fake attempt
-                    penalty_amount = len(fake_rows) * 1.00
+                    # Configurable fake-attempt penalty (default RM2.00 per parcel)
+                    penalty_amount = len(fake_rows) * float(fake_attempt_penalty_per_parcel)
                     penalty_breakdown['fake_attempt']['amount'] = round(float(penalty_amount), 2)
                     penalty_breakdown['fake_attempt']['count'] = len(fake_rows)
 
@@ -1378,7 +1379,8 @@ class PayoutCalculator:
                               ldr_df: Optional[pd.DataFrame] = None,
                               fake_df: Optional[pd.DataFrame] = None,
                               cod_df: Optional[pd.DataFrame] = None,
-                              attendance_df: Optional[pd.DataFrame] = None) -> Tuple:
+                              attendance_df: Optional[pd.DataFrame] = None,
+                              fake_attempt_penalty_per_parcel: float = 2.0) -> Tuple:
         """Calculate payout for tiered daily mode with KPI bonus, attendance bonus, and special rates."""
         tiers = []
         for tier in tiers_config:
@@ -1744,7 +1746,8 @@ class PayoutCalculator:
                 fake_df,
                 cod_df,
                 attendance_df,
-                working_days
+                working_days,
+                fake_attempt_penalty_per_parcel
             )
 
         # Calculate gross payout (base + bonuses - penalties) - round to 2 decimal places
@@ -2696,7 +2699,8 @@ def main():
                 ldr_df,
                 fake_attempt_df,
                 cod_df,
-                attendance_df
+                attendance_df,
+                config.get("fake_attempt_penalty_per_parcel", 2.0)
             )
 
             # Calculate pickup payout (assuming RM1.00 per pickup parcel)
@@ -2973,6 +2977,15 @@ def main():
                         if not (str(col).startswith('Unnamed') or str(col).strip() == '' or str(col).lower() == 'nan')
                     ]
                     display_qr_order_df = display_qr_order_df[valid_columns]
+
+                    # Remove technical QR columns if present (safe when missing)
+                    drop_qr_columns = []
+                    for col in display_qr_order_df.columns:
+                        col_normalized = re.sub(r"[\s_]+", "", str(col).strip().lower())
+                        if col_normalized in {"orderstatus", "orderno"}:
+                            drop_qr_columns.append(col)
+                    if drop_qr_columns:
+                        display_qr_order_df = display_qr_order_df.drop(columns=drop_qr_columns, errors="ignore")
 
                     # Clean up column names for display
                     display_qr_order_df.columns = [str(col).title() for col in display_qr_order_df.columns]

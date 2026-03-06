@@ -1564,15 +1564,18 @@ class PayoutCalculator:
             dispatcher_summary_df['qr_order_payout'] = 0.0
             return dispatcher_summary_df
 
-        # Find dispatcher column in QR order data
-        dispatcher_col = None
-        for col in qr_order_df.columns:
-            col_lower = str(col).lower()
-            if col_lower in ('pickup_dispatcher_id', 'dispatcher_id', 'dispatcher'):
-                dispatcher_col = col
-                break
+        # Find dispatcher columns in QR order data (priority fallback per row)
+        dispatcher_col_priority = ('dispatcher_id', 'dispatcher', 'pickup_dispatcher_id')
+        dispatcher_cols = []
+        for preferred_col in dispatcher_col_priority:
+            matched_col = next(
+                (col for col in qr_order_df.columns if str(col).lower() == preferred_col),
+                None
+            )
+            if matched_col:
+                dispatcher_cols.append(matched_col)
 
-        if not dispatcher_col:
+        if not dispatcher_cols:
             st.warning("⚠️ No dispatcher column found in QR order data")
             dispatcher_summary_df['qr_order_count'] = 0
             dispatcher_summary_df['qr_order_payout'] = 0.0
@@ -1592,30 +1595,62 @@ class PayoutCalculator:
             dispatcher_summary_df['qr_order_payout'] = 0.0
             return dispatcher_summary_df
 
-        # Clean dispatcher IDs
-        qr_order_df['clean_dispatcher_id'] = qr_order_df[dispatcher_col].astype(str).str.strip()
+        # Normalize dispatcher IDs and order identifiers before grouping.
+        # This avoids mismatches like "1234" vs "1234.0" and ignores blank/null order keys.
+        qr_order_work = qr_order_df.copy()
+        qr_order_work['clean_dispatcher_id'] = ""
+        for disp_col in dispatcher_cols:
+            normalized_series = qr_order_work[disp_col].apply(normalize_dispatcher_id)
+            qr_order_work['clean_dispatcher_id'] = qr_order_work['clean_dispatcher_id'].where(
+                qr_order_work['clean_dispatcher_id'] != "",
+                normalized_series
+            )
 
-        # Group by dispatcher ID to count unique orders
-        qr_order_summary = qr_order_df.groupby('clean_dispatcher_id').agg(
-            qr_order_count=(order_no_col, 'nunique')
+        order_series = qr_order_work[order_no_col].astype(str).str.strip()
+        order_series = order_series.replace({
+            "": pd.NA,
+            "nan": pd.NA,
+            "NaN": pd.NA,
+            "None": pd.NA,
+            "none": pd.NA,
+            "NULL": pd.NA,
+            "null": pd.NA
+        })
+        qr_order_work['_clean_order_key'] = order_series
+
+        qr_order_work = qr_order_work[
+            (qr_order_work['clean_dispatcher_id'] != "") &
+            (qr_order_work['_clean_order_key'].notna())
+        ]
+
+        # Group by normalized dispatcher ID to count valid order rows.
+        # This matches app.py behavior: each valid row is one QR order.
+        qr_order_summary = qr_order_work.groupby('clean_dispatcher_id').agg(
+            qr_order_count=('_clean_order_key', 'size')
         ).reset_index()
 
         # Calculate QR order payout
         qr_order_summary['qr_order_payout'] = qr_order_summary['qr_order_count'] * qr_order_payout_per_order
 
         # Rename column for merging
-        qr_order_summary = qr_order_summary.rename(columns={'clean_dispatcher_id': 'dispatcher_id'})
+        qr_order_summary = qr_order_summary.rename(columns={'clean_dispatcher_id': '_dispatcher_key'})
 
         # Merge with dispatcher summary
+        dispatcher_summary_df = dispatcher_summary_df.copy()
+        dispatcher_summary_df['_dispatcher_key'] = dispatcher_summary_df['dispatcher_id'].apply(
+            lambda x: normalize_dispatcher_id(str(x))
+        )
+
         dispatcher_summary_df = dispatcher_summary_df.merge(
-            qr_order_summary[['dispatcher_id', 'qr_order_count', 'qr_order_payout']],
-            on='dispatcher_id',
+            qr_order_summary[['_dispatcher_key', 'qr_order_count', 'qr_order_payout']],
+            on='_dispatcher_key',
             how='left'
         )
 
         # Fill NaN values
-        dispatcher_summary_df['qr_order_count'] = dispatcher_summary_df['qr_order_count'].fillna(0)
+        dispatcher_summary_df['qr_order_count'] = dispatcher_summary_df['qr_order_count'].fillna(0).astype(int)
         dispatcher_summary_df['qr_order_payout'] = dispatcher_summary_df['qr_order_payout'].fillna(0.0)
+        dispatcher_summary_df = dispatcher_summary_df.drop(columns=['_dispatcher_key'], errors='ignore')
 
         return dispatcher_summary_df
 
@@ -3448,13 +3483,6 @@ def main():
         if qr_order_df is not None and not qr_order_df.empty:
             with st.expander("📱 QR Orders Details", expanded=False):
                 st.subheader("📱 QR Orders Details")
-                # Find dispatcher column
-                qr_dispatcher_col = None
-                for col in qr_order_df.columns:
-                    if col.lower() in ('pickup_dispatcher_id', 'dispatcher_id', 'dispatcher'):
-                        qr_dispatcher_col = col
-                        break
-
                 # Find waybill_number column
                 order_no_col = None
                 for col in qr_order_df.columns:
@@ -3462,12 +3490,37 @@ def main():
                         order_no_col = col
                         break
 
-                if qr_dispatcher_col and order_no_col:
-                    # Show summary by dispatcher
-                    qr_summary = qr_order_df.groupby(qr_dispatcher_col).agg(
-                        order_count=(order_no_col, 'nunique')
+                if order_no_col:
+                    # Build dispatcher key with row-level fallback to match payout logic
+                    qr_work = qr_order_df.copy()
+                    qr_work['_dispatcher_key'] = ""
+
+                    for preferred_col in ('dispatcher_id', 'dispatcher', 'pickup_dispatcher_id'):
+                        matched_col = next((c for c in qr_work.columns if str(c).lower() == preferred_col), None)
+                        if matched_col:
+                            normalized_series = qr_work[matched_col].apply(normalize_dispatcher_id)
+                            qr_work['_dispatcher_key'] = qr_work['_dispatcher_key'].where(
+                                qr_work['_dispatcher_key'] != "",
+                                normalized_series
+                            )
+
+                    # Keep only valid order rows (same as payout logic)
+                    order_series = qr_work[order_no_col].astype(str).str.strip().replace({
+                        "": pd.NA,
+                        "nan": pd.NA,
+                        "NaN": pd.NA,
+                        "None": pd.NA,
+                        "none": pd.NA,
+                        "NULL": pd.NA,
+                        "null": pd.NA
+                    })
+                    qr_work = qr_work[(qr_work['_dispatcher_key'] != "") & (order_series.notna())]
+
+                    # Show summary by dispatcher (row count, not unique count)
+                    qr_summary = qr_work.groupby('_dispatcher_key').agg(
+                        order_count=('_dispatcher_key', 'size')
                     ).reset_index()
-                    qr_summary = qr_summary.rename(columns={qr_dispatcher_col: 'Dispatcher ID', 'order_count': 'QR Orders'})
+                    qr_summary = qr_summary.rename(columns={'_dispatcher_key': 'Dispatcher ID', 'order_count': 'QR Orders'})
                     qr_summary = qr_summary.sort_values('QR Orders', ascending=False)
                     st.dataframe(qr_summary, use_container_width=True, hide_index=True)
 
