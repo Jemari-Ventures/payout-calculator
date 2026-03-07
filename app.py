@@ -1681,6 +1681,11 @@ class PayoutCalculator:
 
             missing_records_all = filtered_df[missing_mask].copy()
 
+            # Do not add back waybills that are in the return sheet (keep Total Delivery Parcels excluding returns).
+            if not missing_records_all.empty and return_waybills:
+                norm_missing = missing_records_all[waybill_col].apply(_norm_waybill)
+                missing_records_all = missing_records_all.loc[~norm_missing.isin(return_waybills)].copy()
+
             if not missing_records_all.empty:
                 # Convert waybill - use direct string conversion to ensure it's never None
                 def force_waybill_to_string(x):
@@ -1926,7 +1931,8 @@ class InvoiceGenerator:
         return_payout: float = 0.0,
         return_count: int = 0,
         kpi_description: str = "",
-        attendance_description: str = ""
+        attendance_description: str = "",
+        total_awb: int = 0
     ) -> str:
         total_parcels = df_disp['Total Parcel'].sum() if 'Total Parcel' in df_disp.columns else 0
         total_days = len(df_disp) if 'Date' in df_disp.columns else 0
@@ -2119,6 +2125,10 @@ class InvoiceGenerator:
                     <div class="chip">
                         <div class="label">Dispatcher ID</div>
                         <div class="value">{dpid}</div>
+                    </div>
+                    <div class="chip">
+                        <div class="label">Total AWB</div>
+                        <div class="value">{total_awb:,}</div>
                     </div>
                     <div class="chip">
                         <div class="label">Total Delivery Parcels</div>
@@ -2776,45 +2786,48 @@ def main():
             # Calculate final payout - round to 2 decimal places
             final_payout = round(gross_total_payout - advance_payout, 2)
 
-            # Display metrics in columns
-            col1, col2, col3, col4, col5, col6 = st.columns(6)
-
-            with col1:
+            # Total AWB = row count from dispatch sheet only; do not exclude return waybills.
+            total_awb = len(dispatcher_df)
+            row1_col1, row1_col2, row1_col3 = st.columns(3)
+            with row1_col1:
+                st.metric(
+                    "Total AWB",
+                    f"{total_awb:,}",
+                    help="From dispatch sheet only; all waybills included (returns not excluded)"
+                )
+            with row1_col2:
                 st.metric(
                     "Total Delivery Parcels",
                     f"{display_df['Total Parcel'].sum():,}",
-                    help="Total parcels delivered in the month"
+                    help="Total parcels delivered in the month (excl. returns)"
                 )
-
-            with col2:
+            with row1_col3:
                 st.metric(
                     "Working Days",
                     f"{len(display_df)}",
                     help="Number of days worked"
                 )
 
-            with col3:
+            row2_col1, row2_col2, row2_col3, row2_col4 = st.columns(4)
+            with row2_col1:
                 st.metric(
                     "Base Delivery Payout",
                     f"{config['currency_symbol']}{base_delivery_payout:,.2f}",
                     help="Total base payout from daily deliveries"
                 )
-
-            with col4:
+            with row2_col2:
                 st.metric(
                     "Gross Payout",
                     f"{config['currency_symbol']}{gross_total_payout:,.2f}",
                     help="Total gross payout including bonuses and penalties"
                 )
-
-            with col5:
+            with row2_col3:
                 st.metric(
                     "Advance Payout",
                     f"{config['currency_symbol']}{advance_payout:,.2f}",
                     help="40% of base delivery payout"
                 )
-
-            with col6:
+            with row2_col4:
                 st.metric(
                     "Final Payout",
                     f"{config['currency_symbol']}{final_payout:,.2f}",
@@ -3267,7 +3280,8 @@ def main():
                 return_payout=return_payout,
                 return_count=return_count,
                 kpi_description=kpi_description,
-                attendance_description=attendance_desc
+                attendance_description=attendance_desc,
+                total_awb=len(dispatcher_df)
             )
 
             # Display invoice
@@ -3312,6 +3326,7 @@ Period: {period_display}
 
 SUMMARY
 -------
+Total AWB: {len(dispatcher_df):,}
 Total Delivery Parcels: {display_df['Total Parcel'].sum():,}
 Working Days: {len(display_df)}
 Pickup Parcels: {pickup_parcels:,}
