@@ -1672,11 +1672,15 @@ class PayoutCalculator:
             dispatcher_summary_df['return_payout'] = 0.0
             return dispatcher_summary_df
 
-        # Find dispatcher ID column in return data
+        # Find dispatcher ID column in return data (exact then partial match)
         return_dispatcher_col = None
         for col in return_df.columns:
-            col_lower = str(col).lower()
-            if 'dispatcher_id' in col_lower or 'Dispatcher ID' in col:
+            c = str(col).strip()
+            c_lower = c.lower()
+            if c_lower == 'dispatcher_id' or c == 'Dispatcher ID':
+                return_dispatcher_col = col
+                break
+            if 'dispatcher' in c_lower and ('id' in c_lower or 'no' in c_lower or 'number' in c_lower or 'delivery' in c_lower):
                 return_dispatcher_col = col
                 break
 
@@ -1700,26 +1704,28 @@ class PayoutCalculator:
             dispatcher_summary_df['return_payout'] = 0.0
             return dispatcher_summary_df
 
-        # Clean dispatcher IDs
-        return_df['clean_dispatcher_id'] = return_df[return_dispatcher_col].astype(str).str.strip()
+        # Normalize dispatcher IDs so merge matches dispatch summary (same as QR order fix).
+        return_work = return_df.copy()
+        return_work['_dispatcher_key'] = return_work[return_dispatcher_col].apply(normalize_dispatcher_id)
+        return_work = return_work[return_work['_dispatcher_key'] != ""]
 
-        # Group by dispatcher ID to count unique waybills
-        return_summary = return_df.groupby('clean_dispatcher_id').agg(
-            return_parcels=(waybill_col, 'nunique')
+        # Group by normalized dispatcher ID; count rows (each row = one return parcel).
+        return_summary = return_work.groupby('_dispatcher_key').agg(
+            return_parcels=(waybill_col, 'size')
         ).reset_index()
-
-        # Calculate return payout
         return_summary['return_payout'] = return_summary['return_parcels'] * return_payout_per_parcel
 
-        # Rename column for merging
-        return_summary = return_summary.rename(columns={'clean_dispatcher_id': 'dispatcher_id'})
-
-        # Merge with dispatcher summary
+        # Merge on normalized key so all 130 rows can match dispatch dispatchers.
+        dispatcher_summary_df = dispatcher_summary_df.copy()
+        dispatcher_summary_df['_dispatcher_key'] = dispatcher_summary_df['dispatcher_id'].apply(
+            lambda x: normalize_dispatcher_id(str(x))
+        )
         dispatcher_summary_df = dispatcher_summary_df.merge(
-            return_summary[['dispatcher_id', 'return_parcels', 'return_payout']],
-            on='dispatcher_id',
+            return_summary[['_dispatcher_key', 'return_parcels', 'return_payout']],
+            on='_dispatcher_key',
             how='left'
         )
+        dispatcher_summary_df = dispatcher_summary_df.drop(columns=['_dispatcher_key'], errors='ignore')
 
         # Fill NaN values
         dispatcher_summary_df['return_parcels'] = dispatcher_summary_df['return_parcels'].fillna(0)
@@ -3450,26 +3456,29 @@ def main():
         if return_df is not None and not return_df.empty:
             with st.expander("↩️ Return Parcels Details", expanded=False):
                 st.subheader("↩️ Return Parcels Details")
-                # Find dispatcher ID column
                 return_dispatcher_col = None
                 for col in return_df.columns:
-                    if 'dispatcher_id' in col.lower() or 'Dispatcher ID' in col:
+                    c = str(col).strip().lower()
+                    if c == 'dispatcher_id' or col == 'Dispatcher ID':
                         return_dispatcher_col = col
                         break
-
-                # Find waybill column
+                    if 'dispatcher' in c and ('id' in c or 'no' in c or 'number' in c or 'delivery' in c):
+                        return_dispatcher_col = col
+                        break
                 waybill_col = None
                 for col in return_df.columns:
-                    if 'waybill' in col.lower() or 'Waybill Number' in col:
+                    if 'waybill' in str(col).lower() or col == 'Waybill Number':
                         waybill_col = col
                         break
 
                 if return_dispatcher_col and waybill_col:
-                    # Show summary by dispatcher
-                    return_summary = return_df.groupby(return_dispatcher_col).agg(
-                        parcel_count=(waybill_col, 'nunique')
+                    return_work = return_df.copy()
+                    return_work['_key'] = return_work[return_dispatcher_col].apply(normalize_dispatcher_id)
+                    return_work = return_work[return_work['_key'] != ""]
+                    return_summary = return_work.groupby('_key').agg(
+                        parcel_count=(waybill_col, 'size')
                     ).reset_index()
-                    return_summary = return_summary.rename(columns={return_dispatcher_col: 'Dispatcher ID', 'parcel_count': 'Return Parcels'})
+                    return_summary = return_summary.rename(columns={'_key': 'Dispatcher ID', 'parcel_count': 'Return Parcels'})
                     return_summary = return_summary.sort_values('Return Parcels', ascending=False)
                     st.dataframe(return_summary, use_container_width=True, hide_index=True)
 
