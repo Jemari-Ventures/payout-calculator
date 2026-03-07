@@ -1380,8 +1380,12 @@ class PayoutCalculator:
                               fake_df: Optional[pd.DataFrame] = None,
                               cod_df: Optional[pd.DataFrame] = None,
                               attendance_df: Optional[pd.DataFrame] = None,
-                              fake_attempt_penalty_per_parcel: float = 2.0) -> Tuple:
-        """Calculate payout for tiered daily mode with KPI bonus, attendance bonus, and special rates."""
+                              fake_attempt_penalty_per_parcel: float = 2.0,
+                              return_df: Optional[pd.DataFrame] = None) -> Tuple:
+        """Calculate payout for tiered daily mode with KPI bonus, attendance bonus, and special rates.
+        Any waybill that appears in the return sheet is excluded from dispatch so tier calculation
+        uses delivery-only parcels (e.g. dispatch 2059 - return 45 = 2014 for tier).
+        """
         tiers = []
         for tier in tiers_config:
             tmin = tier.get("Min Parcels")
@@ -1410,6 +1414,48 @@ class PayoutCalculator:
 
         if delivery_sig_col is None or waybill_col is None:
             raise ValueError("Required columns (Delivery Signature and Waybill Number) not found in data")
+
+        # Exclude any waybill that appears in the return sheet so tier calc uses delivery-only parcels (e.g. 2059 - 45 = 2014).
+        def _norm_waybill(v):
+            if pd.isna(v):
+                return ""
+            if isinstance(v, (int, float)):
+                try:
+                    if isinstance(v, float) and v == int(v):
+                        return str(int(v))
+                    if isinstance(v, float):
+                        if v == int(v):
+                            return str(int(v))
+                        return str(v).strip()
+                    return str(int(v))
+                except (ValueError, OverflowError):
+                    return str(v).strip()
+            s = str(v).strip()
+            if not s or s.lower() in ("nan", "none", "null", ""):
+                return ""
+            if s.endswith(".0") and s[:-2].isdigit():
+                s = s[:-2]
+            if "e" in s.lower():
+                try:
+                    f = float(s)
+                    if f == int(f):
+                        return str(int(f))
+                    return str(f).strip()
+                except (ValueError, OverflowError):
+                    pass
+            return s
+
+        return_waybills = set()
+        if return_df is not None and not return_df.empty and waybill_col is not None:
+            return_wb_col = find_column(return_df, ["Waybill Number", "waybill_number", "Waybill", "waybill"])
+            if return_wb_col is not None:
+                for x in return_df[return_wb_col].dropna().unique():
+                    n = _norm_waybill(x)
+                    if n:
+                        return_waybills.add(n)
+        if return_waybills:
+            dispatch_norm = work[waybill_col].apply(_norm_waybill)
+            work = work.loc[~dispatch_norm.isin(return_waybills)].copy()
 
         # Convert dates - but DON'T drop records with invalid dates
         # Use errors="coerce" to convert invalid dates to NaT, but keep the records
@@ -2700,7 +2746,8 @@ def main():
                 fake_attempt_df,
                 cod_df,
                 attendance_df,
-                config.get("fake_attempt_penalty_per_parcel", 2.0)
+                config.get("fake_attempt_penalty_per_parcel", 2.0),
+                return_df=return_df
             )
 
             # Calculate pickup payout (assuming RM1.00 per pickup parcel)

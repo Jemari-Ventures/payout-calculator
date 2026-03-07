@@ -864,6 +864,37 @@ class DataSource:
             st.warning(f"Could not load reward data from PostgreSQL table 'reward': {exc}")
             return None
 
+    @staticmethod
+    def load_rental_data(config: dict, excel_source=None) -> Optional[pd.DataFrame]:
+        """Load rental data from rental table or Excel sheet (columns: dispatcher_id, amount)."""
+        data_source = config.get("data_source", {})
+        source_type = data_source.get("type", "postgres")
+
+        if source_type == "excel":
+            try:
+                sheet_name = DataSource._get_excel_sheet_name(config, "rental", "Rental")
+                gsheet_url = data_source.get("gsheet_url")
+                if not gsheet_url:
+                    return None
+                df = DataSource.read_google_sheet(gsheet_url, sheet_name=sheet_name)
+                if df.empty and sheet_name != sheet_name.upper():
+                    df = DataSource.read_google_sheet(gsheet_url, sheet_name=sheet_name.upper())
+                return df
+            except Exception as exc:
+                st.warning(f"Could not load rental data from Excel sheet '{sheet_name}': {exc}")
+                return None
+
+        engine = DataSource.get_postgres_engine()
+        if not engine:
+            return None
+
+        try:
+            df = DataSource.read_postgres_table(engine, 'rental')
+            return df
+        except Exception as exc:
+            st.warning(f"Could not load rental data from PostgreSQL table 'rental': {exc}")
+            return None
+
 # =============================================================================
 # DATA PROCESSING
 # =============================================================================
@@ -1742,10 +1773,85 @@ class PayoutCalculator:
                         return_df: Optional[pd.DataFrame] = None,
                         return_payout_per_parcel: float = 1.50,
                         reward_df: Optional[pd.DataFrame] = None,
+                        rental_df: Optional[pd.DataFrame] = None,
                         attendance_df: Optional[pd.DataFrame] = None,
                         processing_warnings: Optional[List[str]] = None) -> Tuple[pd.DataFrame, pd.DataFrame, float]:
         """Calculate payout using tier-based weight calculation."""
-        # Prepare data
+        # Normalize waybill for matching dispatch vs return (same format for comparison).
+        def _norm_waybill(v):
+            if pd.isna(v):
+                return ""
+            if isinstance(v, (int, float)):
+                try:
+                    if isinstance(v, float) and v == int(v):
+                        return str(int(v))
+                    if isinstance(v, float):
+                        if v == int(v):
+                            return str(int(v))
+                        return str(v).strip()
+                    return str(int(v))
+                except (ValueError, OverflowError):
+                    return str(v).strip()
+            s = str(v).strip()
+            if not s or s.lower() in ('nan', 'none', 'null', ''):
+                return ""
+            if s.endswith('.0') and s[:-2].isdigit():
+                s = s[:-2]
+            if 'e' in s.lower():
+                try:
+                    f = float(s)
+                    if f == int(f):
+                        return str(int(f))
+                    return str(f).strip()
+                except (ValueError, OverflowError):
+                    pass
+            return s
+
+        # Total AWB = raw dispatch count per dispatcher (do not minus return); compute before filtering.
+        dispatch_disp_col = None
+        for c in ('Dispatcher ID', 'dispatcher_id', 'Dispatcher Id'):
+            if c in df.columns:
+                dispatch_disp_col = c
+                break
+        if dispatch_disp_col is None:
+            for col in df.columns:
+                if 'dispatcher' in str(col).lower() and 'id' in str(col).lower():
+                    dispatch_disp_col = col
+                    break
+        total_awb_df = None
+        if dispatch_disp_col is not None:
+            total_awb_df = df.groupby(dispatch_disp_col).size().reset_index(name='total_awb')
+
+        # Exclude return waybills from dispatch *before* any processing so "Parcels Delivered" and tier calc are delivery-only.
+        if return_df is not None and not return_df.empty:
+            return_wb_col = None
+            for col in return_df.columns:
+                c = str(col).strip().lower()
+                if 'waybill' in c or col == 'Waybill Number':
+                    return_wb_col = col
+                    break
+            if return_wb_col is not None:
+                return_waybills = set()
+                for x in return_df[return_wb_col].dropna().unique():
+                    n = _norm_waybill(x)
+                    if n:
+                        return_waybills.add(n)
+                if return_waybills:
+                    # Find waybill column in raw dispatch df (before prepare_dataframe renames)
+                    dispatch_wb_col = None
+                    for c in ('Waybill Number', 'waybill_number', 'waybill', 'Waybill'):
+                        if c in df.columns:
+                            dispatch_wb_col = c
+                            break
+                    if dispatch_wb_col is None:
+                        for col in df.columns:
+                            if 'waybill' in str(col).lower():
+                                dispatch_wb_col = col
+                                break
+                    if dispatch_wb_col is not None:
+                        df = df.loc[~df[dispatch_wb_col].apply(_norm_waybill).isin(return_waybills)].copy()
+
+        # Prepare data (now on delivery-only rows)
         df_clean = DataProcessor.prepare_dataframe(df)
         df_clean = DataProcessor.remove_duplicates(df_clean)
 
@@ -1760,7 +1866,6 @@ class PayoutCalculator:
         )
         df_clean['payout'] = df_clean['payout_rate']
 
-        # Keep all waybills (no deduplication)
         waybill_col = find_column(df_clean, 'waybill') or 'waybill'
         delivery_sig_col = None
         for col in df.columns:
@@ -1772,6 +1877,13 @@ class PayoutCalculator:
                 delivery_sig_col = col
                 break
         date_col = delivery_sig_col or ('date' if 'date' in df_clean.columns else find_column(df_clean, 'date'))
+
+        if waybill_col not in df_clean.columns:
+            for c in ('waybill', 'Waybill Number', 'waybill_number', 'Waybill'):
+                if c in df_clean.columns:
+                    waybill_col = c
+                    break
+
         df_unique = df_clean.copy()
 
         # Attendance penalty map per dispatcher (sum of attendance penalty column)
@@ -1801,6 +1913,31 @@ class PayoutCalculator:
                 reward_copy['_reward_amount'] = pd.to_numeric(reward_copy[reward_amount_col], errors='coerce').fillna(0.0)
                 reward_map = (
                     reward_copy.groupby('_emp_id')['_reward_amount']
+                    .sum()
+                    .round(2)
+                    .to_dict()
+                )
+
+        rental_map = {}
+        if rental_df is not None and not rental_df.empty:
+            rental_disp_col = next((col for col in rental_df.columns if str(col).strip().lower() == 'dispatcher_id'), None)
+            rental_amount_col = next((col for col in rental_df.columns if str(col).strip().lower() == 'amount'), None)
+            if rental_disp_col is None:
+                for col in rental_df.columns:
+                    if 'dispatcher' in str(col).lower() and 'id' in str(col).lower():
+                        rental_disp_col = col
+                        break
+            if rental_amount_col is None:
+                for col in rental_df.columns:
+                    if str(col).strip().lower() == 'amount':
+                        rental_amount_col = col
+                        break
+            if rental_disp_col and rental_amount_col:
+                rental_copy = rental_df.copy()
+                rental_copy['_key'] = rental_copy[rental_disp_col].apply(normalize_dispatcher_id)
+                rental_copy['_amount'] = pd.to_numeric(rental_copy[rental_amount_col], errors='coerce').fillna(0.0)
+                rental_map = (
+                    rental_copy.groupby('_key')['_amount']
                     .sum()
                     .round(2)
                     .to_dict()
@@ -1894,6 +2031,10 @@ class PayoutCalculator:
             lambda x: float(reward_map.get(normalize_dispatcher_id(str(x)), 0.0))
         )
 
+        grouped['rental'] = grouped['dispatcher_id'].apply(
+            lambda x: float(rental_map.get(normalize_dispatcher_id(str(x)), 0.0))
+        )
+
         # Calculate pickup payout
         grouped = PayoutCalculator.calculate_pickup_payout(pickup_df, grouped, pickup_payout_per_parcel)
 
@@ -1903,7 +2044,7 @@ class PayoutCalculator:
         # Calculate return payout
         grouped = PayoutCalculator.calculate_return_payout(return_df, grouped, return_payout_per_parcel)
 
-        # Calculate total payout: dispatch payout - penalty + pickup payout + QR order payout + return payout + reward
+        # Calculate total payout: dispatch - penalty + pickup + QR order + return + reward - rental
         grouped['total_payout'] = (
             grouped['dispatch_payout']
             - grouped['penalty_amount']
@@ -1911,13 +2052,26 @@ class PayoutCalculator:
             + grouped['qr_order_payout']
             + grouped['return_payout']
             + grouped['reward']
+            - grouped['rental']
         )
+
+        # Add Total AWB (raw dispatch count, not minus return)
+        if total_awb_df is not None and dispatch_disp_col is not None:
+            grouped = grouped.merge(
+                total_awb_df.rename(columns={dispatch_disp_col: 'dispatcher_id'}),
+                on='dispatcher_id',
+                how='left'
+            )
+            grouped['total_awb'] = grouped['total_awb'].fillna(0).astype(int)
+        else:
+            grouped['total_awb'] = grouped['parcel_count'].astype(int)
 
         # Create display and numeric dataframes
         numeric_df = grouped.rename(columns={
             "dispatcher_id": "Dispatcher ID",
             "dispatcher_name": "Dispatcher Name",
             "parcel_count": "Parcels Delivered",
+            "total_awb": "Total AWB",
             "total_weight": "Total Weight (kg)",
             "avg_weight": "Avg Weight (kg)",
             "avg_rate": "Avg Rate per Parcel",
@@ -1938,6 +2092,7 @@ class PayoutCalculator:
             "return_parcels": "Return Parcels",
             "return_payout": "Return Parcels Payout",
             "reward": "Reward",
+            "rental": "Rental",
             "tier1_parcels": "Parcels 0-5kg",
             "tier2_parcels": "Parcels 5.01-10kg",
             "tier3_parcels": "Parcels 10.01-30kg",
@@ -1968,6 +2123,10 @@ class PayoutCalculator:
             display_df["Return Parcels Payout"] = display_df["Return Parcels Payout"].apply(lambda x: f"{currency_symbol}{x:,.2f}")
         if "Reward" in display_df.columns:
             display_df["Reward"] = display_df["Reward"].apply(lambda x: f"{currency_symbol}{x:,.2f}")
+        if "Rental" in display_df.columns:
+            display_df["Rental"] = display_df["Rental"].apply(
+                lambda x: f"-{currency_symbol}{x:,.2f}" if x > 0 else f"{currency_symbol}0.00"
+            )
 
         # Keep Penalty Waybills and Penalty Parcels in numeric_df but remove from display_df
         if "Penalty Waybills" in display_df.columns:
@@ -2333,6 +2492,7 @@ class InvoiceGenerator:
             total_qr_orders = int(numeric_df["QR Orders"].sum()) if "QR Orders" in numeric_df.columns else 0
             total_qr_order_payout = numeric_df["QR Orders Payout"].sum() if "QR Orders Payout" in numeric_df.columns else 0.0
             total_reward = numeric_df["Reward"].sum() if "Reward" in numeric_df.columns else 0.0
+            total_rental = numeric_df["Rental"].sum() if "Rental" in numeric_df.columns else 0.0
             penalty_by_type = {
                 'duitnow': numeric_df["DuitNow Penalty"].sum() if "DuitNow Penalty" in numeric_df.columns else 0.0,
                 'ldr': numeric_df["LDR Penalty"].sum() if "LDR Penalty" in numeric_df.columns else 0.0,
@@ -2348,14 +2508,15 @@ class InvoiceGenerator:
                 + total_return_payout
                 + total_qr_order_payout
                 + total_reward
+                - total_rental
             )
             gross_payout = invoice_total_payout - total_penalty
             top_3 = display_df.head(3)
 
-            table_columns = ["Dispatcher ID", "Dispatcher Name", "Parcels Delivered",
+            table_columns = ["Dispatcher ID", "Dispatcher Name", "Total AWB", "Parcels Delivered",
                            "Delivery Parcels Payout", "Pickup Parcels", "Pickup Parcels Payout",
                            "Return Parcels", "Return Parcels Payout",
-                           "Reward", "Penalty", "Total Payout"]
+                           "Reward", "Rental", "Penalty", "Total Payout"]
 
             html = f"""
             <html>
@@ -2495,7 +2656,8 @@ class InvoiceGenerator:
                                     Pickup: {currency_symbol} {total_pickup_payout:,.2f} ·
                                     Return: {currency_symbol} {total_return_payout:,.2f}<br>
                                     QR Orders: {currency_symbol} {total_qr_order_payout:,.2f} ·
-                                    Reward: {currency_symbol} {total_reward:,.2f}
+                                    Reward: {currency_symbol} {total_reward:,.2f} ·
+                                    Rental: -{currency_symbol} {total_rental:,.2f}
                                 </div>
                             </div>
                             <div class="chip">
@@ -2535,6 +2697,7 @@ class InvoiceGenerator:
                             <tr><td>Return Parcels Payout</td><td style="text-align:right;">{currency_symbol} {total_return_payout:,.2f}</td></tr>
                             <tr><td>QR Orders Payout</td><td style="text-align:right;">{currency_symbol} {total_qr_order_payout:,.2f}</td></tr>
                             <tr><td>Total Reward</td><td style="text-align:right;">{currency_symbol} {total_reward:,.2f}</td></tr>
+                            <tr><td>Total Rental (deduction)</td><td style="text-align:right;">-{currency_symbol} {total_rental:,.2f}</td></tr>
                             <tr><td><strong>Total Payout</strong></td><td style="text-align:right;"><strong>{currency_symbol} {invoice_total_payout:,.2f}</strong></td></tr>
                             <tr><td>Total Penalty</td><td style="text-align:right;">-{currency_symbol} {total_penalty:,.2f}</td></tr>
                             <tr><td><strong>Gross Payout</strong></td><td style="text-align:right;"><strong>{currency_symbol} {gross_payout:,.2f}</strong></td></tr>
@@ -2875,6 +3038,7 @@ def main():
     qr_order_df = DataSource.load_qr_order_data(config, excel_source)
     return_df = DataSource.load_return_data(config, excel_source)
     reward_df = DataSource.load_reward_data(config, excel_source)
+    rental_df = DataSource.load_rental_data(config, excel_source)
     attendance_df = DataSource.load_attendance_data(config, excel_source)
 
     # Filter all data by selected date range if a date column is selected
@@ -3192,6 +3356,7 @@ def main():
         df, currency, penalty_data, pickup_df, pickup_payout_per_parcel,
         qr_order_df, qr_order_payout_per_order, return_df, return_payout_per_parcel,
         reward_df=reward_df,
+        rental_df=rental_df,
         attendance_df=attendance_df,
         processing_warnings=processing_warnings
     )
@@ -3233,6 +3398,7 @@ def main():
         st.subheader("📈 Performance Overview")
 
         # Calculate totals
+        total_awb = int(numeric_df["Total AWB"].sum()) if "Total AWB" in numeric_df.columns else 0
         total_pickup_parcels = int(numeric_df["Pickup Parcels"].sum()) if "Pickup Parcels" in numeric_df.columns else 0
         total_pickup_payout = numeric_df["Pickup Parcels Payout"].sum() if "Pickup Parcels Payout" in numeric_df.columns else 0.0
         total_qr_orders = int(numeric_df["QR Orders"].sum()) if "QR Orders" in numeric_df.columns else 0
@@ -3241,6 +3407,7 @@ def main():
         total_return_payout = numeric_df["Return Parcels Payout"].sum() if "Return Parcels Payout" in numeric_df.columns else 0.0
         total_dispatch_payout = numeric_df["Delivery Parcels Payout"].sum() if "Delivery Parcels Payout" in numeric_df.columns else 0.0
         total_reward = numeric_df["Reward"].sum() if "Reward" in numeric_df.columns else 0.0
+        total_rental = numeric_df["Rental"].sum() if "Rental" in numeric_df.columns else 0.0
 
         total_penalty = numeric_df["Penalty"].sum() if "Penalty" in numeric_df.columns else 0.0
 
@@ -3253,17 +3420,19 @@ def main():
             'attendance': numeric_df["Attendance Penalty"].sum() if "Attendance Penalty" in numeric_df.columns else 0.0
         }
 
-        # Row 1: Dispatcher | Delivery Parcels | Pickup Parcels | Return Parcels | QR Orders
-        row1_col1, row1_col2, row1_col3, row1_col4, row1_col5 = st.columns(5)
+        # Row 1: Dispatchers | Total AWB | Delivery Parcels | Pickup Parcels | Return Parcels | QR Orders
+        row1_col1, row1_col2, row1_col3, row1_col4, row1_col5, row1_col6 = st.columns(6)
         with row1_col1:
             st.metric("Dispatchers", f"{len(display_df):,}")
         with row1_col2:
-            st.metric("Delivery Parcels", f"{int(numeric_df['Parcels Delivered'].sum()):,}")
+            st.metric("Total AWB", f"{total_awb:,}")
         with row1_col3:
-            st.metric("Pickup Parcels", f"{total_pickup_parcels:,}")
+            st.metric("Delivery Parcels", f"{int(numeric_df['Parcels Delivered'].sum()):,}")
         with row1_col4:
-            st.metric("Return Parcels", f"{total_return_parcels:,}")
+            st.metric("Pickup Parcels", f"{total_pickup_parcels:,}")
         with row1_col5:
+            st.metric("Return Parcels", f"{total_return_parcels:,}")
+        with row1_col6:
             st.metric("QR Orders", f"{total_qr_orders:,}")
 
         # Row 2: Total Payout | Delivery Parcels Payout | Pickup Parcels Payout | Return Parcels Payout | QR Orders Payout
@@ -3282,6 +3451,8 @@ def main():
         row3_cols = st.columns(5)
         with row3_cols[0]:
             st.metric("QR Orders Payout", f"{currency} {total_qr_order_payout:,.2f}")
+        with row3_cols[1]:
+            st.metric("Rental (deduction)", f"-{currency} {total_rental:,.2f}")
 
         # Penalty breakdown by type
         st.markdown("#### ⚠️ Penalty Breakdown by Type")
@@ -3396,11 +3567,11 @@ def main():
 
             # Reorder columns for better readability
             preferred_order = [
-                "Dispatcher ID", "Dispatcher Name", "Parcels Delivered",
+                "Dispatcher ID", "Dispatcher Name", "Total AWB", "Parcels Delivered",
                 "Delivery Parcels Payout", "Pickup Parcels", "Pickup Parcels Payout",
                 "QR Orders", "QR Orders Payout",
                 "Return Parcels", "Return Parcels Payout",
-                "Reward",
+                "Reward", "Rental",
                 "Penalty", "DuitNow Penalty", "LDR Penalty", "Fake Attempt Penalty", "COD Penalty", "Attendance Penalty",
                 "Total Payout", "Total Weight (kg)", "Avg Weight (kg)",
                 "Avg Rate per Parcel", "Parcels 0-5kg", "Parcels 5.01-10kg",
