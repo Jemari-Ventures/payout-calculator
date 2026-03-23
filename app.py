@@ -378,16 +378,31 @@ class DataSource:
         candidate_sample = (
             candidate_df.head(sample_size)
             .fillna("")
-            .applymap(DataSource._normalize_compare_value)
+            .map(DataSource._normalize_compare_value)
             .astype(str)
         )
         dispatch_sample = (
             dispatch_df.head(sample_size)
             .fillna("")
-            .applymap(DataSource._normalize_compare_value)
+            .map(DataSource._normalize_compare_value)
             .astype(str)
         )
         return candidate_sample.equals(dispatch_sample)
+
+    @staticmethod
+    def _read_optional_sheet_without_dispatch_fallback(gsheet_url: str, sheet_name: str) -> pd.DataFrame:
+        """
+        Read an optional sheet and guard against Google Sheets fallback behavior
+        where a missing tab may return Dispatch content instead.
+        """
+        sheet_df = DataSource.read_google_sheet(gsheet_url, sheet_name=sheet_name)
+        if sheet_df is None or sheet_df.empty:
+            return pd.DataFrame()
+
+        dispatch_df = DataSource.read_google_sheet(gsheet_url, sheet_name="Dispatch")
+        if DataSource._is_fallback_dispatch_sheet(sheet_df, dispatch_df):
+            return pd.DataFrame()
+        return sheet_df
 
     @staticmethod
     def load_data(config: dict) -> Optional[pd.DataFrame]:
@@ -408,7 +423,9 @@ class DataSource:
         data_source = config["data_source"]
         if data_source["type"] == "gsheet" and data_source["gsheet_url"]:
             try:
-                return DataSource.read_google_sheet(data_source["gsheet_url"], sheet_name="Pickup")
+                return DataSource._read_optional_sheet_without_dispatch_fallback(
+                    data_source["gsheet_url"], sheet_name="Pickup"
+                )
             except Exception as exc:
                 st.warning(f"Could not load pickup data from Sheet2: {exc}")
                 return None
@@ -420,7 +437,9 @@ class DataSource:
         data_source = config["data_source"]
         if data_source["type"] == "gsheet" and data_source["gsheet_url"]:
             try:
-                return DataSource.read_google_sheet(data_source["gsheet_url"], sheet_name="DuitNow")
+                return DataSource._read_optional_sheet_without_dispatch_fallback(
+                    data_source["gsheet_url"], sheet_name="DuitNow"
+                )
             except Exception as exc:
                 st.warning(f"Could not load DuitNow penalty data from Sheet3: {exc}")
                 return None
@@ -432,7 +451,9 @@ class DataSource:
         data_source = config["data_source"]
         if data_source["type"] == "gsheet" and data_source["gsheet_url"]:
             try:
-                return DataSource.read_google_sheet(data_source["gsheet_url"], sheet_name="LDR")
+                return DataSource._read_optional_sheet_without_dispatch_fallback(
+                    data_source["gsheet_url"], sheet_name="LDR"
+                )
             except Exception as exc:
                 st.warning(f"Could not load LD&R penalty data from Sheet4: {exc}")
                 return None
@@ -444,7 +465,9 @@ class DataSource:
         data_source = config["data_source"]
         if data_source["type"] == "gsheet" and data_source["gsheet_url"]:
             try:
-                return DataSource.read_google_sheet(data_source["gsheet_url"], sheet_name="Fake Attempt")
+                return DataSource._read_optional_sheet_without_dispatch_fallback(
+                    data_source["gsheet_url"], sheet_name="Fake Attempt"
+                )
             except Exception as exc:
                 st.warning(f"Could not load Fake Attempt penalty data from Sheet5: {exc}")
                 return None
@@ -456,7 +479,9 @@ class DataSource:
         data_source = config["data_source"]
         if data_source["type"] == "gsheet" and data_source["gsheet_url"]:
             try:
-                return DataSource.read_google_sheet(data_source["gsheet_url"], sheet_name="COD")
+                return DataSource._read_optional_sheet_without_dispatch_fallback(
+                    data_source["gsheet_url"], sheet_name="COD"
+                )
             except Exception as exc:
                 st.warning(f"Could not load COD penalty data: {exc}")
                 return None
@@ -468,11 +493,9 @@ class DataSource:
         data_source = config["data_source"]
         if data_source["type"] == "gsheet" and data_source["gsheet_url"]:
             try:
-                qr_df = DataSource.read_google_sheet(data_source["gsheet_url"], sheet_name="QR Order")
-                dispatch_df = DataSource.read_google_sheet(data_source["gsheet_url"], sheet_name="Dispatch")
-                if DataSource._is_fallback_dispatch_sheet(qr_df, dispatch_df):
-                    return pd.DataFrame()
-                return qr_df
+                return DataSource._read_optional_sheet_without_dispatch_fallback(
+                    data_source["gsheet_url"], sheet_name="QR Order"
+                )
             except Exception as exc:
                 st.warning(f"Could not load QR Order data: {exc}")
                 return None
@@ -484,11 +507,9 @@ class DataSource:
         data_source = config["data_source"]
         if data_source["type"] == "gsheet" and data_source["gsheet_url"]:
             try:
-                return_df = DataSource.read_google_sheet(data_source["gsheet_url"], sheet_name="Return")
-                dispatch_df = DataSource.read_google_sheet(data_source["gsheet_url"], sheet_name="Dispatch")
-                if DataSource._is_fallback_dispatch_sheet(return_df, dispatch_df):
-                    return pd.DataFrame()
-                return return_df
+                return DataSource._read_optional_sheet_without_dispatch_fallback(
+                    data_source["gsheet_url"], sheet_name="Return"
+                )
             except Exception as exc:
                 st.warning(f"Could not load Return data: {exc}")
                 return None
@@ -500,7 +521,9 @@ class DataSource:
         data_source = config["data_source"]
         if data_source["type"] == "gsheet" and data_source["gsheet_url"]:
             try:
-                return DataSource.read_google_sheet(data_source["gsheet_url"], sheet_name="Attendance")
+                return DataSource._read_optional_sheet_without_dispatch_fallback(
+                    data_source["gsheet_url"], sheet_name="Attendance"
+                )
             except Exception as exc:
                 st.warning(f"Could not load Attendance data: {exc}")
                 return None
@@ -2697,6 +2720,28 @@ def main():
     ldr_df = DataSource.load_ldr_penalty_data(config)
     fake_attempt_df = DataSource.load_fake_attempt_penalty_data(config)
     cod_df = DataSource.load_cod_penalty_data(config)
+
+    # Visibility: show which optional sheets are missing/empty and therefore treated as 0.
+    optional_sheets = {
+        "Pickup": pickup_df,
+        "DuitNow": duitnow_df,
+        "LDR": ldr_df,
+        "Fake Attempt": fake_attempt_df,
+        "COD": cod_df,
+        "QR Order": qr_order_df,
+        "Return": return_df,
+        "Attendance": attendance_df,
+    }
+    missing_or_empty_sheets = [
+        sheet_name for sheet_name, sheet_df in optional_sheets.items()
+        if sheet_df is None or sheet_df.empty
+    ]
+    if missing_or_empty_sheets:
+        sheet_list = ", ".join(missing_or_empty_sheets)
+        st.warning(
+            f"Missing or empty optional sheet(s): {sheet_list}. "
+            f"Related pickup/penalty calculations are treated as 0."
+        )
 
     # Calculate payout
     st.subheader(f"💰 Payout Calculation for {selected_dispatcher_name or selected_dispatcher_id}")
