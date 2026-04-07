@@ -84,7 +84,9 @@ class Config:
                 "qr_order": "QR Order",
                 "return": "Return",
                 "attendance": "Attendance",
-                "reward": "Reward"
+                "reward": "Reward",
+                "binding": "Binding",
+                "pending_parcel": "Pending Parcel"
             }
         },
         "database": {"table_name": "dispatch"},
@@ -99,7 +101,8 @@ class Config:
         "forecast_days": 30,
         "qr_order_payout_per_order": 1.80,
         "return_payout_per_parcel": 1.50,
-        "fake_attempt_penalty_per_parcel": 1.00
+        "fake_attempt_penalty_per_parcel": 1.00,
+        "pending_parcel_penalty_per_parcel": 2.00
     }
 
     _cache = None
@@ -125,6 +128,8 @@ class Config:
                         config["data_source"]["excel_sheets"] = Config.DEFAULT_CONFIG["data_source"]["excel_sheets"]
                     elif "reward" not in config["data_source"]["excel_sheets"]:
                         config["data_source"]["excel_sheets"]["reward"] = "Reward"
+                    if "binding" not in config["data_source"].get("excel_sheets", {}):
+                        config["data_source"].setdefault("excel_sheets", {})["binding"] = "Binding"
                     if "pickup_payout_per_parcel" not in config:
                         config["pickup_payout_per_parcel"] = 1.50
                     if "forecast_days" not in config:
@@ -135,6 +140,10 @@ class Config:
                         config["return_payout_per_parcel"] = 1.50
                     if "fake_attempt_penalty_per_parcel" not in config:
                         config["fake_attempt_penalty_per_parcel"] = 1.00
+                    if "pending_parcel_penalty_per_parcel" not in config:
+                        config["pending_parcel_penalty_per_parcel"] = 2.00
+                    if "pending_parcel" not in config.get("data_source", {}).get("excel_sheets", {}):
+                        config["data_source"].setdefault("excel_sheets", {})["pending_parcel"] = "Pending Parcel"
                     cls._cache = config
                     return cls._cache
             except Exception as e:
@@ -434,6 +443,10 @@ class DataSource:
                 column_mapping = {}  # No mapping needed, use original column names
             elif table_name == 'cod_penalty' or table_name.endswith('cod_penalty'):
                 column_mapping = {}  # No mapping needed, use original column names
+            elif table_name == 'binding_penalty' or table_name.endswith('binding_penalty'):
+                column_mapping = {}  # No mapping needed, use original column names
+            elif table_name == 'pending_parcel_penalty' or table_name.endswith('pending_parcel_penalty'):
+                column_mapping = {}  # No mapping needed, use original column names
             elif table_name == 'qr_order' or table_name.endswith('qr_order'):
                 column_mapping = {}  # No mapping needed, use original column names
             elif table_name == 'return' or table_name.endswith('return'):
@@ -636,7 +649,7 @@ class DataSource:
         """Load penalty data from all penalty tables.
 
         Returns:
-            Dictionary with keys: 'duitnow', 'ldr', 'fake_attempt', 'cod'
+            Dictionary with keys: 'duitnow', 'ldr', 'fake_attempt', 'cod', 'binding', 'pending_parcel'
         """
         data_source = config.get("data_source", {})
         source_type = data_source.get("type", "postgres")
@@ -648,6 +661,8 @@ class DataSource:
                 "ldr": DataSource._get_excel_sheet_name(config, "ldr", "LDR"),
                 "fake_attempt": DataSource._get_excel_sheet_name(config, "fake_attempt", "FakeAttempt"),
                 "cod": DataSource._get_excel_sheet_name(config, "cod", "COD"),
+                "binding": DataSource._get_excel_sheet_name(config, "binding", "Binding"),
+                "pending_parcel": DataSource._get_excel_sheet_name(config, "pending_parcel", "Pending Parcel"),
             }
 
             gsheet_url = data_source.get("gsheet_url")
@@ -701,6 +716,22 @@ class DataSource:
                 penalty_data['cod'] = cod_df
         except Exception as exc:
             st.warning(f"Could not load COD penalty data: {exc}")
+
+        # Load Binding penalty
+        try:
+            binding_df = DataSource.read_postgres_table(engine, 'binding_penalty')
+            if not binding_df.empty:
+                penalty_data['binding'] = binding_df
+        except Exception as exc:
+            st.warning(f"Could not load Binding penalty data: {exc}")
+
+        # Load Pending Parcel penalty
+        try:
+            pending_parcel_df = DataSource.read_postgres_table(engine, 'pending_parcel_penalty')
+            if not pending_parcel_df.empty:
+                penalty_data['pending_parcel'] = pending_parcel_df
+        except Exception as exc:
+            st.warning(f"Could not load Pending Parcel penalty data: {exc}")
 
         return penalty_data if penalty_data else None
 
@@ -983,6 +1014,22 @@ class PayoutCalculator:
         return sorted_tiers[0]['rate']
 
     @staticmethod
+    def _find_pending_parcel_awb_column(df: pd.DataFrame) -> Optional[str]:
+        """Resolve AWB / waybill column on Pending Parcel sheet (e.g. AWB No.)."""
+        for col in df.columns:
+            s = str(col).strip().lower().replace(" ", "")
+            if s in ("awbno", "awbno.") or s == "awb_no":
+                return col
+        for col in df.columns:
+            s = str(col).strip().lower()
+            if "awb" in s and "no" in s:
+                return col
+        for col in df.columns:
+            if str(col).lower().strip() in ("waybill_number", "waybill"):
+                return col
+        return None
+
+    @staticmethod
     def _preprocess_penalty_data(penalty_data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
         """
         Pre-process penalty dataframes to cache column lookups and Decimal conversions.
@@ -1033,6 +1080,25 @@ class PayoutCalculator:
                 if dispatcher_id_col:
                     df_processed['_dispatcher_id_normalized'] = df_processed[dispatcher_id_col].apply(normalize_dispatcher_id)
 
+            # Pre-process Pending Parcel penalty (Dispatcher ID, AWB No. — per-parcel rate from config)
+            elif penalty_type == 'pending_parcel':
+                dispatcher_id_col = None
+                for col in df.columns:
+                    c = str(col).strip().lower().replace(" ", "_")
+                    if c in ("dispatcher_id", "dispatcherid"):
+                        dispatcher_id_col = col
+                        break
+                if dispatcher_id_col is None:
+                    for col in df.columns:
+                        cu = str(col).upper()
+                        if "DISPATCHER" in cu and "ID" in cu:
+                            dispatcher_id_col = col
+                            break
+                if dispatcher_id_col:
+                    df_processed['_dispatcher_id_normalized'] = df_processed[dispatcher_id_col].apply(
+                        normalize_dispatcher_id
+                    )
+
             # Pre-process COD penalty data
             elif penalty_type == 'cod':
                 dispatcher_id_col = next((col for col in df.columns if col.lower() == 'dispatcher_id'), None)
@@ -1048,6 +1114,34 @@ class PayoutCalculator:
                             lambda x: Decimal(str(x)) if pd.notna(x) else Decimal('0')
                         )
                     # Pre-filter positive penalties
+                    df_processed = df_processed[df_processed['penalty_numeric'] > 0].copy()
+
+            # Pre-process Binding penalty (Dispatcher ID, Penalty — same shape as COD)
+            elif penalty_type == 'binding':
+                dispatcher_id_col = None
+                for col in df.columns:
+                    c = str(col).strip().lower().replace(" ", "_")
+                    if c in ("dispatcher_id", "dispatcherid"):
+                        dispatcher_id_col = col
+                        break
+                if dispatcher_id_col is None:
+                    for col in df.columns:
+                        cu = str(col).upper()
+                        if "DISPATCHER" in cu and "ID" in cu:
+                            dispatcher_id_col = col
+                            break
+                penalty_col = next((col for col in df.columns if str(col).strip().lower() == 'penalty'), None)
+
+                if dispatcher_id_col:
+                    df_processed['_dispatcher_id_normalized'] = df_processed[dispatcher_id_col].apply(
+                        normalize_dispatcher_id
+                    )
+
+                if penalty_col:
+                    if 'penalty_numeric' not in df_processed.columns:
+                        df_processed['penalty_numeric'] = df_processed[penalty_col].apply(
+                            lambda x: Decimal(str(x)) if pd.notna(x) else Decimal('0')
+                        )
                     df_processed = df_processed[df_processed['penalty_numeric'] > 0].copy()
 
             processed[penalty_type] = df_processed
@@ -1203,6 +1297,77 @@ class PayoutCalculator:
                     total_penalty += float(cod_penalty_rounded)  # Convert to float only at the end
                     total_count += len(cod_records)
 
+        # 5. Binding Penalty: Dispatcher ID + Penalty column (sheet Binding)
+        if 'binding' in penalty_data:
+            binding_df = penalty_data['binding']
+            if not binding_df.empty:
+                if '_dispatcher_id_normalized' in binding_df.columns:
+                    binding_records = binding_df[binding_df['_dispatcher_id_normalized'] == dispatcher_id_clean]
+                else:
+                    dispatcher_id_col = None
+                    for col in binding_df.columns:
+                        c = str(col).strip().lower().replace(" ", "_")
+                        if c in ("dispatcher_id", "dispatcherid"):
+                            dispatcher_id_col = col
+                            break
+                    if dispatcher_id_col is None:
+                        for col in binding_df.columns:
+                            cu = str(col).upper()
+                            if "DISPATCHER" in cu and "ID" in cu:
+                                dispatcher_id_col = col
+                                break
+                    if dispatcher_id_col:
+                        dispatcher_series = binding_df[dispatcher_id_col].apply(normalize_dispatcher_id)
+                        binding_records = binding_df[dispatcher_series == dispatcher_id_clean]
+                    else:
+                        binding_records = pd.DataFrame()
+
+                if not binding_records.empty and 'penalty_numeric' in binding_records.columns:
+                    rounded_penalties = [
+                        penalty.quantize(Decimal('0.01'), rounding='ROUND_HALF_UP')
+                        for penalty in binding_records['penalty_numeric'].tolist()
+                    ]
+                    binding_penalty_rounded = sum(rounded_penalties)
+                    total_penalty += float(binding_penalty_rounded)
+                    total_count += len(binding_records)
+
+        # 6. Pending Parcel penalty: unique AWB No. × rate from config
+        if 'pending_parcel' in penalty_data:
+            pp_df = penalty_data['pending_parcel']
+            if not pp_df.empty:
+                if '_dispatcher_id_normalized' in pp_df.columns:
+                    pp_records = pp_df[pp_df['_dispatcher_id_normalized'] == dispatcher_id_clean]
+                else:
+                    dispatcher_id_col = None
+                    for col in pp_df.columns:
+                        c = str(col).strip().lower().replace(" ", "_")
+                        if c in ("dispatcher_id", "dispatcherid"):
+                            dispatcher_id_col = col
+                            break
+                    if dispatcher_id_col is None:
+                        for col in pp_df.columns:
+                            cu = str(col).upper()
+                            if "DISPATCHER" in cu and "ID" in cu:
+                                dispatcher_id_col = col
+                                break
+                    if dispatcher_id_col:
+                        dispatcher_series = pp_df[dispatcher_id_col].apply(normalize_dispatcher_id)
+                        pp_records = pp_df[dispatcher_series == dispatcher_id_clean]
+                    else:
+                        pp_records = pd.DataFrame()
+
+                if not pp_records.empty:
+                    awb_col = PayoutCalculator._find_pending_parcel_awb_column(pp_df)
+                    if awb_col:
+                        waybill_count = pp_records[awb_col].nunique()
+                        waybill_list = pp_records[awb_col].dropna().astype(str).unique().tolist()
+                        waybill_numbers.extend([wb for wb in waybill_list if wb and wb.lower() != 'nan'])
+                    else:
+                        waybill_count = len(pp_records)
+                    pp_rate = Config.load().get("pending_parcel_penalty_per_parcel", 2.00)
+                    total_penalty += waybill_count * float(pp_rate)
+                    total_count += waybill_count
+
         attendance_penalty = float(attendance_penalty_amount)
         total_penalty += attendance_penalty
 
@@ -1219,13 +1384,15 @@ class PayoutCalculator:
             penalty_data: Dictionary containing penalty dataframes from all penalty tables
 
         Returns:
-            Dictionary with keys: 'duitnow', 'ldr', 'fake_attempt', 'cod', 'attendance' and their penalty amounts
+            Dictionary with keys: 'duitnow', 'ldr', 'fake_attempt', 'cod', 'binding', 'pending_parcel', 'attendance' and their penalty amounts
         """
         breakdown = {
             'duitnow': 0.0,
             'ldr': 0.0,
             'fake_attempt': 0.0,
             'cod': 0.0,
+            'binding': 0.0,
+            'pending_parcel': 0.0,
             'attendance': 0.0
         }
 
@@ -1348,6 +1515,71 @@ class PayoutCalculator:
                     ]
                     breakdown['cod'] = float(sum(rounded_penalties))
 
+        # 5. Binding Penalty
+        if 'binding' in penalty_data:
+            binding_df = penalty_data['binding']
+            if not binding_df.empty:
+                if '_dispatcher_id_normalized' in binding_df.columns:
+                    binding_records = binding_df[binding_df['_dispatcher_id_normalized'] == dispatcher_id_clean]
+                else:
+                    dispatcher_id_col = None
+                    for col in binding_df.columns:
+                        c = str(col).strip().lower().replace(" ", "_")
+                        if c in ("dispatcher_id", "dispatcherid"):
+                            dispatcher_id_col = col
+                            break
+                    if dispatcher_id_col is None:
+                        for col in binding_df.columns:
+                            cu = str(col).upper()
+                            if "DISPATCHER" in cu and "ID" in cu:
+                                dispatcher_id_col = col
+                                break
+                    if dispatcher_id_col:
+                        dispatcher_series = binding_df[dispatcher_id_col].apply(normalize_dispatcher_id)
+                        binding_records = binding_df[dispatcher_series == dispatcher_id_clean]
+                    else:
+                        binding_records = pd.DataFrame()
+
+                if not binding_records.empty and 'penalty_numeric' in binding_records.columns:
+                    rounded_penalties = [
+                        penalty.quantize(Decimal('0.01'), rounding='ROUND_HALF_UP')
+                        for penalty in binding_records['penalty_numeric'].tolist()
+                    ]
+                    breakdown['binding'] = float(sum(rounded_penalties))
+
+        if 'pending_parcel' in penalty_data:
+            pp_df = penalty_data['pending_parcel']
+            if not pp_df.empty:
+                if '_dispatcher_id_normalized' in pp_df.columns:
+                    pp_records = pp_df[pp_df['_dispatcher_id_normalized'] == dispatcher_id_clean]
+                else:
+                    dispatcher_id_col = None
+                    for col in pp_df.columns:
+                        c = str(col).strip().lower().replace(" ", "_")
+                        if c in ("dispatcher_id", "dispatcherid"):
+                            dispatcher_id_col = col
+                            break
+                    if dispatcher_id_col is None:
+                        for col in pp_df.columns:
+                            cu = str(col).upper()
+                            if "DISPATCHER" in cu and "ID" in cu:
+                                dispatcher_id_col = col
+                                break
+                    if dispatcher_id_col:
+                        dispatcher_series = pp_df[dispatcher_id_col].apply(normalize_dispatcher_id)
+                        pp_records = pp_df[dispatcher_series == dispatcher_id_clean]
+                    else:
+                        pp_records = pd.DataFrame()
+
+                if not pp_records.empty:
+                    awb_col = PayoutCalculator._find_pending_parcel_awb_column(pp_df)
+                    if awb_col:
+                        waybill_count = pp_records[awb_col].nunique()
+                    else:
+                        waybill_count = len(pp_records)
+                    pp_rate = Config.load().get("pending_parcel_penalty_per_parcel", 2.00)
+                    breakdown['pending_parcel'] = waybill_count * float(pp_rate)
+
         return breakdown
 
     @staticmethod
@@ -1359,13 +1591,15 @@ class PayoutCalculator:
             penalty_data: Dictionary containing penalty dataframes from all penalty tables
 
         Returns:
-            Dictionary with keys: 'duitnow', 'ldr', 'fake_attempt', 'cod', 'attendance' and their total amounts
+            Dictionary with keys: 'duitnow', 'ldr', 'fake_attempt', 'cod', 'binding', 'pending_parcel', 'attendance' and their total amounts
         """
         penalty_totals = {
             'duitnow': 0.0,
             'ldr': 0.0,
             'fake_attempt': 0.0,
             'cod': 0.0,
+            'binding': 0.0,
+            'pending_parcel': 0.0,
             'attendance': 0.0
         }
 
@@ -1503,6 +1737,49 @@ class PayoutCalculator:
                 else:
                     st.error(f"❌ 'penalty' column not found in COD data. Available columns: {list(cod_df.columns)}")
                     penalty_totals['cod'] = 0.0
+
+        # 5. Binding Penalty: sum all penalty amounts (only positive amounts)
+        if 'binding' in penalty_data:
+            binding_df = penalty_data['binding']
+
+            if binding_df is None or binding_df.empty:
+                penalty_totals['binding'] = 0.0
+            else:
+                penalty_col = None
+                for col in binding_df.columns:
+                    if str(col).strip().lower() == 'penalty':
+                        penalty_col = col
+                        break
+
+                if penalty_col:
+                    binding_df = binding_df.copy()
+                    binding_df['penalty_numeric'] = binding_df[penalty_col].apply(
+                        lambda x: Decimal(str(x)) if pd.notna(x) else Decimal('0')
+                    )
+                    binding_filtered = binding_df[binding_df['penalty_numeric'] > 0]
+
+                    if len(binding_filtered) > 0:
+                        rounded_penalties = [
+                            penalty.quantize(Decimal('0.01'), rounding='ROUND_HALF_UP')
+                            for penalty in binding_filtered['penalty_numeric'].tolist()
+                        ]
+                        penalty_totals['binding'] = float(sum(rounded_penalties))
+                    else:
+                        penalty_totals['binding'] = 0.0
+                else:
+                    st.error(f"❌ 'penalty' column not found in Binding data. Available columns: {list(binding_df.columns)}")
+                    penalty_totals['binding'] = 0.0
+
+        if 'pending_parcel' in penalty_data:
+            pp_df = penalty_data['pending_parcel']
+            if pp_df is not None and not pp_df.empty:
+                awb_col = PayoutCalculator._find_pending_parcel_awb_column(pp_df)
+                if awb_col:
+                    waybill_count = pp_df[awb_col].nunique()
+                else:
+                    waybill_count = len(pp_df)
+                pp_rate = Config.load().get("pending_parcel_penalty_per_parcel", 2.00)
+                penalty_totals['pending_parcel'] = waybill_count * float(pp_rate)
 
         return penalty_totals
 
@@ -1994,6 +2271,8 @@ class PayoutCalculator:
         grouped['ldr_penalty'] = 0.0
         grouped['fake_attempt_penalty'] = 0.0
         grouped['cod_penalty'] = 0.0
+        grouped['binding_penalty'] = 0.0
+        grouped['pending_parcel_penalty'] = 0.0
         grouped['attendance_penalty'] = 0.0
 
         # Pre-process penalty dataframes once for better performance
@@ -2019,13 +2298,15 @@ class PayoutCalculator:
                 'ldr_penalty': penalty_breakdown['ldr'],
                 'fake_attempt_penalty': penalty_breakdown['fake_attempt'],
                 'cod_penalty': penalty_breakdown['cod'],
+                'binding_penalty': penalty_breakdown['binding'],
+                'pending_parcel_penalty': penalty_breakdown['pending_parcel'],
                 'attendance_penalty': attendance_penalty
             })
 
         penalty_results = grouped.apply(calculate_penalties, axis=1)
         grouped[['penalty_amount', 'penalty_count', 'penalty_waybills',
                  'duitnow_penalty', 'ldr_penalty', 'fake_attempt_penalty', 'cod_penalty',
-                 'attendance_penalty']] = penalty_results
+                 'binding_penalty', 'pending_parcel_penalty', 'attendance_penalty']] = penalty_results
 
         grouped['reward'] = grouped['dispatcher_id'].apply(
             lambda x: float(reward_map.get(normalize_dispatcher_id(str(x)), 0.0))
@@ -2084,6 +2365,8 @@ class PayoutCalculator:
             "ldr_penalty": "LDR Penalty",
             "fake_attempt_penalty": "Fake Attempt Penalty",
             "cod_penalty": "COD Penalty",
+            "binding_penalty": "Binding Penalty",
+            "pending_parcel_penalty": "Pending Parcel Penalty",
             "attendance_penalty": "Attendance Penalty",
             "pickup_parcels": "Pickup Parcels",
             "pickup_payout": "Pickup Parcels Payout",
@@ -2114,6 +2397,12 @@ class PayoutCalculator:
             display_df["Fake Attempt Penalty"] = display_df["Fake Attempt Penalty"].apply(lambda x: f"-{currency_symbol}{x:,.2f}" if x > 0 else f"{currency_symbol}0.00")
         if "COD Penalty" in display_df.columns:
             display_df["COD Penalty"] = display_df["COD Penalty"].apply(lambda x: f"-{currency_symbol}{x:,.2f}" if x > 0 else f"{currency_symbol}0.00")
+        if "Binding Penalty" in display_df.columns:
+            display_df["Binding Penalty"] = display_df["Binding Penalty"].apply(lambda x: f"-{currency_symbol}{x:,.2f}" if x > 0 else f"{currency_symbol}0.00")
+        if "Pending Parcel Penalty" in display_df.columns:
+            display_df["Pending Parcel Penalty"] = display_df["Pending Parcel Penalty"].apply(
+                lambda x: f"-{currency_symbol}{x:,.2f}" if x > 0 else f"{currency_symbol}0.00"
+            )
         if "Attendance Penalty" in display_df.columns:
             display_df["Attendance Penalty"] = display_df["Attendance Penalty"].apply(lambda x: f"-{currency_symbol}{x:,.2f}" if x > 0 else f"{currency_symbol}0.00")
         display_df["Pickup Parcels Payout"] = display_df["Pickup Parcels Payout"].apply(lambda x: f"{currency_symbol}{x:,.2f}")
@@ -2498,6 +2787,7 @@ class InvoiceGenerator:
                 'ldr': numeric_df["LDR Penalty"].sum() if "LDR Penalty" in numeric_df.columns else 0.0,
                 'fake_attempt': numeric_df["Fake Attempt Penalty"].sum() if "Fake Attempt Penalty" in numeric_df.columns else 0.0,
                 'cod': numeric_df["COD Penalty"].sum() if "COD Penalty" in numeric_df.columns else 0.0,
+                'binding': numeric_df["Binding Penalty"].sum() if "Binding Penalty" in numeric_df.columns else 0.0,
                 'attendance': numeric_df["Attendance Penalty"].sum() if "Attendance Penalty" in numeric_df.columns else 0.0
             }
             # Keep summary math consistent with line items shown in invoice.
@@ -2668,6 +2958,7 @@ class InvoiceGenerator:
                                     LDR: -{currency_symbol} {penalty_by_type['ldr']:,.2f} ·
                                     Fake: -{currency_symbol} {penalty_by_type['fake_attempt']:,.2f}<br>
                                     COD: -{currency_symbol} {penalty_by_type['cod']:,.2f} ·
+                                    Binding: -{currency_symbol} {penalty_by_type['binding']:,.2f}<br>
                                     Attendance: -{currency_symbol} {penalty_by_type['attendance']:,.2f}
                                 </div>
                             </div>
@@ -2886,6 +3177,19 @@ def main():
         config["fake_attempt_penalty_per_parcel"] = fake_attempt_penalty_per_parcel
         Config.save(config)
 
+    pending_parcel_penalty_per_parcel = st.sidebar.number_input(
+        "Pending Parcel Penalty per Parcel",
+        min_value=0.0,
+        max_value=100.0,
+        value=config.get("pending_parcel_penalty_per_parcel", 2.00),
+        step=0.10,
+        help="Penalty per unique AWB on the Pending Parcel sheet",
+    )
+
+    if pending_parcel_penalty_per_parcel != config.get("pending_parcel_penalty_per_parcel", 2.00):
+        config["pending_parcel_penalty_per_parcel"] = pending_parcel_penalty_per_parcel
+        Config.save(config)
+
     # Add configuration for forecast days
     forecast_days = st.sidebar.number_input(
         "Forecast Period (days)",
@@ -2919,6 +3223,9 @@ def main():
 
     **🚫 Fake Attempt Penalty:**
     - RM{fake_attempt_penalty_per_parcel:.2f} per parcel
+
+    **📦 Pending Parcel Penalty:**
+    - RM{pending_parcel_penalty_per_parcel:.2f} per parcel
 
     **📈 Forecast Period:**
     - {forecast_days} days
@@ -3202,6 +3509,60 @@ def main():
                     else:
                         st.warning("⚠️ COD penalty table has no 'created_at' column; penalties are not filtered by date range.")
 
+                # Filter Binding penalty (optional created_at, same as COD)
+                if 'binding' in penalty_data and penalty_data['binding'] is not None and not penalty_data['binding'].empty:
+                    binding_df = penalty_data['binding']
+                    binding_date_col = None
+                    if 'created_at' in binding_df.columns:
+                        binding_date_col = 'created_at'
+                    else:
+                        for col in binding_df.columns:
+                            if str(col).lower() == 'created_at':
+                                binding_date_col = col
+                                break
+
+                    if binding_date_col is not None:
+                        binding_df[binding_date_col] = pd.to_datetime(binding_df[binding_date_col], errors="coerce")
+                        initial_binding_count = len(binding_df)
+                        binding_df = binding_df[
+                            (normalize_series_for_date_compare(binding_df[binding_date_col]) >= start_ts) &
+                            (normalize_series_for_date_compare(binding_df[binding_date_col]) <= end_ts)
+                        ]
+                        filtered_binding_count = len(binding_df)
+                        penalty_data['binding'] = binding_df
+                        if initial_binding_count != filtered_binding_count:
+                            st.info(f"⚠️ Filtered Binding penalty: {initial_binding_count:,} → {filtered_binding_count:,} records")
+                    else:
+                        st.warning("⚠️ Binding penalty data has no 'created_at' column; penalties are not filtered by date range.")
+
+                # Filter Pending Parcel penalty (optional date / created_at)
+                if 'pending_parcel' in penalty_data and penalty_data['pending_parcel'] is not None and not penalty_data['pending_parcel'].empty:
+                    pp_df = penalty_data['pending_parcel']
+                    pp_date_col = None
+                    if 'date' in pp_df.columns:
+                        pp_date_col = 'date'
+                    elif 'created_at' in pp_df.columns:
+                        pp_date_col = 'created_at'
+                    else:
+                        for col in pp_df.columns:
+                            if str(col).lower() in ("date", "created_at"):
+                                pp_date_col = col
+                                break
+
+                    if pp_date_col is not None:
+                        pp_df[pp_date_col] = pd.to_datetime(pp_df[pp_date_col], errors="coerce")
+                        initial_pp_count = len(pp_df)
+                        pp_df = pp_df[
+                            (normalize_series_for_date_compare(pp_df[pp_date_col]) >= start_ts) &
+                            (normalize_series_for_date_compare(pp_df[pp_date_col]) <= end_ts)
+                        ]
+                        filtered_pp_count = len(pp_df)
+                        penalty_data['pending_parcel'] = pp_df
+                        if initial_pp_count != filtered_pp_count:
+                            st.info(f"⚠️ Filtered Pending Parcel penalty: {initial_pp_count:,} → {filtered_pp_count:,} records")
+                    else:
+                        st.warning("⚠️ Pending Parcel penalty data has no 'date' or 'created_at' column; penalties are not filtered by date range.")
+
                 # Filter QR order data by selected date range
                 if qr_order_df is not None and not qr_order_df.empty:
                     qr_order_date_col = None
@@ -3417,6 +3778,7 @@ def main():
             'ldr': numeric_df["LDR Penalty"].sum() if "LDR Penalty" in numeric_df.columns else 0.0,
             'fake_attempt': numeric_df["Fake Attempt Penalty"].sum() if "Fake Attempt Penalty" in numeric_df.columns else 0.0,
             'cod': numeric_df["COD Penalty"].sum() if "COD Penalty" in numeric_df.columns else 0.0,
+            'binding': numeric_df["Binding Penalty"].sum() if "Binding Penalty" in numeric_df.columns else 0.0,
             'attendance': numeric_df["Attendance Penalty"].sum() if "Attendance Penalty" in numeric_df.columns else 0.0
         }
 
@@ -3456,7 +3818,7 @@ def main():
 
         # Penalty breakdown by type
         st.markdown("#### ⚠️ Penalty Breakdown by Type")
-        penalty_col1, penalty_col2, penalty_col3, penalty_col4, penalty_col5 = st.columns(5)
+        penalty_col1, penalty_col2, penalty_col3, penalty_col4, penalty_col5, penalty_col6 = st.columns(6)
         with penalty_col1:
             st.metric("DuitNow Penalty", f"-{currency} {penalty_by_type['duitnow']:,.2f}")
         with penalty_col2:
@@ -3466,6 +3828,8 @@ def main():
         with penalty_col4:
             st.metric("COD Penalty", f"-{currency} {penalty_by_type['cod']:,.2f}")
         with penalty_col5:
+            st.metric("Binding Penalty", f"-{currency} {penalty_by_type['binding']:,.2f}")
+        with penalty_col6:
             st.metric("Attendance Penalty", f"-{currency} {penalty_by_type['attendance']:,.2f}")
 
     # Charts
@@ -3530,6 +3894,8 @@ def main():
                     ldr_penalty = row.get('LDR Penalty', 0.0) if 'LDR Penalty' in row else 0.0
                     fake_attempt_penalty = row.get('Fake Attempt Penalty', 0.0) if 'Fake Attempt Penalty' in row else 0.0
                     cod_penalty = row.get('COD Penalty', 0.0) if 'COD Penalty' in row else 0.0
+                    binding_penalty = row.get('Binding Penalty', 0.0) if 'Binding Penalty' in row else 0.0
+                    pending_parcel_penalty = row.get('Pending Parcel Penalty', 0.0) if 'Pending Parcel Penalty' in row else 0.0
                     attendance_penalty = row.get('Attendance Penalty', 0.0) if 'Attendance Penalty' in row else 0.0
 
                     penalty_breakdown = []
@@ -3541,6 +3907,10 @@ def main():
                         penalty_breakdown.append(f"Fake: {currency}{fake_attempt_penalty:,.2f}")
                     if cod_penalty > 0:
                         penalty_breakdown.append(f"COD: {currency}{cod_penalty:,.2f}")
+                    if binding_penalty > 0:
+                        penalty_breakdown.append(f"Binding: {currency}{binding_penalty:,.2f}")
+                    if pending_parcel_penalty > 0:
+                        penalty_breakdown.append(f"Pending Parcel: {currency}{pending_parcel_penalty:,.2f}")
                     if attendance_penalty > 0:
                         penalty_breakdown.append(f"Attendance: {currency}{attendance_penalty:,.2f}")
 
@@ -3572,7 +3942,7 @@ def main():
                 "QR Orders", "QR Orders Payout",
                 "Return Parcels", "Return Parcels Payout",
                 "Reward", "Rental",
-                "Penalty", "DuitNow Penalty", "LDR Penalty", "Fake Attempt Penalty", "COD Penalty", "Attendance Penalty",
+                "Penalty", "DuitNow Penalty", "LDR Penalty", "Fake Attempt Penalty", "COD Penalty", "Binding Penalty", "Attendance Penalty",
                 "Total Payout", "Total Weight (kg)", "Avg Weight (kg)",
                 "Avg Rate per Parcel", "Parcels 0-5kg", "Parcels 5.01-10kg",
                 "Parcels 10.01-30kg", "Parcels 30+kg"
