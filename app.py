@@ -519,6 +519,23 @@ class DataSource:
         return None
 
     @staticmethod
+    def load_parcel_lost_penalty_data(config: dict) -> Optional[pd.DataFrame]:
+        """Load Parcel Lost penalty (waybill_number, Dispatcher ID, etc.) from config sheet name."""
+        data_source = config["data_source"]
+        if data_source["type"] == "gsheet" and data_source["gsheet_url"]:
+            try:
+                sheet = config.get("data_source", {}).get("excel_sheets", {}).get(
+                    "parcel_lost", "Parcel lost"
+                )
+                return DataSource._read_optional_sheet_without_dispatch_fallback(
+                    data_source["gsheet_url"], sheet_name=sheet
+                )
+            except Exception as exc:
+                st.warning(f"Could not load Parcel Lost penalty data: {exc}")
+                return None
+        return None
+
+    @staticmethod
     def load_qr_order_data(config: dict) -> Optional[pd.DataFrame]:
         """Load QR Order data from QR Order sheet."""
         data_source = config["data_source"]
@@ -664,6 +681,7 @@ class PayoutCalculator:
                          cod_df: Optional[pd.DataFrame] = None,
                          binding_df: Optional[pd.DataFrame] = None,
                          pending_parcel_df: Optional[pd.DataFrame] = None,
+                         parcel_lost_df: Optional[pd.DataFrame] = None,
                          attendance_df: Optional[pd.DataFrame] = None,
                          working_days: Optional[int] = None,
                          fake_attempt_penalty_per_parcel: float = 2.0,
@@ -690,6 +708,7 @@ class PayoutCalculator:
             'cod': {'amount': 0.0, 'count': 0},
             'binding': {'amount': 0.0, 'count': 0},
             'pending_parcel': {'amount': 0.0, 'count': 0, 'waybills': []},
+            'parcel_lost': {'amount': 0.0, 'count': 0, 'waybills': []},
             'attendance': {'amount': 0.0, 'count': 0},
             'total_amount': 0.0,
             'total_count': 0
@@ -1124,7 +1143,60 @@ class PayoutCalculator:
                     )
                     penalty_breakdown['pending_parcel']['count'] = int(parcel_count)
 
-        # 7. Process Attendance penalty (Attendance sheet) - direct penalty column sum by employee_id
+        # 7. Parcel Lost penalty: sum **COD** column per dispatcher (sheet Parcel lost)
+        if parcel_lost_df is not None and not parcel_lost_df.empty:
+            pl_disp_col = None
+            for col in parcel_lost_df.columns:
+                col_normalized = str(col).upper().strip().replace(" ", "")
+                if col_normalized == "DISPATCHERID" or ("DISPATCHER" in col_normalized and "ID" in col_normalized):
+                    pl_disp_col = col
+                    break
+            if pl_disp_col is None:
+                for col in parcel_lost_df.columns:
+                    col_upper = str(col).upper().strip()
+                    if "DISPATCHER" in col_upper and "ID" in col_upper:
+                        pl_disp_col = col
+                        break
+            cod_col = None
+            for col in parcel_lost_df.columns:
+                if str(col).strip().lower() == "cod":
+                    cod_col = col
+                    break
+            if pl_disp_col is not None and cod_col is not None:
+                pl_copy = parcel_lost_df.copy()
+                pl_copy[pl_disp_col] = pl_copy[pl_disp_col].astype(str).str.strip()
+                pl_rows = pl_copy[pl_copy[pl_disp_col] == dispatcher_id_normalized]
+                if not pl_rows.empty:
+                    cod_values = pl_rows[cod_col].apply(lambda x: PayoutCalculator._convert_to_float(x))
+                    positive = cod_values > 0
+                    penalty_breakdown['parcel_lost']['amount'] = round(float(cod_values[positive].sum()), 2)
+                    penalty_breakdown['parcel_lost']['count'] = int(positive.sum())
+                    awb_col = None
+                    for col in parcel_lost_df.columns:
+                        s = str(col).strip().lower().replace(" ", "")
+                        if s in ("awbno", "awbno.") or s == "awb_no":
+                            awb_col = col
+                            break
+                    if awb_col is None:
+                        for col in parcel_lost_df.columns:
+                            sl = str(col).strip().lower()
+                            if "awb" in sl and "no" in sl:
+                                awb_col = col
+                                break
+                    if awb_col is None:
+                        for col in parcel_lost_df.columns:
+                            if str(col).lower().strip() in ("waybill_number", "waybill"):
+                                awb_col = col
+                                break
+                    if awb_col is not None:
+                        w_rows = pl_rows.loc[positive]
+                        if not w_rows.empty:
+                            waybills = w_rows[awb_col].dropna().astype(str).str.strip().tolist()
+                            penalty_breakdown['parcel_lost']['waybills'] = [
+                                wb for wb in waybills if wb and wb.lower() != 'nan'
+                            ]
+
+        # 8. Process Attendance penalty (Attendance sheet) - direct penalty column sum by employee_id
         if attendance_df is not None and not attendance_df.empty:
             emp_id_col = find_column(attendance_df, ["Employee ID", "employee_id", "EMPLOYEE ID", "EMPLOYEE_ID"])
             if emp_id_col:
@@ -1151,6 +1223,7 @@ class PayoutCalculator:
             penalty_breakdown['cod']['amount'] +
             penalty_breakdown['binding']['amount'] +
             penalty_breakdown['pending_parcel']['amount'] +
+            penalty_breakdown['parcel_lost']['amount'] +
             penalty_breakdown['attendance']['amount'],
             2
         )
@@ -1160,6 +1233,7 @@ class PayoutCalculator:
             penalty_breakdown['cod']['count'] +
             penalty_breakdown['binding']['count'] +
             penalty_breakdown['pending_parcel']['count'] +
+            penalty_breakdown['parcel_lost']['count'] +
             penalty_breakdown['attendance']['count']
         )
 
@@ -1552,6 +1626,7 @@ class PayoutCalculator:
                               cod_df: Optional[pd.DataFrame] = None,
                               binding_df: Optional[pd.DataFrame] = None,
                               pending_parcel_df: Optional[pd.DataFrame] = None,
+                              parcel_lost_df: Optional[pd.DataFrame] = None,
                               attendance_df: Optional[pd.DataFrame] = None,
                               fake_attempt_penalty_per_parcel: float = 2.0,
                               pending_parcel_penalty_per_parcel: float = 2.0,
@@ -1951,6 +2026,7 @@ class PayoutCalculator:
                            'cod': {'amount': 0.0, 'count': 0},
                            'binding': {'amount': 0.0, 'count': 0},
                            'pending_parcel': {'amount': 0.0, 'count': 0, 'waybills': []},
+                           'parcel_lost': {'amount': 0.0, 'count': 0, 'waybills': []},
                            'attendance': {'amount': 0.0, 'count': 0},
                            'total_amount': 0.0, 'total_count': 0}
 
@@ -1974,6 +2050,7 @@ class PayoutCalculator:
                 cod_df,
                 binding_df,
                 pending_parcel_df,
+                parcel_lost_df,
                 attendance_df,
                 working_days,
                 fake_attempt_penalty_per_parcel,
@@ -2446,6 +2523,23 @@ class InvoiceGenerator:
                         </div>
                         """
 
+                if penalty_breakdown['parcel_lost']['count'] > 0:
+                    waybills_pl = ", ".join(penalty_breakdown['parcel_lost']['waybills'][:3])
+                    if len(penalty_breakdown['parcel_lost']['waybills']) > 3:
+                        waybills_pl += f" (+{len(penalty_breakdown['parcel_lost']['waybills']) - 3} more)"
+                    html_content += f"""
+                        <div class="penalty-item">
+                            <span><strong>Parcel Lost:</strong> {penalty_breakdown['parcel_lost']['count']} parcel(s)</span>
+                            <span>- {currency_symbol} {penalty_breakdown['parcel_lost']['amount']:,.2f}</span>
+                        </div>
+                    """
+                    if penalty_breakdown['parcel_lost']['waybills']:
+                        html_content += f"""
+                        <div style="font-size: 11px; opacity: 0.8; padding: 4px 0;">
+                            Waybills: {waybills_pl}
+                        </div>
+                        """
+
                 # Attendance penalties
                 if penalty_breakdown['attendance']['amount'] > 0:
                     html_content += f"""
@@ -2574,6 +2668,21 @@ class InvoiceGenerator:
                     waybills_display = ", ".join(penalty_breakdown['pending_parcel']['waybills'][:5])
                     if len(penalty_breakdown['pending_parcel']['waybills']) > 5:
                         waybills_display += f" (+{len(penalty_breakdown['pending_parcel']['waybills']) - 5} more)"
+                    html_content += f"""
+                    <div class="payout-row penalty-detail-row" style="font-size: 12px; padding-left: 40px;">
+                        <span style="color: var(--text-secondary);">Waybills: {waybills_display}</span>
+                    </div>"""
+
+            if penalty_breakdown['parcel_lost']['count'] > 0:
+                html_content += f"""
+                <div class="payout-row penalty-detail-row">
+                    <span>↳ Parcel Lost ({penalty_breakdown['parcel_lost']['count']} parcel(s)):</span>
+                    <span>- {currency_symbol} {penalty_breakdown['parcel_lost']['amount']:,.2f}</span>
+                </div>"""
+                if penalty_breakdown['parcel_lost']['waybills']:
+                    waybills_display = ", ".join(penalty_breakdown['parcel_lost']['waybills'][:5])
+                    if len(penalty_breakdown['parcel_lost']['waybills']) > 5:
+                        waybills_display += f" (+{len(penalty_breakdown['parcel_lost']['waybills']) - 5} more)"
                     html_content += f"""
                     <div class="payout-row penalty-detail-row" style="font-size: 12px; padding-left: 40px;">
                         <span style="color: var(--text-secondary);">Waybills: {waybills_display}</span>
@@ -2925,6 +3034,7 @@ def main():
     cod_df = DataSource.load_cod_penalty_data(config)
     binding_df = DataSource.load_binding_penalty_data(config)
     pending_parcel_df = DataSource.load_pending_parcel_penalty_data(config)
+    parcel_lost_df = DataSource.load_parcel_lost_penalty_data(config)
 
     # Visibility: show which optional sheets are missing/empty and therefore treated as 0.
     optional_sheets = {
@@ -2935,6 +3045,7 @@ def main():
         "COD": cod_df,
         "Binding": binding_df,
         "Pending Parcel": pending_parcel_df,
+        "Parcel lost": parcel_lost_df,
         "QR Order": qr_order_df,
         "Return": return_df,
         "Attendance": attendance_df,
@@ -2983,6 +3094,7 @@ def main():
                         'cod': {'amount': 0.0, 'count': 0},
                         'binding': {'amount': 0.0, 'count': 0},
                         'pending_parcel': {'amount': 0.0, 'count': 0, 'waybills': []},
+                        'parcel_lost': {'amount': 0.0, 'count': 0, 'waybills': []},
                         'attendance': {'amount': 0.0, 'count': 0},
                         'total_amount': 0.0, 'total_count': 0}
     per_day_df = pd.DataFrame()
@@ -3011,6 +3123,7 @@ def main():
                 cod_df,
                 binding_df,
                 pending_parcel_df,
+                parcel_lost_df,
                 attendance_df,
                 config.get("fake_attempt_penalty_per_parcel", 2.0),
                 config.get("pending_parcel_penalty_per_parcel", 2.0),
@@ -3438,6 +3551,10 @@ def main():
                             st.error(f"**Pending Parcel:** {penalty_breakdown['pending_parcel']['count']} parcel(s) - {config['currency_symbol']}{penalty_breakdown['pending_parcel']['amount']:,.2f}")
                             if penalty_breakdown['pending_parcel']['waybills']:
                                 st.caption(f"Waybills: {', '.join(penalty_breakdown['pending_parcel']['waybills'][:5])}")
+                        if penalty_breakdown['parcel_lost']['count'] > 0:
+                            st.error(f"**Parcel Lost:** {penalty_breakdown['parcel_lost']['count']} parcel(s) - {config['currency_symbol']}{penalty_breakdown['parcel_lost']['amount']:,.2f}")
+                            if penalty_breakdown['parcel_lost']['waybills']:
+                                st.caption(f"Waybills: {', '.join(penalty_breakdown['parcel_lost']['waybills'][:5])}")
 
                     with penalty_col7:
                         if penalty_breakdown['attendance']['amount'] > 0:
