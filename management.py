@@ -103,7 +103,8 @@ class Config:
         "qr_order_payout_per_order": 1.80,
         "return_payout_per_parcel": 1.50,
         "fake_attempt_penalty_per_parcel": 1.00,
-        "pending_parcel_penalty_per_parcel": 2.00
+        "pending_parcel_penalty_per_parcel": 2.00,
+        "route_penalty_amount": 1000.0
     }
 
     _cache = None
@@ -147,6 +148,8 @@ class Config:
                         config["data_source"].setdefault("excel_sheets", {})["pending_parcel"] = "Pending Parcel"
                     if "parcel_lost" not in config.get("data_source", {}).get("excel_sheets", {}):
                         config["data_source"].setdefault("excel_sheets", {})["parcel_lost"] = "Parcel lost"
+                    if "route_penalty_amount" not in config:
+                        config["route_penalty_amount"] = cls.DEFAULT_CONFIG["route_penalty_amount"]
                     cls._cache = config
                     return cls._cache
             except Exception as e:
@@ -200,6 +203,22 @@ def normalize_dispatcher_id(value) -> str:
     if text.isdigit():
         text = text.lstrip("0") or "0"
     return text
+
+
+def split_route_penalty_pool(pool_total: float, dispatcher_ids) -> dict:
+    """Per-dispatcher shares (2 dp) summing exactly to *pool_total*; remainder cents in sorted-ID order."""
+    ids = sorted(
+        {str(x).strip() for x in dispatcher_ids if pd.notna(x) and str(x).strip() and str(x).strip().lower() != "nan"}
+    )
+    n = len(ids)
+    if n == 0 or pool_total <= 0:
+        return {}
+    pool_cents = int(round(float(pool_total) * 100))
+    if pool_cents <= 0:
+        return {i: 0.0 for i in ids}
+    base = pool_cents // n
+    rem = pool_cents % n
+    return {did: (base + (1 if j < rem else 0)) / 100.0 for j, did in enumerate(ids)}
 
 
 def clean_dispatcher_name(name: str) -> str:
@@ -1198,7 +1217,8 @@ class PayoutCalculator:
 
     @staticmethod
     def calculate_penalty(dispatcher_id: str, penalty_data: Optional[Dict[str, pd.DataFrame]],
-                          attendance_penalty_amount: float = 0.0) -> Tuple[float, int, List[str], float]:
+                          attendance_penalty_amount: float = 0.0,
+                          route_penalty_per_dispatcher: float = 0.0) -> Tuple[float, int, List[str], float]:
         """
         Calculate total penalty for a dispatcher from all penalty types.
 
@@ -1206,13 +1226,19 @@ class PayoutCalculator:
             dispatcher_id: Dispatcher ID to calculate penalty for
             penalty_data: Dictionary containing penalty dataframes from all penalty tables
             attendance_penalty_amount: Attendance penalty amount for dispatcher
+            route_penalty_per_dispatcher: Fixed route pool from config divided by dispatcher count in batch
 
         Returns:
             (total_penalty_amount, total_penalty_count, waybill_numbers, attendance_penalty)
         """
         if penalty_data is None or not penalty_data:
             attendance_penalty = float(attendance_penalty_amount)
-            return attendance_penalty, 0, [], attendance_penalty
+            route_amt = float(
+                Decimal(str(route_penalty_per_dispatcher or 0)).quantize(Decimal('0.01'), rounding='ROUND_HALF_UP')
+            )
+            total = attendance_penalty + route_amt
+            route_count = 1 if route_amt > 0 else 0
+            return total, route_count, [], attendance_penalty
 
         total_penalty = 0.0
         total_count = 0
@@ -1454,6 +1480,14 @@ class PayoutCalculator:
                     total_penalty += float(pl_rounded)
                     total_count += len(pl_records)
 
+        # Route penalty: config pool split equally across dispatchers in this payout batch
+        if route_penalty_per_dispatcher and float(route_penalty_per_dispatcher) > 0:
+            route_amt = float(
+                Decimal(str(route_penalty_per_dispatcher)).quantize(Decimal('0.01'), rounding='ROUND_HALF_UP')
+            )
+            total_penalty += route_amt
+            total_count += 1
+
         attendance_penalty = float(attendance_penalty_amount)
         total_penalty += attendance_penalty
 
@@ -1461,7 +1495,8 @@ class PayoutCalculator:
 
     @staticmethod
     def calculate_penalty_breakdown(dispatcher_id: str, penalty_data: Optional[Dict[str, pd.DataFrame]],
-                                    attendance_penalty_amount: float = 0.0) -> Dict[str, float]:
+                                    attendance_penalty_amount: float = 0.0,
+                                    route_penalty_per_dispatcher: float = 0.0) -> Dict[str, float]:
         """
         Calculate penalty breakdown by type for a dispatcher.
 
@@ -1470,7 +1505,8 @@ class PayoutCalculator:
             penalty_data: Dictionary containing penalty dataframes from all penalty tables
 
         Returns:
-            Dictionary with keys: 'duitnow', 'ldr', 'fake_attempt', 'cod', 'binding', 'pending_parcel', 'parcel_lost', 'attendance' and their penalty amounts
+            Dictionary with keys: 'duitnow', 'ldr', 'fake_attempt', 'cod', 'binding', 'pending_parcel',
+            'parcel_lost', 'route', 'attendance' and their penalty amounts
         """
         breakdown = {
             'duitnow': 0.0,
@@ -1480,10 +1516,15 @@ class PayoutCalculator:
             'binding': 0.0,
             'pending_parcel': 0.0,
             'parcel_lost': 0.0,
+            'route': 0.0,
             'attendance': 0.0
         }
 
         breakdown['attendance'] = float(attendance_penalty_amount)
+        if route_penalty_per_dispatcher and float(route_penalty_per_dispatcher) > 0:
+            breakdown['route'] = float(
+                Decimal(str(route_penalty_per_dispatcher)).quantize(Decimal('0.01'), rounding='ROUND_HALF_UP')
+            )
 
         if penalty_data is None or not penalty_data:
             return breakdown
@@ -1711,7 +1752,8 @@ class PayoutCalculator:
             penalty_data: Dictionary containing penalty dataframes from all penalty tables
 
         Returns:
-            Dictionary with keys: 'duitnow', 'ldr', 'fake_attempt', 'cod', 'binding', 'pending_parcel', 'parcel_lost', 'attendance' and their total amounts
+            Dictionary with keys: 'duitnow', 'ldr', 'fake_attempt', 'cod', 'binding', 'pending_parcel',
+            'parcel_lost', 'route', 'attendance' and their total amounts
         """
         penalty_totals = {
             'duitnow': 0.0,
@@ -1721,6 +1763,7 @@ class PayoutCalculator:
             'binding': 0.0,
             'pending_parcel': 0.0,
             'parcel_lost': 0.0,
+            'route': 0.0,
             'attendance': 0.0
         }
 
@@ -2420,22 +2463,31 @@ class PayoutCalculator:
         grouped['binding_penalty'] = 0.0
         grouped['pending_parcel_penalty'] = 0.0
         grouped['parcel_lost_penalty'] = 0.0
+        grouped['route_penalty'] = 0.0
         grouped['attendance_penalty'] = 0.0
 
         # Pre-process penalty dataframes once for better performance
         penalty_data_processed = PayoutCalculator._preprocess_penalty_data(penalty_data) if penalty_data else None
+
+        _payout_cfg = Config.load()
+        _route_pool = float(_payout_cfg.get("route_penalty_amount", 0.0) or 0.0)
+        _route_split = {}
+        if grouped is not None and not grouped.empty and _route_pool > 0:
+            _route_ids = grouped["dispatcher_id"].astype(str).str.strip().unique().tolist()
+            _route_split = split_route_penalty_pool(_route_pool, _route_ids)
 
         # Use apply instead of iterrows for better performance
         def calculate_penalties(row):
             dispatcher_id = str(row['dispatcher_id'])
             dispatcher_key = normalize_dispatcher_id(dispatcher_id)
             attendance_penalty = float(attendance_penalty_map.get(dispatcher_key, 0.0))
+            route_share = float(_route_split.get(str(row["dispatcher_id"]).strip(), 0.0))
 
             penalty_amount, penalty_count, penalty_waybills, attendance_penalty = PayoutCalculator.calculate_penalty(
-                dispatcher_id, penalty_data_processed, attendance_penalty
+                dispatcher_id, penalty_data_processed, attendance_penalty, route_share
             )
             penalty_breakdown = PayoutCalculator.calculate_penalty_breakdown(
-                dispatcher_id, penalty_data_processed, attendance_penalty
+                dispatcher_id, penalty_data_processed, attendance_penalty, route_share
             )
             return pd.Series({
                 'penalty_amount': penalty_amount,
@@ -2448,13 +2500,15 @@ class PayoutCalculator:
                 'binding_penalty': penalty_breakdown['binding'],
                 'pending_parcel_penalty': penalty_breakdown['pending_parcel'],
                 'parcel_lost_penalty': penalty_breakdown['parcel_lost'],
+                'route_penalty': penalty_breakdown['route'],
                 'attendance_penalty': attendance_penalty
             })
 
         penalty_results = grouped.apply(calculate_penalties, axis=1)
         grouped[['penalty_amount', 'penalty_count', 'penalty_waybills',
                  'duitnow_penalty', 'ldr_penalty', 'fake_attempt_penalty', 'cod_penalty',
-                 'binding_penalty', 'pending_parcel_penalty', 'parcel_lost_penalty', 'attendance_penalty']] = penalty_results
+                 'binding_penalty', 'pending_parcel_penalty', 'parcel_lost_penalty', 'route_penalty',
+                 'attendance_penalty']] = penalty_results
 
         grouped['reward'] = grouped['dispatcher_id'].apply(
             lambda x: float(reward_map.get(normalize_dispatcher_id(str(x)), 0.0))
@@ -2516,6 +2570,7 @@ class PayoutCalculator:
             "binding_penalty": "Binding Penalty",
             "pending_parcel_penalty": "Pending Parcel Penalty",
             "parcel_lost_penalty": "Parcel Lost Penalty",
+            "route_penalty": "Route Penalty",
             "attendance_penalty": "Attendance Penalty",
             "pickup_parcels": "Pickup Parcels",
             "pickup_payout": "Pickup Parcels Payout",
@@ -2554,6 +2609,10 @@ class PayoutCalculator:
             )
         if "Parcel Lost Penalty" in display_df.columns:
             display_df["Parcel Lost Penalty"] = display_df["Parcel Lost Penalty"].apply(
+                lambda x: f"-{currency_symbol}{x:,.2f}" if x > 0 else f"{currency_symbol}0.00"
+            )
+        if "Route Penalty" in display_df.columns:
+            display_df["Route Penalty"] = display_df["Route Penalty"].apply(
                 lambda x: f"-{currency_symbol}{x:,.2f}" if x > 0 else f"{currency_symbol}0.00"
             )
         if "Attendance Penalty" in display_df.columns:
@@ -2943,6 +3002,7 @@ class InvoiceGenerator:
                 'binding': numeric_df["Binding Penalty"].sum() if "Binding Penalty" in numeric_df.columns else 0.0,
                 'pending_parcel': numeric_df["Pending Parcel Penalty"].sum() if "Pending Parcel Penalty" in numeric_df.columns else 0.0,
                 'parcel_lost': numeric_df["Parcel Lost Penalty"].sum() if "Parcel Lost Penalty" in numeric_df.columns else 0.0,
+                'route': numeric_df["Route Penalty"].sum() if "Route Penalty" in numeric_df.columns else 0.0,
                 'attendance': numeric_df["Attendance Penalty"].sum() if "Attendance Penalty" in numeric_df.columns else 0.0
             }
             # Keep summary math consistent with line items shown in invoice.
@@ -3115,7 +3175,8 @@ class InvoiceGenerator:
                                     COD: -{currency_symbol} {penalty_by_type['cod']:,.2f} ·
                                     Binding: -{currency_symbol} {penalty_by_type['binding']:,.2f} ·
                                     Pending Parcel: -{currency_symbol} {penalty_by_type['pending_parcel']:,.2f} ·
-                                    Parcel Lost: -{currency_symbol} {penalty_by_type['parcel_lost']:,.2f}<br>
+                                    Parcel Lost: -{currency_symbol} {penalty_by_type['parcel_lost']:,.2f} ·
+                                    Route: -{currency_symbol} {penalty_by_type['route']:,.2f}<br>
                                     Attendance: -{currency_symbol} {penalty_by_type['attendance']:,.2f}
                                 </div>
                             </div>
@@ -3347,6 +3408,18 @@ def main():
         config["pending_parcel_penalty_per_parcel"] = pending_parcel_penalty_per_parcel
         Config.save(config)
 
+    route_penalty_amount = st.sidebar.number_input(
+        "Route penalty (total pool)",
+        min_value=0.0,
+        max_value=1_000_000.0,
+        value=float(config.get("route_penalty_amount", 1000.0)),
+        step=50.0,
+        help="Total route penalty split equally across all dispatchers in the payout batch (same as app.py).",
+    )
+    if route_penalty_amount != float(config.get("route_penalty_amount", 1000.0)):
+        config["route_penalty_amount"] = float(route_penalty_amount)
+        Config.save(config)
+
     # Add configuration for forecast days
     forecast_days = st.sidebar.number_input(
         "Forecast Period (days)",
@@ -3386,6 +3459,9 @@ def main():
 
     **📦 Parcel Lost Penalty:**
     - Sum of **COD** column (Parcel lost sheet)
+
+    **🛣️ Route Penalty:**
+    - RM{route_penalty_amount:,.2f} total ÷ number of dispatchers in batch (each pays equal share)
 
     **📈 Forecast Period:**
     - {forecast_days} days
@@ -3969,6 +4045,7 @@ def main():
             'binding': numeric_df["Binding Penalty"].sum() if "Binding Penalty" in numeric_df.columns else 0.0,
             'pending_parcel': numeric_df["Pending Parcel Penalty"].sum() if "Pending Parcel Penalty" in numeric_df.columns else 0.0,
             'parcel_lost': numeric_df["Parcel Lost Penalty"].sum() if "Parcel Lost Penalty" in numeric_df.columns else 0.0,
+            'route': numeric_df["Route Penalty"].sum() if "Route Penalty" in numeric_df.columns else 0.0,
             'attendance': numeric_df["Attendance Penalty"].sum() if "Attendance Penalty" in numeric_df.columns else 0.0
         }
 
@@ -4025,6 +4102,10 @@ def main():
         with penalty_col7:
             st.metric("Parcel Lost Penalty", f"-{currency} {penalty_by_type['parcel_lost']:,.2f}")
         with penalty_col8:
+            st.metric("Route Penalty", f"-{currency} {penalty_by_type['route']:,.2f}")
+
+        penalty_row3 = st.columns(4)
+        with penalty_row3[0]:
             st.metric("Attendance Penalty", f"-{currency} {penalty_by_type['attendance']:,.2f}")
 
     # Charts
@@ -4092,6 +4173,7 @@ def main():
                     binding_penalty = row.get('Binding Penalty', 0.0) if 'Binding Penalty' in row else 0.0
                     pending_parcel_penalty = row.get('Pending Parcel Penalty', 0.0) if 'Pending Parcel Penalty' in row else 0.0
                     parcel_lost_penalty = row.get('Parcel Lost Penalty', 0.0) if 'Parcel Lost Penalty' in row else 0.0
+                    route_penalty = row.get('Route Penalty', 0.0) if 'Route Penalty' in row else 0.0
                     attendance_penalty = row.get('Attendance Penalty', 0.0) if 'Attendance Penalty' in row else 0.0
 
                     penalty_breakdown = []
@@ -4109,6 +4191,8 @@ def main():
                         penalty_breakdown.append(f"Pending Parcel: {currency}{pending_parcel_penalty:,.2f}")
                     if parcel_lost_penalty > 0:
                         penalty_breakdown.append(f"Parcel Lost: {currency}{parcel_lost_penalty:,.2f}")
+                    if route_penalty > 0:
+                        penalty_breakdown.append(f"Route: {currency}{route_penalty:,.2f}")
                     if attendance_penalty > 0:
                         penalty_breakdown.append(f"Attendance: {currency}{attendance_penalty:,.2f}")
 
@@ -4140,7 +4224,7 @@ def main():
                 "QR Orders", "QR Orders Payout",
                 "Return Parcels", "Return Parcels Payout",
                 "Reward", "Rental",
-                "Penalty", "DuitNow Penalty", "LDR Penalty", "Fake Attempt Penalty", "COD Penalty", "Binding Penalty", "Pending Parcel Penalty", "Parcel Lost Penalty", "Attendance Penalty",
+                "Penalty", "DuitNow Penalty", "LDR Penalty", "Fake Attempt Penalty", "COD Penalty", "Binding Penalty", "Pending Parcel Penalty", "Parcel Lost Penalty", "Route Penalty", "Attendance Penalty",
                 "Total Payout", "Total Weight (kg)", "Avg Weight (kg)",
                 "Avg Rate per Parcel", "Parcels 0-5kg", "Parcels 5.01-10kg",
                 "Parcels 10.01-30kg", "Parcels 30+kg"

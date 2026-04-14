@@ -6,7 +6,7 @@ warnings.filterwarnings('ignore', category=urllib3.exceptions.NotOpenSSLWarning)
 import io
 from typing import List, Optional, Tuple, Dict
 import re
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote
 import json
 import os
 from datetime import datetime
@@ -166,6 +166,27 @@ def find_column(df: pd.DataFrame, possible_names: List[str], case_sensitive: boo
 
     return None
 
+
+def split_route_penalty_pool(pool_total: float, dispatcher_ids) -> Dict[str, float]:
+    """Split a currency pool into per-dispatcher shares (2 dp) that sum exactly to *pool_total*.
+
+    Equal cents per person plus remainder assigned in sorted-ID order avoids
+    ``round(pool / n, 2) * n`` drift (e.g. RM1000 ÷ 19 → RM999.97 total).
+    """
+    ids = sorted(
+        {str(x).strip() for x in dispatcher_ids if pd.notna(x) and str(x).strip() and str(x).strip().lower() != "nan"}
+    )
+    n = len(ids)
+    if n == 0 or pool_total <= 0:
+        return {}
+    pool_cents = int(round(float(pool_total) * 100))
+    if pool_cents <= 0:
+        return {i: 0.0 for i in ids}
+    base = pool_cents // n
+    rem = pool_cents % n
+    return {did: (base + (1 if j < rem else 0)) / 100.0 for j, did in enumerate(ids)}
+
+
 # =============================================================================
 # DATA SOURCE MANAGEMENT
 # =============================================================================
@@ -205,8 +226,9 @@ class DataSource:
     def _build_gsheet_csv_url(spreadsheet_id: str, sheet_name: Optional[str], gid: Optional[str]) -> str:
         """Construct CSV export URL for Google Sheets."""
         base = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}"
-        if sheet_name:
-            return f"{base}/gviz/tq?tqx=out:csv&sheet={sheet_name}"
+        if sheet_name and str(sheet_name).strip():
+            encoded = quote(str(sheet_name).strip(), safe="")
+            return f"{base}/gviz/tq?tqx=out:csv&sheet={encoded}"
         if gid:
             return f"{base}/export?format=csv&gid={gid}"
         return f"{base}/export?format=csv"
@@ -263,9 +285,11 @@ class DataSource:
                 io.BytesIO(resp_content),
                 keep_default_na=False,  # Don't automatically convert strings to NaN
                 na_values=[],  # Don't treat any specific values as NaN
-                encoding='utf-8',  # Ensure proper encoding
+                encoding="utf-8-sig",  # utf-8-sig strips UTF-8 BOM (else first header can be "\ufeffemployee_id")
                 low_memory=False  # Read entire file to determine dtypes, eliminates DtypeWarning
             )
+            # Normalize headers: BOM remnants, leading/trailing spaces (Google Sheets / Excel CSV quirks)
+            df.columns = [str(c).replace("\ufeff", "").strip() for c in df.columns]
 
             # CRITICAL: Convert Waybill Number to string IMMEDIATELY after reading
             # This must happen before any other processing to preserve all waybill formats
@@ -565,12 +589,18 @@ class DataSource:
 
     @staticmethod
     def load_attendance_data(config: dict) -> Optional[pd.DataFrame]:
-        """Load Attendance data from Attendance sheet."""
+        """Load attendance penalty rows from the tab named in config (data_source.excel_sheets.attendance)."""
         data_source = config["data_source"]
         if data_source["type"] == "gsheet" and data_source["gsheet_url"]:
             try:
+                sheet = (
+                    config.get("data_source", {})
+                    .get("excel_sheets", {})
+                    .get("attendance", "Attendance")
+                )
+                sheet = str(sheet).strip() if sheet is not None else "Attendance"
                 return DataSource._read_optional_sheet_without_dispatch_fallback(
-                    data_source["gsheet_url"], sheet_name="Attendance"
+                    data_source["gsheet_url"], sheet_name=sheet
                 )
             except Exception as exc:
                 st.warning(f"Could not load Attendance data: {exc}")
@@ -681,11 +711,13 @@ class PayoutCalculator:
                          cod_df: Optional[pd.DataFrame] = None,
                          binding_df: Optional[pd.DataFrame] = None,
                          pending_parcel_df: Optional[pd.DataFrame] = None,
-                         parcel_lost_df: Optional[pd.DataFrame] = None,
                          attendance_df: Optional[pd.DataFrame] = None,
                          working_days: Optional[int] = None,
                          fake_attempt_penalty_per_parcel: float = 2.0,
-                         pending_parcel_penalty_per_parcel: float = 2.0) -> Dict:
+                         pending_parcel_penalty_per_parcel: float = 2.0,
+                         route_penalty_per_dispatcher: float = 0.0,
+                         route_penalty_dispatcher_count: int = 0,
+                         route_penalty_pool_total: float = 0.0) -> Dict:
         """Calculate total penalty for a dispatcher from penalty sheets.
 
         Args:
@@ -708,7 +740,7 @@ class PayoutCalculator:
             'cod': {'amount': 0.0, 'count': 0},
             'binding': {'amount': 0.0, 'count': 0},
             'pending_parcel': {'amount': 0.0, 'count': 0, 'waybills': []},
-            'parcel_lost': {'amount': 0.0, 'count': 0, 'waybills': []},
+            'route': {'amount': 0.0, 'count': 0, 'pool_total': 0.0},
             'attendance': {'amount': 0.0, 'count': 0},
             'total_amount': 0.0,
             'total_count': 0
@@ -1143,62 +1175,25 @@ class PayoutCalculator:
                     )
                     penalty_breakdown['pending_parcel']['count'] = int(parcel_count)
 
-        # 7. Parcel Lost penalty: sum **COD** column per dispatcher (sheet Parcel lost)
-        if parcel_lost_df is not None and not parcel_lost_df.empty:
-            pl_disp_col = None
-            for col in parcel_lost_df.columns:
-                col_normalized = str(col).upper().strip().replace(" ", "")
-                if col_normalized == "DISPATCHERID" or ("DISPATCHER" in col_normalized and "ID" in col_normalized):
-                    pl_disp_col = col
-                    break
-            if pl_disp_col is None:
-                for col in parcel_lost_df.columns:
-                    col_upper = str(col).upper().strip()
-                    if "DISPATCHER" in col_upper and "ID" in col_upper:
-                        pl_disp_col = col
-                        break
-            cod_col = None
-            for col in parcel_lost_df.columns:
-                if str(col).strip().lower() == "cod":
-                    cod_col = col
-                    break
-            if pl_disp_col is not None and cod_col is not None:
-                pl_copy = parcel_lost_df.copy()
-                pl_copy[pl_disp_col] = pl_copy[pl_disp_col].astype(str).str.strip()
-                pl_rows = pl_copy[pl_copy[pl_disp_col] == dispatcher_id_normalized]
-                if not pl_rows.empty:
-                    cod_values = pl_rows[cod_col].apply(lambda x: PayoutCalculator._convert_to_float(x))
-                    positive = cod_values > 0
-                    penalty_breakdown['parcel_lost']['amount'] = round(float(cod_values[positive].sum()), 2)
-                    penalty_breakdown['parcel_lost']['count'] = int(positive.sum())
-                    awb_col = None
-                    for col in parcel_lost_df.columns:
-                        s = str(col).strip().lower().replace(" ", "")
-                        if s in ("awbno", "awbno.") or s == "awb_no":
-                            awb_col = col
-                            break
-                    if awb_col is None:
-                        for col in parcel_lost_df.columns:
-                            sl = str(col).strip().lower()
-                            if "awb" in sl and "no" in sl:
-                                awb_col = col
-                                break
-                    if awb_col is None:
-                        for col in parcel_lost_df.columns:
-                            if str(col).lower().strip() in ("waybill_number", "waybill"):
-                                awb_col = col
-                                break
-                    if awb_col is not None:
-                        w_rows = pl_rows.loc[positive]
-                        if not w_rows.empty:
-                            waybills = w_rows[awb_col].dropna().astype(str).str.strip().tolist()
-                            penalty_breakdown['parcel_lost']['waybills'] = [
-                                wb for wb in waybills if wb and wb.lower() != 'nan'
-                            ]
+        # 7. Route penalty: total from config divided equally among dispatchers (see main / calculate_tiered_daily)
+        if route_penalty_per_dispatcher > 0:
+            penalty_breakdown['route']['amount'] = round(float(route_penalty_per_dispatcher), 2)
+            penalty_breakdown['route']['count'] = int(route_penalty_dispatcher_count) if route_penalty_dispatcher_count else 0
+            penalty_breakdown['route']['pool_total'] = round(float(route_penalty_pool_total), 2)
 
         # 8. Process Attendance penalty (Attendance sheet) - direct penalty column sum by employee_id
         if attendance_df is not None and not attendance_df.empty:
-            emp_id_col = find_column(attendance_df, ["Employee ID", "employee_id", "EMPLOYEE ID", "EMPLOYEE_ID"])
+            emp_id_col = find_column(
+                attendance_df,
+                [
+                    "Employee ID",
+                    "employee_id",
+                    "EMPLOYEE ID",
+                    "EMPLOYEE_ID",
+                    "Dispatcher ID",
+                    "dispatcher_id",
+                ],
+            )
             if emp_id_col:
                 attendance_df_copy = attendance_df.copy()
                 attendance_df_copy[emp_id_col] = attendance_df_copy[emp_id_col].astype(str).str.strip()
@@ -1223,7 +1218,7 @@ class PayoutCalculator:
             penalty_breakdown['cod']['amount'] +
             penalty_breakdown['binding']['amount'] +
             penalty_breakdown['pending_parcel']['amount'] +
-            penalty_breakdown['parcel_lost']['amount'] +
+            penalty_breakdown['route']['amount'] +
             penalty_breakdown['attendance']['amount'],
             2
         )
@@ -1233,8 +1228,8 @@ class PayoutCalculator:
             penalty_breakdown['cod']['count'] +
             penalty_breakdown['binding']['count'] +
             penalty_breakdown['pending_parcel']['count'] +
-            penalty_breakdown['parcel_lost']['count'] +
-            penalty_breakdown['attendance']['count']
+            penalty_breakdown['attendance']['count'] +
+            (1 if penalty_breakdown['route']['amount'] > 0 else 0)
         )
 
         return penalty_breakdown
@@ -1626,11 +1621,13 @@ class PayoutCalculator:
                               cod_df: Optional[pd.DataFrame] = None,
                               binding_df: Optional[pd.DataFrame] = None,
                               pending_parcel_df: Optional[pd.DataFrame] = None,
-                              parcel_lost_df: Optional[pd.DataFrame] = None,
                               attendance_df: Optional[pd.DataFrame] = None,
                               fake_attempt_penalty_per_parcel: float = 2.0,
                               pending_parcel_penalty_per_parcel: float = 2.0,
-                              return_df: Optional[pd.DataFrame] = None) -> Tuple:
+                              return_df: Optional[pd.DataFrame] = None,
+                              route_penalty_per_dispatcher: float = 0.0,
+                              route_penalty_dispatcher_count: int = 0,
+                              route_penalty_pool_total: float = 0.0) -> Tuple:
         """Calculate payout for tiered daily mode with KPI bonus, attendance bonus, and special rates.
         Any waybill that appears in the return sheet is excluded from dispatch so tier calculation
         uses delivery-only parcels (e.g. dispatch 2059 - return 45 = 2014 for tier).
@@ -2026,7 +2023,7 @@ class PayoutCalculator:
                            'cod': {'amount': 0.0, 'count': 0},
                            'binding': {'amount': 0.0, 'count': 0},
                            'pending_parcel': {'amount': 0.0, 'count': 0, 'waybills': []},
-                           'parcel_lost': {'amount': 0.0, 'count': 0, 'waybills': []},
+                           'route': {'amount': 0.0, 'count': 0, 'pool_total': 0.0},
                            'attendance': {'amount': 0.0, 'count': 0},
                            'total_amount': 0.0, 'total_count': 0}
 
@@ -2050,11 +2047,13 @@ class PayoutCalculator:
                 cod_df,
                 binding_df,
                 pending_parcel_df,
-                parcel_lost_df,
                 attendance_df,
                 working_days,
                 fake_attempt_penalty_per_parcel,
-                pending_parcel_penalty_per_parcel
+                pending_parcel_penalty_per_parcel,
+                route_penalty_per_dispatcher,
+                route_penalty_dispatcher_count,
+                route_penalty_pool_total,
             )
 
         # Calculate gross payout (base + bonuses - penalties) - round to 2 decimal places
@@ -2523,22 +2522,15 @@ class InvoiceGenerator:
                         </div>
                         """
 
-                if penalty_breakdown['parcel_lost']['count'] > 0:
-                    waybills_pl = ", ".join(penalty_breakdown['parcel_lost']['waybills'][:3])
-                    if len(penalty_breakdown['parcel_lost']['waybills']) > 3:
-                        waybills_pl += f" (+{len(penalty_breakdown['parcel_lost']['waybills']) - 3} more)"
+                if penalty_breakdown.get('route', {}).get('amount', 0) > 0:
+                    rc = penalty_breakdown['route'].get('count', 0) or 0
+                    pool = float(penalty_breakdown['route'].get('pool_total', 0) or 0)
                     html_content += f"""
                         <div class="penalty-item">
-                            <span><strong>Parcel Lost:</strong> {penalty_breakdown['parcel_lost']['count']} parcel(s)</span>
-                            <span>- {currency_symbol} {penalty_breakdown['parcel_lost']['amount']:,.2f}</span>
+                            <span><strong>Route:</strong> {currency_symbol}{pool:,.2f} ÷ {rc} dispatchers</span>
+                            <span>- {currency_symbol} {penalty_breakdown['route']['amount']:,.2f}</span>
                         </div>
                     """
-                    if penalty_breakdown['parcel_lost']['waybills']:
-                        html_content += f"""
-                        <div style="font-size: 11px; opacity: 0.8; padding: 4px 0;">
-                            Waybills: {waybills_pl}
-                        </div>
-                        """
 
                 # Attendance penalties
                 if penalty_breakdown['attendance']['amount'] > 0:
@@ -2673,20 +2665,14 @@ class InvoiceGenerator:
                         <span style="color: var(--text-secondary);">Waybills: {waybills_display}</span>
                     </div>"""
 
-            if penalty_breakdown['parcel_lost']['count'] > 0:
+            if penalty_breakdown.get('route', {}).get('amount', 0) > 0:
+                rc = penalty_breakdown['route'].get('count', 0) or 0
+                pool = float(penalty_breakdown['route'].get('pool_total', 0) or 0)
                 html_content += f"""
                 <div class="payout-row penalty-detail-row">
-                    <span>↳ Parcel Lost ({penalty_breakdown['parcel_lost']['count']} parcel(s)):</span>
-                    <span>- {currency_symbol} {penalty_breakdown['parcel_lost']['amount']:,.2f}</span>
+                    <span>↳ Route ({currency_symbol}{pool:,.2f} ÷ {rc} dispatchers):</span>
+                    <span>- {currency_symbol} {penalty_breakdown['route']['amount']:,.2f}</span>
                 </div>"""
-                if penalty_breakdown['parcel_lost']['waybills']:
-                    waybills_display = ", ".join(penalty_breakdown['parcel_lost']['waybills'][:5])
-                    if len(penalty_breakdown['parcel_lost']['waybills']) > 5:
-                        waybills_display += f" (+{len(penalty_breakdown['parcel_lost']['waybills']) - 5} more)"
-                    html_content += f"""
-                    <div class="payout-row penalty-detail-row" style="font-size: 12px; padding-left: 40px;">
-                        <span style="color: var(--text-secondary);">Waybills: {waybills_display}</span>
-                    </div>"""
 
             if penalty_breakdown['attendance']['amount'] > 0:
                 html_content += f"""
@@ -3034,7 +3020,14 @@ def main():
     cod_df = DataSource.load_cod_penalty_data(config)
     binding_df = DataSource.load_binding_penalty_data(config)
     pending_parcel_df = DataSource.load_pending_parcel_penalty_data(config)
-    parcel_lost_df = DataSource.load_parcel_lost_penalty_data(config)
+
+    route_penalty_total = float(config.get("route_penalty_amount", 1000.0))
+    route_id_list = df[dispatcher_id_col].dropna().astype(str).str.strip().unique().tolist()
+    route_penalty_dispatcher_count = len(route_id_list)
+    route_penalty_split = split_route_penalty_pool(route_penalty_total, route_id_list)
+    route_penalty_per_dispatcher = float(
+        route_penalty_split.get(str(selected_dispatcher_id).strip(), 0.0)
+    )
 
     # Visibility: show which optional sheets are missing/empty and therefore treated as 0.
     optional_sheets = {
@@ -3045,7 +3038,6 @@ def main():
         "COD": cod_df,
         "Binding": binding_df,
         "Pending Parcel": pending_parcel_df,
-        "Parcel lost": parcel_lost_df,
         "QR Order": qr_order_df,
         "Return": return_df,
         "Attendance": attendance_df,
@@ -3056,10 +3048,22 @@ def main():
     ]
     if missing_or_empty_sheets:
         sheet_list = ", ".join(missing_or_empty_sheets)
+        attendance_tab = (
+            config.get("data_source", {})
+            .get("excel_sheets", {})
+            .get("attendance", "Attendance")
+        )
         st.warning(
             f"Missing or empty optional sheet(s): {sheet_list}. "
             f"Related pickup/penalty calculations are treated as 0."
         )
+        if "Attendance" in missing_or_empty_sheets:
+            st.caption(
+                f"Attendance: the workbook tab name must match config "
+                f"data_source.excel_sheets.attendance (currently \"{attendance_tab}\"), "
+                f"the tab needs at least one data row (not only headers), and the CSV export must not be "
+                f"identical to Dispatch (a wrong tab name can make Google return Dispatch data, which this app ignores)."
+            )
 
     # Calculate payout
     st.subheader(f"💰 Payout Calculation for {selected_dispatcher_name or selected_dispatcher_id}")
@@ -3094,7 +3098,7 @@ def main():
                         'cod': {'amount': 0.0, 'count': 0},
                         'binding': {'amount': 0.0, 'count': 0},
                         'pending_parcel': {'amount': 0.0, 'count': 0, 'waybills': []},
-                        'parcel_lost': {'amount': 0.0, 'count': 0, 'waybills': []},
+                        'route': {'amount': 0.0, 'count': 0, 'pool_total': 0.0},
                         'attendance': {'amount': 0.0, 'count': 0},
                         'total_amount': 0.0, 'total_count': 0}
     per_day_df = pd.DataFrame()
@@ -3123,11 +3127,13 @@ def main():
                 cod_df,
                 binding_df,
                 pending_parcel_df,
-                parcel_lost_df,
                 attendance_df,
                 config.get("fake_attempt_penalty_per_parcel", 2.0),
                 config.get("pending_parcel_penalty_per_parcel", 2.0),
-                return_df=return_df
+                return_df=return_df,
+                route_penalty_per_dispatcher=route_penalty_per_dispatcher,
+                route_penalty_dispatcher_count=route_penalty_dispatcher_count,
+                route_penalty_pool_total=route_penalty_total,
             )
 
             # Calculate pickup payout (assuming RM1.00 per pickup parcel)
@@ -3520,7 +3526,7 @@ def main():
             # Display penalty details if any
             if penalty_breakdown['total_amount'] > 0:
                 with st.expander("⚠️ Penalty Details"):
-                    penalty_col1, penalty_col2, penalty_col3, penalty_col4, penalty_col5, penalty_col6, penalty_col7 = st.columns(7)
+                    penalty_col1, penalty_col2, penalty_col3, penalty_col4, penalty_col5, penalty_col6, penalty_col7, penalty_col8 = st.columns(8)
 
                     with penalty_col1:
                         if penalty_breakdown['duitnow']['amount'] > 0:
@@ -3551,12 +3557,16 @@ def main():
                             st.error(f"**Pending Parcel:** {penalty_breakdown['pending_parcel']['count']} parcel(s) - {config['currency_symbol']}{penalty_breakdown['pending_parcel']['amount']:,.2f}")
                             if penalty_breakdown['pending_parcel']['waybills']:
                                 st.caption(f"Waybills: {', '.join(penalty_breakdown['pending_parcel']['waybills'][:5])}")
-                        if penalty_breakdown['parcel_lost']['count'] > 0:
-                            st.error(f"**Parcel Lost:** {penalty_breakdown['parcel_lost']['count']} parcel(s) - {config['currency_symbol']}{penalty_breakdown['parcel_lost']['amount']:,.2f}")
-                            if penalty_breakdown['parcel_lost']['waybills']:
-                                st.caption(f"Waybills: {', '.join(penalty_breakdown['parcel_lost']['waybills'][:5])}")
 
                     with penalty_col7:
+                        if penalty_breakdown.get('route', {}).get('amount', 0) > 0:
+                            rc = penalty_breakdown['route'].get('count', 0) or 0
+                            st.error(
+                                f"**Route:** {rc} dispatcher(s) - "
+                                f"{config['currency_symbol']}{penalty_breakdown['route']['amount']:,.2f}"
+                            )
+
+                    with penalty_col8:
                         if penalty_breakdown['attendance']['amount'] > 0:
                             st.error(f"**Attendance:** Missing Clock-in - {config['currency_symbol']}{penalty_breakdown['attendance']['amount']:,.2f}")
 
