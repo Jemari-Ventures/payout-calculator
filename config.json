@@ -1,7 +1,7 @@
 {
   "data_source": {
     "type": "excel",
-    "gsheet_url": "https://docs.google.com/spreadsheets/d/18XWFCvy6SpmR7z__-CL6tJ-NBpxlrKVPWmOSjLeUiyM/edit?gid=0#gid=0",
+    "gsheet_url": "https://docs.google.com/spreadsheets/d/1HatMuFvKtMJM0jRnkmwooTS7WIkAXrVOxZMOgfJwwJw/edit?usp=sharing",
     "postgres_table": "dispatch",
     "pickup_table": "pickup",
     "excel_file": "",
@@ -23,7 +23,7 @@
     "table_name": "dispatch"
   },
   "currency_symbol": "RM",
-  "pickup_fee": 151.0,
+  "pickup_fee": 1.0,
   "payout_rate": 1.5,
   "penalty_rate": 100.0,
   "tiers": [
@@ -107,5 +107,5 @@
   "return_payout_per_parcel": 0.5,
   "fake_attempt_penalty_per_parcel": 2.0,
   "pending_parcel_penalty_per_parcel": 2.0,
-  "route_penalty_amount": 1000.0
+  "route_penalty_amount": 0.0
 }
