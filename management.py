@@ -9,7 +9,7 @@ import os
 from typing import Optional, Tuple, Dict, List
 from datetime import datetime, timedelta
 from urllib.parse import urlparse, parse_qs
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 import pandas as pd
 import numpy as np
@@ -203,6 +203,63 @@ def normalize_dispatcher_id(value) -> str:
     if text.isdigit():
         text = text.lstrip("0") or "0"
     return text
+
+
+def penalty_cell_to_decimal(value) -> Decimal:
+    """Parse penalty/COD amount cells; blanks, placeholders, and bad text → 0 (no crash)."""
+    if value is None:
+        return Decimal("0")
+    if isinstance(value, bool):
+        return Decimal(int(value))
+    if isinstance(value, Decimal):
+        if value.is_nan() or value.is_infinite():
+            return Decimal("0")
+        return value
+    try:
+        if pd.isna(value):
+            return Decimal("0")
+    except TypeError:
+        pass
+    if isinstance(value, (int, np.integer)):
+        return Decimal(int(value))
+    if isinstance(value, (float, np.floating)):
+        v = float(value)
+        if np.isnan(v) or np.isinf(v):
+            return Decimal("0")
+        return Decimal(str(v))
+    s = str(value).strip()
+    if not s or s.lower() in ("nan", "none", "-", "n/a", "na", "--", ""):
+        return Decimal("0")
+    for sym in ("RM", "MYR", "S$", "SGD", "USD", "$", "€", "£"):
+        s = s.replace(sym, "")
+    s = s.replace(",", "").strip()
+    if not s:
+        return Decimal("0")
+    try:
+        return Decimal(s)
+    except InvalidOperation:
+        return Decimal("0")
+
+
+def route_penalty_dispatcher_key(dispatcher_id) -> str:
+    """Stable key for route-penalty split/lookup (e.g. int 123 vs float 123.0 map to the same share)."""
+    if dispatcher_id is None:
+        return ""
+    try:
+        if pd.isna(dispatcher_id):
+            return ""
+    except TypeError:
+        pass
+    s = str(dispatcher_id).strip()
+    if not s or s.lower() == "nan":
+        return ""
+    try:
+        v = float(s.replace(",", ""))
+        if v == int(v):
+            return str(int(v))
+    except (ValueError, OverflowError):
+        pass
+    return s
 
 
 def split_route_penalty_pool(pool_total: float, dispatcher_ids) -> dict:
@@ -1093,9 +1150,7 @@ class PayoutCalculator:
                 if rider_col and penalty_col:
                     # Pre-convert penalty column to Decimal once
                     if 'penalty_numeric' not in df_processed.columns:
-                        df_processed['penalty_numeric'] = df_processed[penalty_col].apply(
-                            lambda x: Decimal(str(x)) if pd.notna(x) else Decimal('0')
-                        )
+                        df_processed['penalty_numeric'] = df_processed[penalty_col].apply(penalty_cell_to_decimal)
                     # Pre-filter positive penalties
                     df_processed = df_processed[df_processed['penalty_numeric'] > 0].copy()
                     # Pre-normalize rider IDs
@@ -1110,9 +1165,7 @@ class PayoutCalculator:
                 if ldr_penalty_col:
                     # Use explicit penalty column when provided by source sheet
                     if 'penalty_numeric' not in df_processed.columns:
-                        df_processed['penalty_numeric'] = df_processed[ldr_penalty_col].apply(
-                            lambda x: Decimal(str(x)) if pd.notna(x) else Decimal('0')
-                        )
+                        df_processed['penalty_numeric'] = df_processed[ldr_penalty_col].apply(penalty_cell_to_decimal)
                     df_processed = df_processed[df_processed['penalty_numeric'] > 0].copy()
 
             # Pre-process Fake Attempt penalty data
@@ -1161,9 +1214,7 @@ class PayoutCalculator:
                     )
                 if dispatcher_id_col and cod_col:
                     if 'penalty_numeric' not in df_processed.columns:
-                        df_processed['penalty_numeric'] = df_processed[cod_col].apply(
-                            lambda x: Decimal(str(x)) if pd.notna(x) else Decimal('0')
-                        )
+                        df_processed['penalty_numeric'] = df_processed[cod_col].apply(penalty_cell_to_decimal)
                     df_processed = df_processed[df_processed['penalty_numeric'] > 0].copy()
 
             # Pre-process COD penalty data
@@ -1177,9 +1228,7 @@ class PayoutCalculator:
                 if penalty_col:
                     # Pre-convert penalty column to Decimal once (COD penalty is bigint, convert to Decimal for precision)
                     if 'penalty_numeric' not in df_processed.columns:
-                        df_processed['penalty_numeric'] = df_processed[penalty_col].apply(
-                            lambda x: Decimal(str(x)) if pd.notna(x) else Decimal('0')
-                        )
+                        df_processed['penalty_numeric'] = df_processed[penalty_col].apply(penalty_cell_to_decimal)
                     # Pre-filter positive penalties
                     df_processed = df_processed[df_processed['penalty_numeric'] > 0].copy()
 
@@ -1206,9 +1255,7 @@ class PayoutCalculator:
 
                 if penalty_col:
                     if 'penalty_numeric' not in df_processed.columns:
-                        df_processed['penalty_numeric'] = df_processed[penalty_col].apply(
-                            lambda x: Decimal(str(x)) if pd.notna(x) else Decimal('0')
-                        )
+                        df_processed['penalty_numeric'] = df_processed[penalty_col].apply(penalty_cell_to_decimal)
                     df_processed = df_processed[df_processed['penalty_numeric'] > 0].copy()
 
             processed[penalty_type] = df_processed
@@ -1788,9 +1835,7 @@ class PayoutCalculator:
                 if penalty_col:
                     # Filter to only include records with positive penalty amounts
                     # Use Decimal to preserve exact precision
-                    duitnow_df['penalty_numeric'] = duitnow_df[penalty_col].apply(
-                        lambda x: Decimal(str(x)) if pd.notna(x) else Decimal('0')
-                    )
+                    duitnow_df['penalty_numeric'] = duitnow_df[penalty_col].apply(penalty_cell_to_decimal)
                     duitnow_filtered = duitnow_df[duitnow_df['penalty_numeric'] > 0]
 
                     # Round each penalty value first, then sum (matching SQL: SUM((FLOOR((penalty * 100) + 0.5) / 100)))
@@ -1817,9 +1862,7 @@ class PayoutCalculator:
             ldr_penalty_col = next((col for col in ldr_df.columns if col.lower() in ['penalty', 'amount']), None)
             if ldr_penalty_col:
                 ldr_df = ldr_df.copy()
-                ldr_df['penalty_numeric'] = ldr_df[ldr_penalty_col].apply(
-                    lambda x: Decimal(str(x)) if pd.notna(x) else Decimal('0')
-                )
+                ldr_df['penalty_numeric'] = ldr_df[ldr_penalty_col].apply(penalty_cell_to_decimal)
                 ldr_filtered = ldr_df[ldr_df['penalty_numeric'] > 0]
                 if len(ldr_filtered) > 0:
                     rounded_penalties = [
@@ -1879,9 +1922,7 @@ class PayoutCalculator:
                 if penalty_col:
                     # Filter to only include records with positive penalty amounts
                     # Use Decimal to preserve exact precision
-                    cod_df['penalty_numeric'] = cod_df[penalty_col].apply(
-                        lambda x: Decimal(str(x)) if pd.notna(x) else Decimal('0')
-                    )
+                    cod_df['penalty_numeric'] = cod_df[penalty_col].apply(penalty_cell_to_decimal)
                     cod_filtered = cod_df[cod_df['penalty_numeric'] > 0]
 
                     # Round each penalty value first, then sum (matching SQL: SUM((FLOOR((penalty * 100) + 0.5) / 100)))
@@ -1917,9 +1958,7 @@ class PayoutCalculator:
 
                 if penalty_col:
                     binding_df = binding_df.copy()
-                    binding_df['penalty_numeric'] = binding_df[penalty_col].apply(
-                        lambda x: Decimal(str(x)) if pd.notna(x) else Decimal('0')
-                    )
+                    binding_df['penalty_numeric'] = binding_df[penalty_col].apply(penalty_cell_to_decimal)
                     binding_filtered = binding_df[binding_df['penalty_numeric'] > 0]
 
                     if len(binding_filtered) > 0:
@@ -1951,9 +1990,7 @@ class PayoutCalculator:
                 cod_col = PayoutCalculator._find_parcel_lost_cod_column(pl_df)
                 if cod_col:
                     pl_df = pl_df.copy()
-                    pl_df['penalty_numeric'] = pl_df[cod_col].apply(
-                        lambda x: Decimal(str(x)) if pd.notna(x) else Decimal('0')
-                    )
+                    pl_df['penalty_numeric'] = pl_df[cod_col].apply(penalty_cell_to_decimal)
                     pl_filtered = pl_df[pl_df['penalty_numeric'] > 0]
                     if len(pl_filtered) > 0:
                         rounded_penalties = [
@@ -2470,18 +2507,23 @@ class PayoutCalculator:
         penalty_data_processed = PayoutCalculator._preprocess_penalty_data(penalty_data) if penalty_data else None
 
         _payout_cfg = Config.load()
-        _route_pool = float(_payout_cfg.get("route_penalty_amount", 0.0) or 0.0)
+        _route_default = float(Config.DEFAULT_CONFIG.get("route_penalty_amount", 1000.0))
+        _route_pool = float(_payout_cfg.get("route_penalty_amount", _route_default) or 0.0)
         _route_split = {}
         if grouped is not None and not grouped.empty and _route_pool > 0:
-            _route_ids = grouped["dispatcher_id"].astype(str).str.strip().unique().tolist()
-            _route_split = split_route_penalty_pool(_route_pool, _route_ids)
+            _route_keys = [
+                route_penalty_dispatcher_key(x) for x in grouped["dispatcher_id"].unique().tolist()
+            ]
+            _route_split = split_route_penalty_pool(_route_pool, _route_keys)
 
         # Use apply instead of iterrows for better performance
         def calculate_penalties(row):
             dispatcher_id = str(row['dispatcher_id'])
             dispatcher_key = normalize_dispatcher_id(dispatcher_id)
             attendance_penalty = float(attendance_penalty_map.get(dispatcher_key, 0.0))
-            route_share = float(_route_split.get(str(row["dispatcher_id"]).strip(), 0.0))
+            route_share = float(
+                _route_split.get(route_penalty_dispatcher_key(row["dispatcher_id"]), 0.0)
+            )
 
             penalty_amount, penalty_count, penalty_waybills, attendance_penalty = PayoutCalculator.calculate_penalty(
                 dispatcher_id, penalty_data_processed, attendance_penalty, route_share
