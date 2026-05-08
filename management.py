@@ -1,6 +1,10 @@
 import warnings
 import urllib3
-warnings.filterwarnings('ignore', category=urllib3.exceptions.NotOpenSSLWarning)
+
+# urllib3 compatibility: NotOpenSSLWarning is not available in some versions.
+_not_openssl_warning = getattr(urllib3.exceptions, "NotOpenSSLWarning", None)
+if _not_openssl_warning is not None:
+    warnings.filterwarnings('ignore', category=_not_openssl_warning)
 
 import io
 import re
@@ -1120,10 +1124,30 @@ class PayoutCalculator:
         return None
 
     @staticmethod
-    def _find_parcel_lost_cod_column(df: pd.DataFrame) -> Optional[str]:
-        """Resolve the COD amount column on Parcel lost sheet (penalty = sum of COD per dispatcher)."""
+    def _find_dispatcher_id_column(df: pd.DataFrame) -> Optional[str]:
+        """Resolve dispatcher_id column with flexible header matching."""
         for col in df.columns:
-            if str(col).strip().lower() == "cod":
+            c = str(col).strip()
+            if c in ("dispatcher_id", "Dispatcher ID", "Dispatcher Id", "DISPATCHER_ID", "DISPATCHER ID"):
+                return col
+        for col in df.columns:
+            c = str(col).strip().lower().replace(" ", "_")
+            if c in ("dispatcher_id", "dispatcherid"):
+                return col
+        for col in df.columns:
+            cu = str(col).upper().strip()
+            if "DISPATCHER" in cu and "ID" in cu:
+                return col
+        return None
+
+    @staticmethod
+    def _find_parcel_lost_cod_column(df: pd.DataFrame) -> Optional[str]:
+        """Resolve the amount column on Parcel lost sheet (penalty = sum Amount per dispatcher)."""
+        for col in df.columns:
+            if str(col).strip().lower() == "amount":
+                return col
+        for col in df.columns:
+            if "amount" in str(col).strip().lower():
                 return col
         return None
 
@@ -1170,11 +1194,11 @@ class PayoutCalculator:
 
             # Pre-process Fake Attempt penalty data
             elif penalty_type == 'fake_attempt':
-                dispatcher_id_col = next((col for col in df.columns if col.lower() == 'dispatcher_id'), None)
+                dispatcher_id_col = PayoutCalculator._find_dispatcher_id_column(df)
                 if dispatcher_id_col:
                     df_processed['_dispatcher_id_normalized'] = df_processed[dispatcher_id_col].apply(normalize_dispatcher_id)
 
-            # Pre-process Pending Parcel penalty (Dispatcher ID, AWB No. — per-parcel rate from config)
+            # Pre-process Pending Parcel penalty (Dispatcher ID, AWB No., Amount)
             elif penalty_type == 'pending_parcel':
                 dispatcher_id_col = None
                 for col in df.columns:
@@ -1192,8 +1216,21 @@ class PayoutCalculator:
                     df_processed['_dispatcher_id_normalized'] = df_processed[dispatcher_id_col].apply(
                         normalize_dispatcher_id
                     )
+                amount_col = next(
+                    (col for col in df.columns if str(col).strip().lower() == 'amount'),
+                    None
+                )
+                if amount_col is None:
+                    amount_col = next(
+                        (col for col in df.columns if 'amount' in str(col).strip().lower()),
+                        None
+                    )
+                if amount_col:
+                    if 'penalty_numeric' not in df_processed.columns:
+                        df_processed['penalty_numeric'] = df_processed[amount_col].apply(penalty_cell_to_decimal)
+                    df_processed = df_processed[df_processed['penalty_numeric'] > 0].copy()
 
-            # Pre-process Parcel Lost penalty (Dispatcher ID, COD column = penalty amount per row)
+            # Pre-process Parcel Lost penalty (Dispatcher ID, Amount column = penalty amount per row)
             elif penalty_type == 'parcel_lost':
                 dispatcher_id_col = None
                 for col in df.columns:
@@ -1369,7 +1406,7 @@ class PayoutCalculator:
                     fake_attempt_records = fake_attempt_df[fake_attempt_df['_dispatcher_id_normalized'] == dispatcher_id_clean]
                 else:
                     # Fallback to original logic
-                    dispatcher_id_col = next((col for col in fake_attempt_df.columns if col.lower() == 'dispatcher_id'), None)
+                    dispatcher_id_col = PayoutCalculator._find_dispatcher_id_column(fake_attempt_df)
                     if dispatcher_id_col:
                         dispatcher_series = fake_attempt_df[dispatcher_id_col].apply(normalize_dispatcher_id)
                         fake_attempt_records = fake_attempt_df[dispatcher_series == dispatcher_id_clean]
@@ -1377,19 +1414,17 @@ class PayoutCalculator:
                         fake_attempt_records = pd.DataFrame()
 
                 if not fake_attempt_records.empty:
-                    # Count unique waybills
+                    # Match app.py behavior: penalty is based on filtered record count, not unique waybills.
                     waybill_col = next((col for col in fake_attempt_df.columns if col.lower() in ['waybill_number', 'waybill']), None)
                     if waybill_col:
-                        waybill_count = fake_attempt_records[waybill_col].nunique()
                         waybill_list = fake_attempt_records[waybill_col].dropna().astype(str).unique().tolist()
                         waybill_numbers.extend([wb for wb in waybill_list if wb and wb.lower() != 'nan'])
-                    else:
-                        waybill_count = len(fake_attempt_records)
+                    penalty_record_count = len(fake_attempt_records)
 
                     fake_attempt_rate = Config.load().get("fake_attempt_penalty_per_parcel", 1.00)
-                    fake_attempt_penalty = waybill_count * float(fake_attempt_rate)
+                    fake_attempt_penalty = penalty_record_count * float(fake_attempt_rate)
                     total_penalty += fake_attempt_penalty
-                    total_count += waybill_count
+                    total_count += penalty_record_count
 
         # 4. COD Penalty: dispatcher_id column = dispatcher_id, penalty amount from penalty column (only positive amounts)
         if 'cod' in penalty_data:
@@ -1452,7 +1487,7 @@ class PayoutCalculator:
                     total_penalty += float(binding_penalty_rounded)
                     total_count += len(binding_records)
 
-        # 6. Pending Parcel penalty: unique AWB No. × rate from config
+        # 6. Pending Parcel penalty: sum Amount per dispatcher
         if 'pending_parcel' in penalty_data:
             pp_df = penalty_data['pending_parcel']
             if not pp_df.empty:
@@ -1485,11 +1520,20 @@ class PayoutCalculator:
                         waybill_numbers.extend([wb for wb in waybill_list if wb and wb.lower() != 'nan'])
                     else:
                         waybill_count = len(pp_records)
-                    pp_rate = Config.load().get("pending_parcel_penalty_per_parcel", 2.00)
-                    total_penalty += waybill_count * float(pp_rate)
+                    if 'penalty_numeric' in pp_records.columns:
+                        rounded_penalties = [
+                            penalty.quantize(Decimal('0.01'), rounding='ROUND_HALF_UP')
+                            for penalty in pp_records['penalty_numeric'].tolist()
+                        ]
+                        pp_rounded = sum(rounded_penalties).quantize(Decimal('0.01'), rounding='ROUND_HALF_UP')
+                        total_penalty += float(pp_rounded)
+                    else:
+                        # Fallback for legacy datasets without Amount column
+                        pp_rate = Config.load().get("pending_parcel_penalty_per_parcel", 2.00)
+                        total_penalty += waybill_count * float(pp_rate)
                     total_count += waybill_count
 
-        # 7. Parcel Lost penalty: sum of COD column per dispatcher (sheet Parcel lost)
+        # 7. Parcel Lost penalty: sum of Amount column per dispatcher (sheet Parcel lost)
         if 'parcel_lost' in penalty_data:
             pl_df = penalty_data['parcel_lost']
             if not pl_df.empty:
@@ -1648,7 +1692,7 @@ class PayoutCalculator:
                     fake_attempt_records = fake_attempt_df[fake_attempt_df['_dispatcher_id_normalized'] == dispatcher_id_clean]
                 else:
                     # Fallback to original logic
-                    dispatcher_id_col = next((col for col in fake_attempt_df.columns if col.lower() == 'dispatcher_id'), None)
+                    dispatcher_id_col = PayoutCalculator._find_dispatcher_id_column(fake_attempt_df)
                     if dispatcher_id_col:
                         dispatcher_series = fake_attempt_df[dispatcher_id_col].apply(normalize_dispatcher_id)
                         fake_attempt_records = fake_attempt_df[dispatcher_series == dispatcher_id_clean]
@@ -1657,13 +1701,10 @@ class PayoutCalculator:
 
                 if not fake_attempt_records.empty:
                     waybill_col = next((col for col in fake_attempt_df.columns if col.lower() in ['waybill_number', 'waybill']), None)
-                    if waybill_col:
-                        waybill_count = fake_attempt_records[waybill_col].nunique()
-                    else:
-                        waybill_count = len(fake_attempt_records)
+                    penalty_record_count = len(fake_attempt_records)
 
                     fake_attempt_rate = Config.load().get("fake_attempt_penalty_per_parcel", 1.00)
-                    breakdown['fake_attempt'] = waybill_count * float(fake_attempt_rate)
+                    breakdown['fake_attempt'] = penalty_record_count * float(fake_attempt_rate)
 
         # 4. COD Penalty: dispatcher_id column = dispatcher_id, penalty amount from penalty column (only positive amounts)
         if 'cod' in penalty_data:
@@ -1752,8 +1793,17 @@ class PayoutCalculator:
                         waybill_count = pp_records[awb_col].nunique()
                     else:
                         waybill_count = len(pp_records)
-                    pp_rate = Config.load().get("pending_parcel_penalty_per_parcel", 2.00)
-                    breakdown['pending_parcel'] = waybill_count * float(pp_rate)
+                    if 'penalty_numeric' in pp_records.columns:
+                        rounded_penalties = [
+                            penalty.quantize(Decimal('0.01'), rounding='ROUND_HALF_UP')
+                            for penalty in pp_records['penalty_numeric'].tolist()
+                        ]
+                        breakdown['pending_parcel'] = float(
+                            sum(rounded_penalties).quantize(Decimal('0.01'), rounding='ROUND_HALF_UP')
+                        )
+                    else:
+                        pp_rate = Config.load().get("pending_parcel_penalty_per_parcel", 2.00)
+                        breakdown['pending_parcel'] = waybill_count * float(pp_rate)
 
         if 'parcel_lost' in penalty_data:
             pl_df = penalty_data['parcel_lost']
@@ -1896,13 +1946,10 @@ class PayoutCalculator:
                     waybill_col = col
                     break
 
-            if waybill_col:
-                waybill_count = fake_attempt_df[waybill_col].nunique()
-            else:
-                waybill_count = len(fake_attempt_df)
+            penalty_record_count = len(fake_attempt_df)
 
             fake_attempt_rate = Config.load().get("fake_attempt_penalty_per_parcel", 1.00)
-            penalty_totals['fake_attempt'] = waybill_count * float(fake_attempt_rate)
+            penalty_totals['fake_attempt'] = penalty_record_count * float(fake_attempt_rate)
 
         # 4. COD Penalty: sum all penalty amounts (only positive amounts)
         if 'cod' in penalty_data:
@@ -1976,13 +2023,26 @@ class PayoutCalculator:
         if 'pending_parcel' in penalty_data:
             pp_df = penalty_data['pending_parcel']
             if pp_df is not None and not pp_df.empty:
-                awb_col = PayoutCalculator._find_pending_parcel_awb_column(pp_df)
-                if awb_col:
-                    waybill_count = pp_df[awb_col].nunique()
+                if 'penalty_numeric' in pp_df.columns:
+                    pp_filtered = pp_df[pp_df['penalty_numeric'] > 0]
+                    if len(pp_filtered) > 0:
+                        rounded_penalties = [
+                            penalty.quantize(Decimal('0.01'), rounding='ROUND_HALF_UP')
+                            for penalty in pp_filtered['penalty_numeric'].tolist()
+                        ]
+                        penalty_totals['pending_parcel'] = float(
+                            sum(rounded_penalties).quantize(Decimal('0.01'), rounding='ROUND_HALF_UP')
+                        )
+                    else:
+                        penalty_totals['pending_parcel'] = 0.0
                 else:
-                    waybill_count = len(pp_df)
-                pp_rate = Config.load().get("pending_parcel_penalty_per_parcel", 2.00)
-                penalty_totals['pending_parcel'] = waybill_count * float(pp_rate)
+                    awb_col = PayoutCalculator._find_pending_parcel_awb_column(pp_df)
+                    if awb_col:
+                        waybill_count = pp_df[awb_col].nunique()
+                    else:
+                        waybill_count = len(pp_df)
+                    pp_rate = Config.load().get("pending_parcel_penalty_per_parcel", 2.00)
+                    penalty_totals['pending_parcel'] = waybill_count * float(pp_rate)
 
         if 'parcel_lost' in penalty_data:
             pl_df = penalty_data['parcel_lost']
@@ -2002,7 +2062,7 @@ class PayoutCalculator:
                         penalty_totals['parcel_lost'] = 0.0
                 else:
                     st.error(
-                        f"❌ 'COD' column not found in Parcel Lost penalty data. "
+                        f"❌ 'Amount' column not found in Parcel Lost penalty data. "
                         f"Available columns: {list(pl_df.columns)}"
                     )
                     penalty_totals['parcel_lost'] = 0.0
