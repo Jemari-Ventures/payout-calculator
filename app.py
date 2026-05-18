@@ -416,6 +416,60 @@ class DataSource:
         return candidate_sample.equals(dispatch_sample)
 
     @staticmethod
+    def sheet_name_from_config(config: dict, key: str, default: str) -> str:
+        """Resolve workbook tab name from config data_source.excel_sheets."""
+        name = (
+            config.get("data_source", {})
+            .get("excel_sheets", {})
+            .get(key, default)
+        )
+        return str(name).strip() if name is not None else default
+
+    @staticmethod
+    def is_sheet_available(sheet_df: Optional[pd.DataFrame]) -> bool:
+        """True when optional sheet data exists and has at least one row."""
+        return sheet_df is not None and isinstance(sheet_df, pd.DataFrame) and not sheet_df.empty
+
+    @staticmethod
+    def for_calc(sheet_df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+        """Return sheet data for calculations, or None to skip that component."""
+        return sheet_df if DataSource.is_sheet_available(sheet_df) else None
+
+    @staticmethod
+    def looks_like_dispatch_only_sheet(sheet_df: pd.DataFrame) -> bool:
+        """
+        Detect sheet content that matches Dispatch layout (e.g. missing-tab fallback).
+        Used to skip penalty/pickup/return calcs when the wrong tab was loaded.
+        """
+        cols_lower = {str(c).strip().lower() for c in sheet_df.columns}
+        return (
+            "delivery signature" in cols_lower
+            and ("waybill number" in cols_lower or "waybill" in cols_lower)
+            and ("dispatcher id" in cols_lower or "dispatcher_id" in cols_lower)
+        )
+
+    @staticmethod
+    def _load_optional_sheet(config: dict, sheet_key: str, default_name: str) -> Optional[pd.DataFrame]:
+        """Load an optional Google Sheet tab; return None if missing, empty, or Dispatch fallback."""
+        data_source = config.get("data_source", {})
+        if data_source.get("type") != "gsheet" or not data_source.get("gsheet_url"):
+            return None
+
+        sheet_name = DataSource.sheet_name_from_config(config, sheet_key, default_name)
+        try:
+            sheet_df = DataSource._read_optional_sheet_without_dispatch_fallback(
+                data_source["gsheet_url"], sheet_name=sheet_name
+            )
+            if not DataSource.is_sheet_available(sheet_df):
+                return None
+            if DataSource.looks_like_dispatch_only_sheet(sheet_df):
+                return None
+            return sheet_df
+        except Exception as exc:
+            st.warning(f"Could not load \"{sheet_name}\" sheet: {exc}")
+            return None
+
+    @staticmethod
     def _read_optional_sheet_without_dispatch_fallback(gsheet_url: str, sheet_name: str) -> pd.DataFrame:
         """
         Read an optional sheet and guard against Google Sheets fallback behavior
@@ -445,169 +499,58 @@ class DataSource:
 
     @staticmethod
     def load_pickup_data(config: dict) -> Optional[pd.DataFrame]:
-        """Load pickup data from Sheet2."""
-        data_source = config["data_source"]
-        if data_source["type"] == "gsheet" and data_source["gsheet_url"]:
-            try:
-                return DataSource._read_optional_sheet_without_dispatch_fallback(
-                    data_source["gsheet_url"], sheet_name="Pickup"
-                )
-            except Exception as exc:
-                st.warning(f"Could not load pickup data from Sheet2: {exc}")
-                return None
-        return None
+        """Load pickup data from optional Pickup sheet."""
+        return DataSource._load_optional_sheet(config, "pickup", "Pickup")
 
     @staticmethod
     def load_duitnow_penalty_data(config: dict) -> Optional[pd.DataFrame]:
-        """Load DuitNow penalty data from Sheet3."""
-        data_source = config["data_source"]
-        if data_source["type"] == "gsheet" and data_source["gsheet_url"]:
-            try:
-                return DataSource._read_optional_sheet_without_dispatch_fallback(
-                    data_source["gsheet_url"], sheet_name="DuitNow"
-                )
-            except Exception as exc:
-                st.warning(f"Could not load DuitNow penalty data from Sheet3: {exc}")
-                return None
-        return None
+        """Load DuitNow penalty data from optional DuitNow sheet."""
+        return DataSource._load_optional_sheet(config, "duitnow", "DuitNow")
 
     @staticmethod
     def load_ldr_penalty_data(config: dict) -> Optional[pd.DataFrame]:
-        """Load LD&R penalty data from Sheet4."""
-        data_source = config["data_source"]
-        if data_source["type"] == "gsheet" and data_source["gsheet_url"]:
-            try:
-                return DataSource._read_optional_sheet_without_dispatch_fallback(
-                    data_source["gsheet_url"], sheet_name="LDR"
-                )
-            except Exception as exc:
-                st.warning(f"Could not load LD&R penalty data from Sheet4: {exc}")
-                return None
-        return None
+        """Load LD&R penalty data from optional LDR sheet."""
+        return DataSource._load_optional_sheet(config, "ldr", "LDR")
 
     @staticmethod
     def load_fake_attempt_penalty_data(config: dict) -> Optional[pd.DataFrame]:
-        """Load Fake Attempt penalty data from Sheet5."""
-        data_source = config["data_source"]
-        if data_source["type"] == "gsheet" and data_source["gsheet_url"]:
-            try:
-                return DataSource._read_optional_sheet_without_dispatch_fallback(
-                    data_source["gsheet_url"], sheet_name="Fake Attempt"
-                )
-            except Exception as exc:
-                st.warning(f"Could not load Fake Attempt penalty data from Sheet5: {exc}")
-                return None
-        return None
+        """Load Fake Attempt penalty data from optional Fake Attempt sheet."""
+        return DataSource._load_optional_sheet(config, "fake_attempt", "Fake Attempt")
 
     @staticmethod
     def load_cod_penalty_data(config: dict) -> Optional[pd.DataFrame]:
-        """Load COD penalty data from COD sheet."""
-        data_source = config["data_source"]
-        if data_source["type"] == "gsheet" and data_source["gsheet_url"]:
-            try:
-                return DataSource._read_optional_sheet_without_dispatch_fallback(
-                    data_source["gsheet_url"], sheet_name="COD"
-                )
-            except Exception as exc:
-                st.warning(f"Could not load COD penalty data: {exc}")
-                return None
-        return None
+        """Load COD penalty data from optional COD sheet."""
+        return DataSource._load_optional_sheet(config, "cod", "COD")
 
     @staticmethod
     def load_binding_penalty_data(config: dict) -> Optional[pd.DataFrame]:
-        """Load Binding penalty data from Binding sheet (Dispatcher ID, Dispatcher Name, Penalty)."""
-        data_source = config["data_source"]
-        if data_source["type"] == "gsheet" and data_source["gsheet_url"]:
-            try:
-                return DataSource._read_optional_sheet_without_dispatch_fallback(
-                    data_source["gsheet_url"], sheet_name="Binding"
-                )
-            except Exception as exc:
-                st.warning(f"Could not load Binding penalty data: {exc}")
-                return None
-        return None
+        """Load Binding penalty data from optional Binding sheet."""
+        return DataSource._load_optional_sheet(config, "binding", "Binding")
 
     @staticmethod
     def load_pending_parcel_penalty_data(config: dict) -> Optional[pd.DataFrame]:
-        """Load Pending Parcel penalty (Dispatcher ID, AWB No.) from config sheet name."""
-        data_source = config["data_source"]
-        if data_source["type"] == "gsheet" and data_source["gsheet_url"]:
-            try:
-                sheet = config.get("data_source", {}).get("excel_sheets", {}).get(
-                    "pending_parcel", "Pending Parcel"
-                )
-                return DataSource._read_optional_sheet_without_dispatch_fallback(
-                    data_source["gsheet_url"], sheet_name=sheet
-                )
-            except Exception as exc:
-                st.warning(f"Could not load Pending Parcel penalty data: {exc}")
-                return None
-        return None
+        """Load Pending Parcel penalty from optional sheet."""
+        return DataSource._load_optional_sheet(config, "pending_parcel", "Pending Parcel")
 
     @staticmethod
     def load_parcel_lost_penalty_data(config: dict) -> Optional[pd.DataFrame]:
-        """Load Parcel Lost penalty (waybill_number, Dispatcher ID, etc.) from config sheet name."""
-        data_source = config["data_source"]
-        if data_source["type"] == "gsheet" and data_source["gsheet_url"]:
-            try:
-                sheet = config.get("data_source", {}).get("excel_sheets", {}).get(
-                    "parcel_lost", "Parcel lost"
-                )
-                return DataSource._read_optional_sheet_without_dispatch_fallback(
-                    data_source["gsheet_url"], sheet_name=sheet
-                )
-            except Exception as exc:
-                st.warning(f"Could not load Parcel Lost penalty data: {exc}")
-                return None
-        return None
+        """Load Parcel Lost penalty from optional sheet."""
+        return DataSource._load_optional_sheet(config, "parcel_lost", "Parcel lost")
 
     @staticmethod
     def load_qr_order_data(config: dict) -> Optional[pd.DataFrame]:
-        """Load QR Order data from QR Order sheet."""
-        data_source = config["data_source"]
-        if data_source["type"] == "gsheet" and data_source["gsheet_url"]:
-            try:
-                return DataSource._read_optional_sheet_without_dispatch_fallback(
-                    data_source["gsheet_url"], sheet_name="QR Order"
-                )
-            except Exception as exc:
-                st.warning(f"Could not load QR Order data: {exc}")
-                return None
-        return None
+        """Load QR Order data from optional QR Order sheet."""
+        return DataSource._load_optional_sheet(config, "qr_order", "QR Order")
 
     @staticmethod
     def load_return_data(config: dict) -> Optional[pd.DataFrame]:
-        """Load Return data from Return sheet."""
-        data_source = config["data_source"]
-        if data_source["type"] == "gsheet" and data_source["gsheet_url"]:
-            try:
-                return DataSource._read_optional_sheet_without_dispatch_fallback(
-                    data_source["gsheet_url"], sheet_name="Return"
-                )
-            except Exception as exc:
-                st.warning(f"Could not load Return data: {exc}")
-                return None
-        return None
+        """Load Return data from optional Return sheet."""
+        return DataSource._load_optional_sheet(config, "return", "Return")
 
     @staticmethod
     def load_attendance_data(config: dict) -> Optional[pd.DataFrame]:
-        """Load attendance penalty rows from the tab named in config (data_source.excel_sheets.attendance)."""
-        data_source = config["data_source"]
-        if data_source["type"] == "gsheet" and data_source["gsheet_url"]:
-            try:
-                sheet = (
-                    config.get("data_source", {})
-                    .get("excel_sheets", {})
-                    .get("attendance", "Attendance")
-                )
-                sheet = str(sheet).strip() if sheet is not None else "Attendance"
-                return DataSource._read_optional_sheet_without_dispatch_fallback(
-                    data_source["gsheet_url"], sheet_name=sheet
-                )
-            except Exception as exc:
-                st.warning(f"Could not load Attendance data: {exc}")
-                return None
-        return None
+        """Load attendance penalty rows from optional Attendance sheet."""
+        return DataSource._load_optional_sheet(config, "attendance", "Attendance")
 
 
 # =============================================================================
@@ -754,7 +697,7 @@ class PayoutCalculator:
         dispatcher_id_normalized = str(dispatcher_id).strip()
 
         # 1. Process DuitNow penalty (Sheet3) - No waybills
-        if duitnow_df is not None and not duitnow_df.empty:
+        if DataSource.is_sheet_available(duitnow_df):
             rider_col = None
             # Try exact match first (case-insensitive, strip spaces)
             for col in duitnow_df.columns:
@@ -826,7 +769,7 @@ class PayoutCalculator:
                         penalty_breakdown['duitnow']['amount'] = round(float(penalty_amount), 2)
 
         # 2. Process LD&R penalty (Sheet4)
-        if ldr_df is not None and not ldr_df.empty:
+        if DataSource.is_sheet_available(ldr_df):
             emp_id_col = None
             # Try exact matches first (both original and normalized formats)
             exact_matches = ["Employee ID", "employee_id", "EMPLOYEE ID", "EMPLOYEE_ID"]
@@ -942,7 +885,7 @@ class PayoutCalculator:
                             penalty_breakdown['ldr']['waybills'] = [wb for wb in waybills if wb and wb.lower() != 'nan']
 
         # 3. Process Fake attempt penalty (Sheet5)
-        if fake_df is not None and not fake_df.empty:
+        if DataSource.is_sheet_available(fake_df):
             disp_id_col = None
             # Try multiple patterns for dispatcher ID column
             for col in fake_df.columns:
@@ -1003,7 +946,7 @@ class PayoutCalculator:
                         penalty_breakdown['fake_attempt']['waybills'] = [wb for wb in waybills if wb and wb.lower() != 'nan']
 
         # 4. Process COD penalty (COD sheet)
-        if cod_df is not None and not cod_df.empty:
+        if DataSource.is_sheet_available(cod_df):
             dispatcher_id_col = None
             # Try exact matches first
             exact_matches = ["dispatcher_id", "Dispatcher ID", "DISPATCHER_ID", "DISPATCHER ID"]
@@ -1073,7 +1016,7 @@ class PayoutCalculator:
                         penalty_breakdown['cod']['count'] = len(cod_rows)
 
         # 5. Process Binding penalty (Binding sheet: Dispatcher ID, Dispatcher Name, Penalty)
-        if binding_df is not None and not binding_df.empty:
+        if DataSource.is_sheet_available(binding_df):
             binding_disp_col = None
             exact_binding = ["dispatcher_id", "Dispatcher ID", "DISPATCHER_ID", "DISPATCHER ID"]
             for col in binding_df.columns:
@@ -1130,7 +1073,7 @@ class PayoutCalculator:
                         penalty_breakdown['binding']['count'] = len(binding_rows)
 
         # 6. Pending Parcel penalty (sum Amount column by dispatcher)
-        if pending_parcel_df is not None and not pending_parcel_df.empty:
+        if DataSource.is_sheet_available(pending_parcel_df):
             pp_disp_col = None
             for col in pending_parcel_df.columns:
                 col_normalized = str(col).upper().strip().replace(" ", "")
@@ -1200,7 +1143,7 @@ class PayoutCalculator:
                     penalty_breakdown['pending_parcel']['count'] = int(parcel_count)
 
         # 7. Parcel Lost penalty (sum amount column by dispatcher_id)
-        if parcel_lost_df is not None and not parcel_lost_df.empty:
+        if DataSource.is_sheet_available(parcel_lost_df):
             pl_disp_col = find_column(
                 parcel_lost_df, ["Dispatcher ID", "dispatcher_id", "Dispatcher Id", "DISPATCHER ID"]
             )
@@ -1232,7 +1175,7 @@ class PayoutCalculator:
             penalty_breakdown['route']['pool_total'] = round(float(route_penalty_pool_total), 2)
 
         # 9. Process Attendance penalty (Attendance sheet) - direct penalty column sum by employee_id
-        if attendance_df is not None and not attendance_df.empty:
+        if DataSource.is_sheet_available(attendance_df):
             emp_id_col = find_column(
                 attendance_df,
                 [
@@ -1296,7 +1239,10 @@ class PayoutCalculator:
         Returns:
             Tuple of (parcel_count, payout, filtered_pickup_df)
         """
-        if pickup_df is None or pickup_df.empty or not dispatcher_id:
+        if not DataSource.is_sheet_available(pickup_df) or not dispatcher_id:
+            return 0, 0.0, pd.DataFrame()
+
+        if DataSource.looks_like_dispatch_only_sheet(pickup_df):
             return 0, 0.0, pd.DataFrame()
 
         # Find dispatcher column - handle multiple possible column name formats
@@ -1409,22 +1355,16 @@ class PayoutCalculator:
         Returns:
             Tuple of (order_count, payout, filtered_qr_order_df)
         """
-        if qr_order_df is None or qr_order_df.empty or not dispatcher_id:
+        if not DataSource.is_sheet_available(qr_order_df) or not dispatcher_id:
             return 0, 0.0, pd.DataFrame()
 
-        # Guard: if requested QR sheet falls back to Dispatch data (when tab is missing),
-        # do not count delivery rows as QR orders.
+        # Guard: skip if sheet content is Dispatch layout (missing-tab fallback).
         qr_cols_lower = {str(c).strip().lower() for c in qr_order_df.columns}
-        has_dispatch_signature = (
-            "delivery signature" in qr_cols_lower and
-            ("waybill number" in qr_cols_lower or "waybill" in qr_cols_lower) and
-            ("dispatcher id" in qr_cols_lower or "dispatcher_id" in qr_cols_lower)
-        )
         has_qr_markers = any(
             ("qr" in col) or ("order" in col) or ("awb" in col)
             for col in qr_cols_lower
         )
-        if has_dispatch_signature and not has_qr_markers:
+        if DataSource.looks_like_dispatch_only_sheet(qr_order_df) and not has_qr_markers:
             return 0, 0.0, pd.DataFrame()
 
         # Find dispatcher column - handle multiple possible column name formats
@@ -1554,19 +1494,13 @@ class PayoutCalculator:
         Returns:
             Tuple of (return_count, payout, filtered_return_df)
         """
-        if return_df is None or return_df.empty or not dispatcher_id:
+        if not DataSource.is_sheet_available(return_df) or not dispatcher_id:
             return 0, 0.0, pd.DataFrame()
 
-        # Guard: if requested Return sheet falls back to Dispatch data (when tab is missing),
-        # do not count delivery rows as returns.
+        # Guard: skip if sheet content is Dispatch layout (missing-tab fallback).
         return_cols_lower = {str(c).strip().lower() for c in return_df.columns}
-        has_dispatch_signature = (
-            "delivery signature" in return_cols_lower and
-            ("waybill number" in return_cols_lower or "waybill" in return_cols_lower) and
-            ("dispatcher id" in return_cols_lower or "dispatcher_id" in return_cols_lower)
-        )
         has_return_markers = any("return" in col for col in return_cols_lower)
-        if has_dispatch_signature and not has_return_markers:
+        if DataSource.looks_like_dispatch_only_sheet(return_df) and not has_return_markers:
             return 0, 0.0, pd.DataFrame()
 
         # Find dispatcher column - handle multiple possible column name formats
@@ -1678,12 +1612,13 @@ class PayoutCalculator:
                               fake_attempt_penalty_per_parcel: float = 2.0,
                               pending_parcel_penalty_per_parcel: float = 2.0,
                               return_df: Optional[pd.DataFrame] = None,
+                              pickup_df: Optional[pd.DataFrame] = None,
                               route_penalty_per_dispatcher: float = 0.0,
                               route_penalty_dispatcher_count: int = 0,
                               route_penalty_pool_total: float = 0.0) -> Tuple:
         """Calculate payout for tiered daily mode with KPI bonus, attendance bonus, and special rates.
-        Any waybill that appears in the return sheet is excluded from dispatch so tier calculation
-        uses delivery-only parcels (e.g. dispatch 2059 - return 45 = 2014 for tier).
+        Waybills that appear in the return or pickup sheet are excluded from dispatch so tier
+        calculation uses delivery-only parcels (pickup/return are paid separately).
         """
         tiers = []
         for tier in tiers_config:
@@ -1714,7 +1649,7 @@ class PayoutCalculator:
         if delivery_sig_col is None or waybill_col is None:
             raise ValueError("Required columns (Delivery Signature and Waybill Number) not found in data")
 
-        # Exclude any waybill that appears in the return sheet so tier calc uses delivery-only parcels (e.g. 2059 - 45 = 2014).
+        # Exclude waybills that appear on return or pickup sheets (paid separately; avoid double-count).
         def _norm_waybill(v):
             if pd.isna(v):
                 return ""
@@ -1744,17 +1679,27 @@ class PayoutCalculator:
                     pass
             return s
 
-        return_waybills = set()
-        if return_df is not None and not return_df.empty and waybill_col is not None:
-            return_wb_col = find_column(return_df, ["Waybill Number", "waybill_number", "Waybill", "waybill"])
-            if return_wb_col is not None:
-                for x in return_df[return_wb_col].dropna().unique():
-                    n = _norm_waybill(x)
-                    if n:
-                        return_waybills.add(n)
-        if return_waybills:
+        def _waybills_from_optional_sheet(sheet_df: Optional[pd.DataFrame]) -> set:
+            waybills = set()
+            if not DataSource.is_sheet_available(sheet_df):
+                return waybills
+            sheet_wb_col = find_column(
+                sheet_df, ["Waybill Number", "waybill_number", "Waybill", "waybill", "AWB", "No. AWB"]
+            )
+            if sheet_wb_col is None:
+                return waybills
+            for x in sheet_df[sheet_wb_col].dropna().unique():
+                n = _norm_waybill(x)
+                if n:
+                    waybills.add(n)
+            return waybills
+
+        return_waybills = _waybills_from_optional_sheet(return_df)
+        pickup_waybills = _waybills_from_optional_sheet(pickup_df)
+        excluded_dispatch_waybills = return_waybills | pickup_waybills
+        if excluded_dispatch_waybills:
             dispatch_norm = work[waybill_col].apply(_norm_waybill)
-            work = work.loc[~dispatch_norm.isin(return_waybills)].copy()
+            work = work.loc[~dispatch_norm.isin(excluded_dispatch_waybills)].copy()
 
         # Convert dates - but DON'T drop records with invalid dates
         # Use errors="coerce" to convert invalid dates to NaT, but keep the records
@@ -1980,10 +1925,10 @@ class PayoutCalculator:
 
             missing_records_all = filtered_df[missing_mask].copy()
 
-            # Do not add back waybills that are in the return sheet (keep Total Delivery Parcels excluding returns).
-            if not missing_records_all.empty and return_waybills:
+            # Do not add back waybills on return/pickup sheets (keep delivery parcels excluding those).
+            if not missing_records_all.empty and excluded_dispatch_waybills:
                 norm_missing = missing_records_all[waybill_col].apply(_norm_waybill)
-                missing_records_all = missing_records_all.loc[~norm_missing.isin(return_waybills)].copy()
+                missing_records_all = missing_records_all.loc[~norm_missing.isin(excluded_dispatch_waybills)].copy()
 
             if not missing_records_all.empty:
                 # Convert waybill - use direct string conversion to ensure it's never None
@@ -3109,6 +3054,19 @@ def main():
     pending_parcel_df = DataSource.load_pending_parcel_penalty_data(config)
     parcel_lost_df = DataSource.load_parcel_lost_penalty_data(config)
 
+    # Normalize: missing/empty/fallback sheets become None so downstream calcs skip them.
+    pickup_df = DataSource.for_calc(pickup_df)
+    qr_order_df = DataSource.for_calc(qr_order_df)
+    return_df = DataSource.for_calc(return_df)
+    attendance_df = DataSource.for_calc(attendance_df)
+    duitnow_df = DataSource.for_calc(duitnow_df)
+    ldr_df = DataSource.for_calc(ldr_df)
+    fake_attempt_df = DataSource.for_calc(fake_attempt_df)
+    cod_df = DataSource.for_calc(cod_df)
+    binding_df = DataSource.for_calc(binding_df)
+    pending_parcel_df = DataSource.for_calc(pending_parcel_df)
+    parcel_lost_df = DataSource.for_calc(parcel_lost_df)
+
     route_penalty_total = float(config.get("route_penalty_amount", 1000.0))
     route_id_list = df[dispatcher_id_col].dropna().astype(str).str.strip().unique().tolist()
     route_penalty_dispatcher_count = len(route_id_list)
@@ -3133,7 +3091,7 @@ def main():
     }
     missing_or_empty_sheets = [
         sheet_name for sheet_name, sheet_df in optional_sheets.items()
-        if sheet_df is None or sheet_df.empty
+        if not DataSource.is_sheet_available(sheet_df)
     ]
     if missing_or_empty_sheets:
         sheet_list = ", ".join(missing_or_empty_sheets)
@@ -3222,25 +3180,33 @@ def main():
                 config.get("fake_attempt_penalty_per_parcel", 2.0),
                 config.get("pending_parcel_penalty_per_parcel", 2.0),
                 return_df=return_df,
+                pickup_df=pickup_df,
                 route_penalty_per_dispatcher=route_penalty_per_dispatcher,
                 route_penalty_dispatcher_count=route_penalty_dispatcher_count,
                 route_penalty_pool_total=route_penalty_total,
             )
 
-            # Calculate pickup payout (assuming RM1.00 per pickup parcel)
-            pickup_parcels, pickup_payout, pickup_filtered_df = PayoutCalculator.calculate_pickup(
-                pickup_df, selected_dispatcher_id, rate=1.00
-            )
+            # Optional sheets: skip payout lines when tab is missing or unavailable.
+            if DataSource.is_sheet_available(pickup_df):
+                pickup_parcels, pickup_payout, pickup_filtered_df = PayoutCalculator.calculate_pickup(
+                    pickup_df, selected_dispatcher_id, rate=1.00
+                )
+            else:
+                pickup_parcels, pickup_payout, pickup_filtered_df = 0, 0.0, pd.DataFrame()
 
-            # Calculate QR order payout (RM1.80 per QR order)
-            qr_order_count, qr_order_payout, qr_order_filtered_df = PayoutCalculator.calculate_qr_order(
-                qr_order_df, selected_dispatcher_id, rate=1.80, dispatcher_name=selected_dispatcher_name
-            )
+            if DataSource.is_sheet_available(qr_order_df):
+                qr_order_count, qr_order_payout, qr_order_filtered_df = PayoutCalculator.calculate_qr_order(
+                    qr_order_df, selected_dispatcher_id, rate=1.80, dispatcher_name=selected_dispatcher_name
+                )
+            else:
+                qr_order_count, qr_order_payout, qr_order_filtered_df = 0, 0.0, pd.DataFrame()
 
-            # Calculate return payout (RM0.50 per return parcel)
-            return_count, return_payout, return_filtered_df = PayoutCalculator.calculate_return(
-                return_df, selected_dispatcher_id, rate=0.50
-            )
+            if DataSource.is_sheet_available(return_df):
+                return_count, return_payout, return_filtered_df = PayoutCalculator.calculate_return(
+                    return_df, selected_dispatcher_id, rate=0.50
+                )
+            else:
+                return_count, return_payout, return_filtered_df = 0, 0.0, pd.DataFrame()
 
             # Calculate gross total payout (delivery + pickup + QR order + return + bonuses - penalties) - round to 2 decimal places
             gross_total_payout = round(gross_delivery_payout + pickup_payout + qr_order_payout + return_payout, 2)
@@ -3266,7 +3232,7 @@ def main():
                 st.metric(
                     "Total Delivery Parcels",
                     f"{display_df['Total Parcel'].sum():,}",
-                    help="Total parcels delivered in the month (excl. returns)"
+                    help="Total parcels delivered in the month (excl. returns and pickup waybills)"
                 )
             with row1_col3:
                 st.metric(
