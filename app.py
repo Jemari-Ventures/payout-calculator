@@ -169,6 +169,181 @@ def find_column(df: pd.DataFrame, possible_names: List[str], case_sensitive: boo
     return None
 
 
+def normalize_waybill(value) -> str:
+    """Normalize a waybill/AWB value for consistent comparison across sheets."""
+    if pd.isna(value):
+        return ""
+    if isinstance(value, (int, float)):
+        try:
+            if isinstance(value, float) and value == int(value):
+                return str(int(value))
+            if isinstance(value, float):
+                if value == int(value):
+                    return str(int(value))
+                return str(value).strip()
+            return str(int(value))
+        except (ValueError, OverflowError):
+            return str(value).strip()
+    s = str(value).strip()
+    if not s or s.lower() in ("nan", "none", "null", ""):
+        return ""
+    if s.endswith(".0") and s[:-2].isdigit():
+        s = s[:-2]
+    if "e" in s.lower():
+        try:
+            f = float(s)
+            if f == int(f):
+                return str(int(f))
+            return str(f).strip()
+        except (ValueError, OverflowError):
+            pass
+    return s
+
+
+def find_waybill_column(df: pd.DataFrame) -> Optional[str]:
+    """Find waybill/AWB column using common header names."""
+    col = find_column(
+        df,
+        [
+            "Waybill Number", "waybill_number", "Waybill", "waybill",
+            "Waybill No", "AWB", "No. AWB", "AWB No.", "awb_no",
+        ],
+    )
+    if col is not None:
+        return col
+    for c in df.columns:
+        cl = str(c).lower().strip()
+        if "waybill" in cl or "awb" in cl:
+            return c
+    return None
+
+
+def find_pickup_dispatcher_column(df: pd.DataFrame) -> Optional[str]:
+    """Find pickup dispatcher ID column."""
+    col = find_column(
+        df,
+        [
+            "Pick Up Dispatcher ID", "Pick Up Dispatcher Id", "Pickup Dispatcher ID",
+            "pickup_dispatcher_id", "pickup_dispatcher", "Pickup Dispatcher",
+            "dispatcher_id", "Dispatcher ID",
+        ],
+    )
+    if col is not None:
+        return col
+    for c in df.columns:
+        cl = str(c).lower().strip()
+        if "pickup" in cl and "dispatcher" in cl:
+            return c
+    return None
+
+
+def is_return_sheet_dispatch_fallback(return_df: pd.DataFrame) -> bool:
+    """True when Return sheet data is actually Dispatch fallback content."""
+    if return_df is None or return_df.empty:
+        return False
+    return_cols_lower = {str(c).strip().lower() for c in return_df.columns}
+    has_dispatch_signature = (
+        "delivery signature" in return_cols_lower
+        and ("waybill number" in return_cols_lower or "waybill" in return_cols_lower)
+        and ("dispatcher id" in return_cols_lower or "dispatcher_id" in return_cols_lower)
+    )
+    has_return_markers = any("return" in col for col in return_cols_lower)
+    return has_dispatch_signature and not has_return_markers
+
+
+def unique_waybills_for_dispatcher(
+    df: Optional[pd.DataFrame],
+    dispatcher_id: str,
+    dispatcher_col: Optional[str],
+    waybill_col: Optional[str],
+) -> set:
+    """Return normalized unique waybills for one dispatcher from a sheet."""
+    if (
+        df is None
+        or df.empty
+        or not dispatcher_id
+        or not dispatcher_col
+        or not waybill_col
+        or dispatcher_col not in df.columns
+        or waybill_col not in df.columns
+    ):
+        return set()
+
+    dispatcher_id_str = str(dispatcher_id).strip()
+    matched = df[df[dispatcher_col].astype(str).str.strip() == dispatcher_id_str]
+    if matched.empty:
+        return set()
+
+    awbs = set()
+    for value in matched[waybill_col].dropna().unique():
+        normalized = normalize_waybill(value)
+        if normalized:
+            awbs.add(normalized)
+    return awbs
+
+
+def build_unique_awb_map(
+    df: Optional[pd.DataFrame],
+    dispatcher_col: Optional[str],
+    waybill_col: Optional[str],
+) -> Dict[str, set]:
+    """Map dispatcher ID -> set of normalized waybills for batch summaries."""
+    if (
+        df is None
+        or df.empty
+        or not dispatcher_col
+        or not waybill_col
+        or dispatcher_col not in df.columns
+        or waybill_col not in df.columns
+    ):
+        return {}
+
+    work = df[[dispatcher_col, waybill_col]].copy()
+    work["_key"] = work[dispatcher_col].astype(str).str.strip()
+    work["_wb"] = work[waybill_col].apply(normalize_waybill)
+    work = work[(work["_key"] != "") & (work["_wb"] != "")]
+    if work.empty:
+        return {}
+
+    return work.groupby("_key")["_wb"].apply(lambda values: set(values.tolist())).to_dict()
+
+
+def find_return_dispatcher_column(df: pd.DataFrame) -> Optional[str]:
+    """Find return dispatcher ID column."""
+    col = find_column(
+        df,
+        ["dispatcher_id", "Dispatcher ID", "dispatcher", "Dispatcher", "DISPATCHER_ID", "DISPATCHER ID"],
+    )
+    if col is not None:
+        return col
+    for c in df.columns:
+        cl = str(c).lower().strip()
+        if "dispatcher" in cl and "id" in cl:
+            return c
+    return None
+
+
+def filter_sheet_by_date_range(
+    sheet_df: Optional[pd.DataFrame],
+    start_date,
+    end_date,
+    date_column_names: List[str],
+) -> Optional[pd.DataFrame]:
+    """Filter a sheet to the selected period using its configured date column."""
+    if sheet_df is None or sheet_df.empty:
+        return sheet_df
+
+    date_col = find_column(sheet_df, date_column_names)
+    if date_col is None:
+        return sheet_df
+
+    work = sheet_df.copy()
+    parsed = pd.to_datetime(work[date_col], errors="coerce")
+    start_ts = pd.Timestamp(start_date).normalize()
+    end_ts = pd.Timestamp(end_date).normalize() + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
+    return work[(parsed >= start_ts) & (parsed <= end_ts)].copy()
+
+
 def split_route_penalty_pool(pool_total: float, dispatcher_ids) -> Dict[str, float]:
     """Split a currency pool into per-dispatcher shares (2 dp) that sum exactly to *pool_total*.
 
@@ -704,6 +879,49 @@ class PayoutCalculator:
                     return float(special.get("rate", 0)), special.get("description", "Special Rate")
 
         return None, ""
+
+    @staticmethod
+    def count_total_unique_awb(
+        dispatcher_id: str,
+        dispatch_df: pd.DataFrame,
+        pickup_df: Optional[pd.DataFrame] = None,
+        return_df: Optional[pd.DataFrame] = None,
+        dispatch_id_col: Optional[str] = None,
+        dispatch_waybill_col: Optional[str] = None,
+    ) -> int:
+        """Count unique AWBs across Dispatch + Pickup + Return for one dispatcher."""
+        awbs: set = set()
+
+        disp_id_col = dispatch_id_col or find_column(
+            dispatch_df, ["Dispatcher ID", "dispatcher_id", "Dispatcher Id", "DISPATCHER ID"]
+        )
+        disp_wb_col = dispatch_waybill_col or find_waybill_column(dispatch_df)
+        awbs |= unique_waybills_for_dispatcher(dispatch_df, dispatcher_id, disp_id_col, disp_wb_col)
+
+        if pickup_df is not None and not pickup_df.empty:
+            pickup_disp_col = find_pickup_dispatcher_column(pickup_df)
+            pickup_wb_col = find_waybill_column(pickup_df)
+            awbs |= unique_waybills_for_dispatcher(
+                pickup_df, dispatcher_id, pickup_disp_col, pickup_wb_col
+            )
+
+        if return_df is not None and not return_df.empty and not is_return_sheet_dispatch_fallback(return_df):
+            return_disp_col = find_column(
+                return_df,
+                ["dispatcher_id", "Dispatcher ID", "dispatcher", "Dispatcher", "DISPATCHER_ID", "DISPATCHER ID"],
+            )
+            if return_disp_col is None:
+                for col in return_df.columns:
+                    col_lower = str(col).lower().strip()
+                    if "dispatcher" in col_lower and "id" in col_lower:
+                        return_disp_col = col
+                        break
+            return_wb_col = find_waybill_column(return_df)
+            awbs |= unique_waybills_for_dispatcher(
+                return_df, dispatcher_id, return_disp_col, return_wb_col
+            )
+
+        return len(awbs)
 
     @staticmethod
     def calculate_penalty(dispatcher_id: str,
@@ -1680,10 +1898,12 @@ class PayoutCalculator:
                               return_df: Optional[pd.DataFrame] = None,
                               route_penalty_per_dispatcher: float = 0.0,
                               route_penalty_dispatcher_count: int = 0,
-                              route_penalty_pool_total: float = 0.0) -> Tuple:
-        """Calculate payout for tiered daily mode with KPI bonus, attendance bonus, and special rates.
-        Any waybill that appears in the return sheet is excluded from dispatch so tier calculation
-        uses delivery-only parcels (e.g. dispatch 2059 - return 45 = 2014 for tier).
+                              route_penalty_pool_total: float = 0.0,
+                              pickup_df: Optional[pd.DataFrame] = None) -> Tuple:
+        """Calculate tiered base delivery payout from dispatch sheet rows only.
+
+        Dispatch AWBs that also appear on this dispatcher's Return or Pickup sheet are
+        excluded from tier counting. Pickup and return are paid separately at flat rates.
         """
         tiers = []
         for tier in tiers_config:
@@ -1714,47 +1934,37 @@ class PayoutCalculator:
         if delivery_sig_col is None or waybill_col is None:
             raise ValueError("Required columns (Delivery Signature and Waybill Number) not found in data")
 
-        # Exclude any waybill that appears in the return sheet so tier calc uses delivery-only parcels (e.g. 2059 - 45 = 2014).
-        def _norm_waybill(v):
-            if pd.isna(v):
-                return ""
-            if isinstance(v, (int, float)):
-                try:
-                    if isinstance(v, float) and v == int(v):
-                        return str(int(v))
-                    if isinstance(v, float):
-                        if v == int(v):
-                            return str(int(v))
-                        return str(v).strip()
-                    return str(int(v))
-                except (ValueError, OverflowError):
-                    return str(v).strip()
-            s = str(v).strip()
-            if not s or s.lower() in ("nan", "none", "null", ""):
-                return ""
-            if s.endswith(".0") and s[:-2].isdigit():
-                s = s[:-2]
-            if "e" in s.lower():
-                try:
-                    f = float(s)
-                    if f == int(f):
-                        return str(int(f))
-                    return str(f).strip()
-                except (ValueError, OverflowError):
-                    pass
-            return s
+        dispatcher_id = None
+        if dispatcher_id_col and dispatcher_id_col in filtered_df.columns and len(filtered_df) > 0:
+            dispatcher_id = str(filtered_df[dispatcher_id_col].iloc[0]).strip()
 
-        return_waybills = set()
-        if return_df is not None and not return_df.empty and waybill_col is not None:
-            return_wb_col = find_column(return_df, ["Waybill Number", "waybill_number", "Waybill", "waybill"])
-            if return_wb_col is not None:
-                for x in return_df[return_wb_col].dropna().unique():
-                    n = _norm_waybill(x)
-                    if n:
-                        return_waybills.add(n)
+        # Tier base rate uses dispatch rows only, minus this dispatcher's return/pickup AWBs.
+        return_waybills: set = set()
+        if (
+            dispatcher_id
+            and return_df is not None
+            and not return_df.empty
+            and not is_return_sheet_dispatch_fallback(return_df)
+        ):
+            return_disp_col = find_return_dispatcher_column(return_df)
+            return_wb_col = find_waybill_column(return_df)
+            return_waybills = unique_waybills_for_dispatcher(
+                return_df, dispatcher_id, return_disp_col, return_wb_col
+            )
         if return_waybills:
-            dispatch_norm = work[waybill_col].apply(_norm_waybill)
+            dispatch_norm = work[waybill_col].apply(normalize_waybill)
             work = work.loc[~dispatch_norm.isin(return_waybills)].copy()
+
+        pickup_waybills: set = set()
+        if dispatcher_id and pickup_df is not None and not pickup_df.empty:
+            pickup_disp_col = find_pickup_dispatcher_column(pickup_df)
+            pickup_wb_col = find_waybill_column(pickup_df)
+            pickup_waybills = unique_waybills_for_dispatcher(
+                pickup_df, dispatcher_id, pickup_disp_col, pickup_wb_col
+            )
+        if pickup_waybills:
+            dispatch_norm = work[waybill_col].apply(normalize_waybill)
+            work = work.loc[~dispatch_norm.isin(pickup_waybills)].copy()
 
         # Convert dates - but DON'T drop records with invalid dates
         # Use errors="coerce" to convert invalid dates to NaT, but keep the records
@@ -1982,8 +2192,13 @@ class PayoutCalculator:
 
             # Do not add back waybills that are in the return sheet (keep Total Delivery Parcels excluding returns).
             if not missing_records_all.empty and return_waybills:
-                norm_missing = missing_records_all[waybill_col].apply(_norm_waybill)
+                norm_missing = missing_records_all[waybill_col].apply(normalize_waybill)
                 missing_records_all = missing_records_all.loc[~norm_missing.isin(return_waybills)].copy()
+
+            # Do not add back waybills that are in the pickup sheet (counted as pickup, not delivery).
+            if not missing_records_all.empty and pickup_waybills:
+                norm_missing = missing_records_all[waybill_col].apply(normalize_waybill)
+                missing_records_all = missing_records_all.loc[~norm_missing.isin(pickup_waybills)].copy()
 
             if not missing_records_all.empty:
                 # Convert waybill - use direct string conversion to ensure it's never None
@@ -2943,7 +3158,8 @@ def main():
     st.set_page_config(
         page_title="JMR Dispatcher Payout System",
         page_icon="🚚",
-        layout="wide"
+        layout="wide",
+        initial_sidebar_state="collapsed",
     )
     apply_custom_styles()
     st.markdown(f"""
@@ -3005,44 +3221,52 @@ def main():
     # Convert Delivery Signature to datetime
     df[delivery_sig_col] = pd.to_datetime(df[delivery_sig_col], errors="coerce")
 
-    # Get date range from data - use full range automatically
     valid_dates = df[delivery_sig_col].dropna()
     if not valid_dates.empty:
         min_date = valid_dates.min().date()
         max_date = valid_dates.max().date()
-        start_date = min_date
-        end_date = max_date
     else:
-        # Fallback if no valid dates
         today = datetime.now().date()
         min_date = today - pd.Timedelta(days=365)
         max_date = today
-        start_date = min_date
-        end_date = max_date
 
-    # Filter data by date range - but INCLUDE waybills with invalid/missing dates
-    # This ensures ALL waybills are available, even if their dates can't be parsed
-    df["__delivery_date"] = pd.to_datetime(df[delivery_sig_col], errors="coerce").dt.date
-
-    # Include records that:
-    # 1. Have valid dates within the selected range, OR
-    # 2. Have invalid/missing dates (we'll handle these in calculate_tiered_daily)
-    date_mask = (
-        (df["__delivery_date"] >= start_date) & (df["__delivery_date"] <= end_date)
-    ) | (
-        df["__delivery_date"].isna()  # Include records with invalid/missing dates
+    default_start = max(min_date, max_date.replace(day=1))
+    st.sidebar.header("📅 Date Range")
+    st.sidebar.caption(f"Data available: {min_date.strftime('%d %b %Y')} – {max_date.strftime('%d %b %Y')}")
+    selected_range = st.sidebar.date_input(
+        "Select period",
+        value=(default_start, max_date),
+        min_value=min_date,
+        max_value=max_date,
+        help="Dispatch (Delivery Signature), pickup/QR (date_pick_up), and return (Delivery Signature).",
     )
-    df = df[date_mask].copy()
 
-    # Drop the temporary column
+    if isinstance(selected_range, tuple) and len(selected_range) == 2:
+        start_date, end_date = selected_range
+    else:
+        start_date = end_date = selected_range
+
+    if start_date > end_date:
+        start_date, end_date = end_date, start_date
+
+    df["__delivery_date"] = pd.to_datetime(df[delivery_sig_col], errors="coerce").dt.date
+    df = df[
+        (df["__delivery_date"] >= start_date) & (df["__delivery_date"] <= end_date)
+    ].copy()
     df = df.drop(columns=["__delivery_date"], errors="ignore")
 
     if df.empty:
-        st.warning(f"No records found in the data.")
+        st.warning(
+            f"No dispatch records found between {start_date.strftime('%B %d, %Y')} "
+            f"and {end_date.strftime('%B %d, %Y')}."
+        )
         add_footer()
         return
 
-    st.caption(f"Showing all deliveries from {start_date.strftime('%B %d, %Y')} to {end_date.strftime('%B %d, %Y')}.")
+    st.caption(
+        f"Showing deliveries from {start_date.strftime('%B %d, %Y')} "
+        f"to {end_date.strftime('%B %d, %Y')}."
+    )
 
     st.subheader("👤 Dispatcher Selection")
     dispatcher_mapping = {}
@@ -3100,6 +3324,15 @@ def main():
     pickup_df = DataSource.load_pickup_data(config)
     qr_order_df = DataSource.load_qr_order_data(config)
     return_df = DataSource.load_return_data(config)
+    pickup_df = filter_sheet_by_date_range(
+        pickup_df, start_date, end_date, ["date_pick_up", "Date Pick Up", "date pick up"]
+    )
+    return_df = filter_sheet_by_date_range(
+        return_df, start_date, end_date, ["Delivery Signature", "delivery_signature"]
+    )
+    qr_order_df = filter_sheet_by_date_range(
+        qr_order_df, start_date, end_date, ["date_pick_up", "Date Pick Up", "date pick up"]
+    )
     attendance_df = DataSource.load_attendance_data(config)
     duitnow_df = DataSource.load_duitnow_penalty_data(config)
     ldr_df = DataSource.load_ldr_penalty_data(config)
@@ -3225,6 +3458,7 @@ def main():
                 route_penalty_per_dispatcher=route_penalty_per_dispatcher,
                 route_penalty_dispatcher_count=route_penalty_dispatcher_count,
                 route_penalty_pool_total=route_penalty_total,
+                pickup_df=pickup_df,
             )
 
             # Calculate pickup payout (assuming RM1.00 per pickup parcel)
@@ -3253,20 +3487,30 @@ def main():
             # Calculate final payout - round to 2 decimal places
             final_payout = round(gross_total_payout - advance_payout, 2)
 
-            # Total AWB = row count from dispatch sheet only; do not exclude return waybills.
-            total_awb = len(dispatcher_df)
+            # Total AWB = unique AWBs across Dispatch + Pickup + Return (no double count).
+            total_awb = PayoutCalculator.count_total_unique_awb(
+                selected_dispatcher_id,
+                dispatcher_df,
+                pickup_df=pickup_df,
+                return_df=return_df,
+                dispatch_id_col=dispatcher_id_col,
+                dispatch_waybill_col=waybill_col,
+            )
             row1_col1, row1_col2, row1_col3 = st.columns(3)
             with row1_col1:
                 st.metric(
                     "Total AWB",
                     f"{total_awb:,}",
-                    help="From dispatch sheet only; all waybills included (returns not excluded)"
+                    help=(
+                        "Unique AWBs across Dispatch, Pickup, and Return for this dispatcher. "
+                        "Each AWB is counted once even if it appears on multiple sheets."
+                    )
                 )
             with row1_col2:
                 st.metric(
                     "Total Delivery Parcels",
                     f"{display_df['Total Parcel'].sum():,}",
-                    help="Total parcels delivered in the month (excl. returns)"
+                    help="Dispatch parcels for tier base rate (excludes return and pickup AWBs; flat rates apply separately)"
                 )
             with row1_col3:
                 st.metric(
@@ -3772,7 +4016,7 @@ def main():
                 return_count=return_count,
                 kpi_description=kpi_description,
                 attendance_description=attendance_desc,
-                total_awb=len(dispatcher_df)
+                total_awb=total_awb
             )
 
             # Display invoice
@@ -3817,7 +4061,7 @@ Period: {period_display}
 
 SUMMARY
 -------
-Total AWB: {len(dispatcher_df):,}
+Total AWB: {total_awb:,}
 Total Delivery Parcels: {display_df['Total Parcel'].sum():,}
 Working Days: {len(display_df)}
 Pickup Parcels: {pickup_parcels:,}

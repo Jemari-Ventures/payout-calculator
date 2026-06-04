@@ -209,6 +209,101 @@ def normalize_dispatcher_id(value) -> str:
     return text
 
 
+def normalize_waybill(value) -> str:
+    """Normalize a waybill/AWB value for consistent comparison across sheets."""
+    if pd.isna(value):
+        return ""
+    if isinstance(value, (int, float)):
+        try:
+            if isinstance(value, float) and value == int(value):
+                return str(int(value))
+            if isinstance(value, float):
+                if value == int(value):
+                    return str(int(value))
+                return str(value).strip()
+            return str(int(value))
+        except (ValueError, OverflowError):
+            return str(value).strip()
+    s = str(value).strip()
+    if not s or s.lower() in ("nan", "none", "null", ""):
+        return ""
+    if s.endswith(".0") and s[:-2].isdigit():
+        s = s[:-2]
+    if "e" in s.lower():
+        try:
+            f = float(s)
+            if f == int(f):
+                return str(int(f))
+            return str(f).strip()
+        except (ValueError, OverflowError):
+            pass
+    return s
+
+
+def find_waybill_column(df: pd.DataFrame) -> Optional[str]:
+    """Find waybill/AWB column using common header names."""
+    for col in df.columns:
+        c = str(col).strip()
+        c_lower = c.lower()
+        if c in ("Waybill Number", "waybill_number", "Waybill", "waybill", "Waybill No", "AWB", "No. AWB"):
+            return col
+        if "waybill" in c_lower or "awb" in c_lower:
+            return col
+    return None
+
+
+def find_pickup_dispatcher_column(df: pd.DataFrame) -> Optional[str]:
+    """Find pickup dispatcher ID column."""
+    for col in df.columns:
+        c = str(col).strip()
+        c_lower = c.lower()
+        if c in ("Pick Up Dispatcher ID", "Pickup Dispatcher ID", "pickup_dispatcher_id", "Dispatcher ID"):
+            return col
+        if "pickup" in c_lower and "dispatcher" in c_lower:
+            return col
+    return None
+
+
+def is_return_sheet_dispatch_fallback(return_df: pd.DataFrame) -> bool:
+    """True when Return sheet data is actually Dispatch fallback content."""
+    if return_df is None or return_df.empty:
+        return False
+    return_cols_lower = {str(c).strip().lower() for c in return_df.columns}
+    has_dispatch_signature = (
+        "delivery signature" in return_cols_lower
+        and ("waybill number" in return_cols_lower or "waybill" in return_cols_lower)
+        and ("dispatcher id" in return_cols_lower or "dispatcher_id" in return_cols_lower)
+    )
+    has_return_markers = any("return" in col for col in return_cols_lower)
+    return has_dispatch_signature and not has_return_markers
+
+
+def build_unique_awb_map(
+    df: Optional[pd.DataFrame],
+    dispatcher_col: Optional[str],
+    waybill_col: Optional[str],
+) -> Dict[str, set]:
+    """Map dispatcher ID -> set of normalized waybills for batch summaries."""
+    if (
+        df is None
+        or df.empty
+        or not dispatcher_col
+        or not waybill_col
+        or dispatcher_col not in df.columns
+        or waybill_col not in df.columns
+    ):
+        return {}
+
+    work = df[[dispatcher_col, waybill_col]].copy()
+    work["_key"] = work[dispatcher_col].astype(str).str.strip()
+    work["_wb"] = work[waybill_col].apply(normalize_waybill)
+    work = work[(work["_key"] != "") & (work["_wb"] != "")]
+    if work.empty:
+        return {}
+
+    return work.groupby("_key")["_wb"].apply(lambda values: set(values.tolist())).to_dict()
+
+
 def penalty_cell_to_decimal(value) -> Decimal:
     """Parse penalty/COD amount cells; blanks, placeholders, and bad text → 0 (no crash)."""
     if value is None:
@@ -2370,7 +2465,7 @@ class PayoutCalculator:
                     pass
             return s
 
-        # Total AWB = raw dispatch count per dispatcher (do not minus return); compute before filtering.
+        # Total AWB unique maps are built from raw dispatch (before return filtering).
         dispatch_disp_col = None
         for c in ('Dispatcher ID', 'dispatcher_id', 'Dispatcher Id'):
             if c in df.columns:
@@ -2381,9 +2476,18 @@ class PayoutCalculator:
                 if 'dispatcher' in str(col).lower() and 'id' in str(col).lower():
                     dispatch_disp_col = col
                     break
-        total_awb_df = None
-        if dispatch_disp_col is not None:
-            total_awb_df = df.groupby(dispatch_disp_col).size().reset_index(name='total_awb')
+
+        raw_dispatch_df = df.copy()
+        dispatch_wb_col_for_awb = None
+        for c in ("Waybill Number", "waybill_number", "waybill", "Waybill"):
+            if c in raw_dispatch_df.columns:
+                dispatch_wb_col_for_awb = c
+                break
+        if dispatch_wb_col_for_awb is None:
+            dispatch_wb_col_for_awb = find_waybill_column(raw_dispatch_df)
+        dispatch_awb_map = build_unique_awb_map(
+            raw_dispatch_df, dispatch_disp_col, dispatch_wb_col_for_awb
+        )
 
         # Exclude return waybills from dispatch *before* any processing so "Parcels Delivered" and tier calc are delivery-only.
         if return_df is not None and not return_df.empty:
@@ -2640,16 +2744,40 @@ class PayoutCalculator:
             - grouped['rental']
         )
 
-        # Add Total AWB (raw dispatch count, not minus return)
-        if total_awb_df is not None and dispatch_disp_col is not None:
-            grouped = grouped.merge(
-                total_awb_df.rename(columns={dispatch_disp_col: 'dispatcher_id'}),
-                on='dispatcher_id',
-                how='left'
+        # Total AWB = unique AWBs across Dispatch + Pickup + Return per dispatcher (no double count).
+        pickup_awb_map: Dict[str, set] = {}
+        if pickup_df is not None and not pickup_df.empty:
+            pickup_disp_col = find_pickup_dispatcher_column(pickup_df)
+            pickup_wb_col = find_waybill_column(pickup_df)
+            pickup_awb_map = build_unique_awb_map(pickup_df, pickup_disp_col, pickup_wb_col)
+
+        return_awb_map: Dict[str, set] = {}
+        if return_df is not None and not return_df.empty and not is_return_sheet_dispatch_fallback(return_df):
+            return_disp_col = None
+            for col in return_df.columns:
+                c_lower = str(col).strip().lower()
+                if c_lower == "dispatcher_id" or str(col).strip() == "Dispatcher ID":
+                    return_disp_col = col
+                    break
+                if "dispatcher" in c_lower and "id" in c_lower:
+                    return_disp_col = col
+                    break
+            return_wb_col = find_waybill_column(return_df)
+            return_awb_map = build_unique_awb_map(return_df, return_disp_col, return_wb_col)
+
+        total_awb_map: Dict[str, int] = {}
+        all_dispatcher_keys = set(dispatch_awb_map) | set(pickup_awb_map) | set(return_awb_map)
+        for dispatcher_key in all_dispatcher_keys:
+            awbs = (
+                dispatch_awb_map.get(dispatcher_key, set())
+                | pickup_awb_map.get(dispatcher_key, set())
+                | return_awb_map.get(dispatcher_key, set())
             )
-            grouped['total_awb'] = grouped['total_awb'].fillna(0).astype(int)
-        else:
-            grouped['total_awb'] = grouped['parcel_count'].astype(int)
+            total_awb_map[dispatcher_key] = len(awbs)
+
+        grouped['total_awb'] = grouped['dispatcher_id'].astype(str).str.strip().map(
+            lambda dispatcher_key: total_awb_map.get(dispatcher_key, 0)
+        ).fillna(0).astype(int)
 
         # Create display and numeric dataframes
         numeric_df = grouped.rename(columns={
@@ -4156,7 +4284,14 @@ def main():
         with row1_col1:
             st.metric("Dispatchers", f"{len(display_df):,}")
         with row1_col2:
-            st.metric("Total AWB", f"{total_awb:,}")
+            st.metric(
+                "Total AWB",
+                f"{total_awb:,}",
+                help=(
+                    "Unique AWBs across Dispatch, Pickup, and Return per dispatcher. "
+                    "Each AWB is counted once even if it appears on multiple sheets."
+                ),
+            )
         with row1_col3:
             st.metric("Delivery Parcels", f"{int(numeric_df['Parcels Delivered'].sum()):,}")
         with row1_col4:
