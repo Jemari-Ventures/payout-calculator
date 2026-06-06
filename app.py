@@ -88,7 +88,17 @@ class Config:
             "enabled": True,
             "percentage": 40.0,
             "description": "Advance Payout (40% of Base Delivery)"
-        }
+        },
+        "designated_driver": {
+            "dispatcher_id": "",
+            "basic_amount": 1700.0,
+            "basic_parcels": 700,
+            "rate_after_basic": 1.0,
+            "kpi_incentives": [
+                {"parcels": 3500, "bonus": 100.0, "description": "3500 Parcel/month"},
+                {"parcels": 4500, "bonus": 150.0, "description": "4500 Parcel/month"},
+            ],
+        },
     }
 
     @classmethod
@@ -107,6 +117,8 @@ class Config:
                         config["attendance_incentive"] = cls.DEFAULT_CONFIG["attendance_incentive"]
                     if "advance_payout" not in config:
                         config["advance_payout"] = cls.DEFAULT_CONFIG["advance_payout"]
+                    if "designated_driver" not in config:
+                        config["designated_driver"] = cls.DEFAULT_CONFIG["designated_driver"]
                     return config
             except Exception as e:
                 st.error(f"Error loading config: {e}")
@@ -834,6 +846,121 @@ class PayoutCalculator:
                 return round(float(bonus), 2), description
 
         return 0.0, "No KPI achieved"
+
+    @staticmethod
+    def get_designated_driver_ids(config: dict) -> set:
+        """Return configured designated-driver dispatcher IDs (empty if none)."""
+        dd_config = config.get("designated_driver") or {}
+        raw_ids = dd_config.get("dispatcher_ids") or dd_config.get("dispatcher_id")
+        if not raw_ids:
+            return set()
+        if isinstance(raw_ids, str):
+            raw_ids = [raw_ids]
+        return {
+            str(dispatcher_id).strip()
+            for dispatcher_id in raw_ids
+            if dispatcher_id is not None and str(dispatcher_id).strip()
+        }
+
+    @staticmethod
+    def is_designated_driver(dispatcher_id: str, config: dict) -> bool:
+        """Check whether a dispatcher uses designated-driver payout rules."""
+        normalized_id = str(dispatcher_id).strip()
+        return bool(normalized_id) and normalized_id in PayoutCalculator.get_designated_driver_ids(config)
+
+    @staticmethod
+    def calculate_designated_driver_base(
+        total_parcels: int,
+        designated_driver_config: dict,
+    ) -> Tuple[float, int, float]:
+        """Calculate designated-driver base payout and extra-parcel earnings."""
+        basic_amount = float(designated_driver_config.get("basic_amount", 1700.0))
+        basic_parcels = int(designated_driver_config.get("basic_parcels", 700))
+        rate_after_basic = float(designated_driver_config.get("rate_after_basic", 1.0))
+        extra_parcels = max(0, int(total_parcels) - basic_parcels)
+        extra_payout = round(extra_parcels * rate_after_basic, 2)
+        base_payout = round(basic_amount + extra_payout, 2)
+        return base_payout, extra_parcels, rate_after_basic
+
+    @staticmethod
+    def build_designated_driver_breakdown(
+        per_day_df: pd.DataFrame,
+        designated_driver_config: dict,
+        total_parcels: int,
+        base_payout: float,
+    ) -> dict:
+        """Build invoice breakdown for designated-driver base delivery payout."""
+        basic_amount = float(designated_driver_config.get("basic_amount", 1700.0))
+        basic_parcels = int(designated_driver_config.get("basic_parcels", 700))
+        rate_after_basic = float(designated_driver_config.get("rate_after_basic", 1.0))
+        extra_parcels = max(0, int(total_parcels) - basic_parcels)
+
+        if per_day_df is not None and not per_day_df.empty and "special_rate" in per_day_df.columns:
+            special_mask = per_day_df["special_rate"].notna()
+            special_payout = round(float(per_day_df.loc[special_mask, "payout_per_day"].sum()), 2)
+            extra_payout = round(float(per_day_df.loc[~special_mask, "payout_per_day"].sum()), 2)
+        else:
+            special_payout = 0.0
+            extra_payout = round(max(0.0, float(base_payout) - basic_amount), 2)
+
+        return {
+            "basic_amount": basic_amount,
+            "basic_parcels": basic_parcels,
+            "rate_after_basic": rate_after_basic,
+            "extra_parcels": extra_parcels,
+            "extra_payout": extra_payout,
+            "special_payout": special_payout,
+        }
+
+    @staticmethod
+    def apply_designated_driver_daily_payout(
+        per_day: pd.DataFrame,
+        designated_driver_config: dict,
+        special_rates_config: Optional[List] = None,
+    ) -> pd.DataFrame:
+        """Annotate per-day rows for designated-driver display and charts."""
+        basic_parcels = int(designated_driver_config.get("basic_parcels", 700))
+        rate_after_basic = float(designated_driver_config.get("rate_after_basic", 1.0))
+        per_day = per_day.sort_values("__date").copy()
+        cumulative_parcels = 0
+        payout_per_day = []
+        rate_per_parcel = []
+        tiers = []
+        special_rates = []
+        special_descs = []
+
+        for _, row in per_day.iterrows():
+            daily_parcels = int(row["daily_parcels"])
+            day_date = row["__date"]
+            previous_total = cumulative_parcels
+            cumulative_parcels += daily_parcels
+
+            special_rate, special_desc = PayoutCalculator.get_special_rate(
+                day_date, daily_parcels, special_rates_config or []
+            )
+
+            if special_rate is not None:
+                day_payout = round(daily_parcels * float(special_rate), 2)
+                payout_per_day.append(day_payout)
+                rate_per_parcel.append(float(special_rate))
+                tiers.append(special_desc or "Special Rate")
+                special_rates.append(float(special_rate))
+                special_descs.append(special_desc or "")
+            else:
+                extra_on_day = max(0, cumulative_parcels - max(previous_total, basic_parcels))
+                payout_per_day.append(round(extra_on_day * rate_after_basic, 2))
+                rate_per_parcel.append(rate_after_basic if extra_on_day > 0 else 0.0)
+                tiers.append("Designated Driver")
+                special_rates.append(pd.NA)
+                special_descs.append("")
+
+        per_day["tier"] = tiers
+        per_day["base_rate"] = rate_after_basic
+        per_day["special_rate"] = special_rates
+        per_day["special_desc"] = special_descs
+        per_day["rate_per_parcel"] = rate_per_parcel
+        per_day["payout_per_day"] = payout_per_day
+        return per_day
 
     @staticmethod
     def calculate_attendance_bonus(per_day_df: pd.DataFrame, attendance_config: dict) -> Tuple[float, str, int]:
@@ -1899,7 +2026,8 @@ class PayoutCalculator:
                               route_penalty_per_dispatcher: float = 0.0,
                               route_penalty_dispatcher_count: int = 0,
                               route_penalty_pool_total: float = 0.0,
-                              pickup_df: Optional[pd.DataFrame] = None) -> Tuple:
+                              pickup_df: Optional[pd.DataFrame] = None,
+                              designated_driver_config: Optional[dict] = None) -> Tuple:
         """Calculate tiered base delivery payout from dispatch sheet rows only.
 
         Dispatch AWBs that also appear on this dispatcher's Return or Pickup sheet are
@@ -2253,32 +2381,44 @@ class PayoutCalculator:
             .rename(columns={"__waybill": "daily_parcels"})
         )
 
-        per_day[["tier", "base_rate"]] = per_day["daily_parcels"].apply(
-            lambda x: pd.Series(map_rate(float(x)))
-        )
-
-        per_day["special_rate"] = per_day.apply(
-            lambda row: PayoutCalculator.get_special_rate(row["__date"], int(row["daily_parcels"]), special_rates_config)[0],
-            axis=1
-        )
-        per_day["special_desc"] = per_day.apply(
-            lambda row: PayoutCalculator.get_special_rate(row["__date"], int(row["daily_parcels"]), special_rates_config)[1],
-            axis=1
-        )
-        per_day["rate_per_parcel"] = per_day.apply(
-            lambda row: row["special_rate"] if pd.notna(row["special_rate"]) else row["base_rate"],
-            axis=1
-        )
-        per_day["tier"] = per_day.apply(
-            lambda row: row["special_desc"] if pd.notna(row["special_rate"]) else row["tier"],
-            axis=1
-        )
-
-        per_day["payout_per_day"] = per_day["daily_parcels"] * per_day["rate_per_parcel"]
-        base_payout = round(float(per_day["payout_per_day"].sum()), 2)
-
         total_parcels = int(per_day["daily_parcels"].sum())
-        kpi_bonus, kpi_description = PayoutCalculator.calculate_kpi_bonus(total_parcels, kpi_config)
+
+        if designated_driver_config:
+            basic_amount = float(designated_driver_config.get("basic_amount", 1700.0))
+            per_day = PayoutCalculator.apply_designated_driver_daily_payout(
+                per_day, designated_driver_config, special_rates_config
+            )
+            variable_payout = round(float(per_day["payout_per_day"].sum()), 2)
+            base_payout = round(basic_amount + variable_payout, 2)
+            dd_kpi_config = designated_driver_config.get("kpi_incentives", [])
+            kpi_bonus, kpi_description = PayoutCalculator.calculate_kpi_bonus(
+                total_parcels, dd_kpi_config
+            )
+        else:
+            per_day[["tier", "base_rate"]] = per_day["daily_parcels"].apply(
+                lambda x: pd.Series(map_rate(float(x)))
+            )
+
+            per_day["special_rate"] = per_day.apply(
+                lambda row: PayoutCalculator.get_special_rate(row["__date"], int(row["daily_parcels"]), special_rates_config)[0],
+                axis=1
+            )
+            per_day["special_desc"] = per_day.apply(
+                lambda row: PayoutCalculator.get_special_rate(row["__date"], int(row["daily_parcels"]), special_rates_config)[1],
+                axis=1
+            )
+            per_day["rate_per_parcel"] = per_day.apply(
+                lambda row: row["special_rate"] if pd.notna(row["special_rate"]) else row["base_rate"],
+                axis=1
+            )
+            per_day["tier"] = per_day.apply(
+                lambda row: row["special_desc"] if pd.notna(row["special_rate"]) else row["tier"],
+                axis=1
+            )
+
+            per_day["payout_per_day"] = per_day["daily_parcels"] * per_day["rate_per_parcel"]
+            base_payout = round(float(per_day["payout_per_day"].sum()), 2)
+            kpi_bonus, kpi_description = PayoutCalculator.calculate_kpi_bonus(total_parcels, kpi_config)
 
         attendance_bonus, attendance_desc, qualified_days = PayoutCalculator.calculate_attendance_bonus(
             per_day, attendance_config
@@ -2341,11 +2481,67 @@ class PayoutCalculator:
             "payout_per_day": "Payout",
         })
 
-        display_df["Payout Rate"] = display_df["Payout Rate"].apply(lambda x: f"{currency_symbol}{x:.2f}")
+        display_df["Payout Rate"] = display_df["Payout Rate"].apply(
+            lambda x: "Basic" if designated_driver_config and (x == 0 or x == 0.0) else f"{currency_symbol}{x:.2f}"
+        )
         display_df["Payout"] = display_df["Payout"].apply(lambda x: f"{currency_symbol}{x:.2f}")
 
         return (display_df, base_payout, gross_payout, kpi_bonus, kpi_description, attendance_bonus,
                 attendance_desc, qualified_days, per_day, penalty_breakdown)
+
+    @staticmethod
+    def calculate_designated_driver(
+        filtered_df: pd.DataFrame,
+        designated_driver_config: dict,
+        attendance_config: dict,
+        currency_symbol: str,
+        duitnow_df: Optional[pd.DataFrame] = None,
+        ldr_df: Optional[pd.DataFrame] = None,
+        fake_df: Optional[pd.DataFrame] = None,
+        cod_df: Optional[pd.DataFrame] = None,
+        binding_df: Optional[pd.DataFrame] = None,
+        pending_parcel_df: Optional[pd.DataFrame] = None,
+        parcel_lost_df: Optional[pd.DataFrame] = None,
+        attendance_df: Optional[pd.DataFrame] = None,
+        fake_attempt_penalty_per_parcel: float = 2.0,
+        pending_parcel_penalty_per_parcel: float = 2.0,
+        return_df: Optional[pd.DataFrame] = None,
+        route_penalty_per_dispatcher: float = 0.0,
+        route_penalty_dispatcher_count: int = 0,
+        route_penalty_pool_total: float = 0.0,
+        pickup_df: Optional[pd.DataFrame] = None,
+        special_rates_config: Optional[List] = None,
+    ) -> Tuple:
+        """Calculate payout for designated-driver position.
+
+        Basic RM1700 covers the first 700 parcels, then RM1.00 per parcel after that.
+        KPI rewards: RM100 at 3500 parcels/month, RM150 at 4500 parcels/month.
+        Qualifying special-rate days use the configured special rate for all parcels that day.
+        """
+        return PayoutCalculator.calculate_tiered_daily(
+            filtered_df,
+            tiers_config=[],
+            kpi_config=[],
+            special_rates_config=special_rates_config or [],
+            attendance_config=attendance_config,
+            currency_symbol=currency_symbol,
+            duitnow_df=duitnow_df,
+            ldr_df=ldr_df,
+            fake_df=fake_df,
+            cod_df=cod_df,
+            binding_df=binding_df,
+            pending_parcel_df=pending_parcel_df,
+            parcel_lost_df=parcel_lost_df,
+            attendance_df=attendance_df,
+            fake_attempt_penalty_per_parcel=fake_attempt_penalty_per_parcel,
+            pending_parcel_penalty_per_parcel=pending_parcel_penalty_per_parcel,
+            return_df=return_df,
+            route_penalty_per_dispatcher=route_penalty_per_dispatcher,
+            route_penalty_dispatcher_count=route_penalty_dispatcher_count,
+            route_penalty_pool_total=route_penalty_pool_total,
+            pickup_df=pickup_df,
+            designated_driver_config=designated_driver_config,
+        )
 
 
 # =============================================================================
@@ -2457,7 +2653,8 @@ class InvoiceGenerator:
         return_count: int = 0,
         kpi_description: str = "",
         attendance_description: str = "",
-        total_awb: int = 0
+        total_awb: int = 0,
+        designated_driver_breakdown: Optional[dict] = None,
     ) -> str:
         total_parcels = df_disp['Total Parcel'].sum() if 'Total Parcel' in df_disp.columns else 0
         total_days = len(df_disp) if 'Date' in df_disp.columns else 0
@@ -2600,6 +2797,11 @@ class InvoiceGenerator:
             .payout-row.penalty-detail-row {{
               font-size: 14px;
               color: var(--error);
+              padding-left: 20px;
+            }}
+            .payout-row.payout-detail-row {{
+              font-size: 14px;
+              color: var(--text-secondary);
               padding-left: 20px;
             }}
             .note {{
@@ -2856,7 +3058,37 @@ class InvoiceGenerator:
                 <div class="payout-row">
                     <span>Base Delivery Payout:</span>
                     <span>{currency_symbol} {base_payout:,.2f}</span>
-                </div>
+                </div>"""
+
+        if designated_driver_breakdown:
+            dd_basic_amount = designated_driver_breakdown.get("basic_amount", 0.0)
+            dd_basic_parcels = designated_driver_breakdown.get("basic_parcels", 0)
+            dd_rate_after_basic = designated_driver_breakdown.get("rate_after_basic", 0.0)
+            dd_extra_parcels = designated_driver_breakdown.get("extra_parcels", 0)
+            dd_extra_payout = designated_driver_breakdown.get("extra_payout", 0.0)
+            dd_special_payout = designated_driver_breakdown.get("special_payout", 0.0)
+
+            html_content += f"""
+                <div class="payout-row payout-detail-row">
+                    <span>↳ Basic Amount (first {dd_basic_parcels:,} parcels):</span>
+                    <span>{currency_symbol} {dd_basic_amount:,.2f}</span>
+                </div>"""
+
+            if dd_extra_payout > 0:
+                html_content += f"""
+                <div class="payout-row payout-detail-row">
+                    <span>↳ Extra Parcels ({dd_extra_parcels:,} × {currency_symbol}{dd_rate_after_basic:,.2f}):</span>
+                    <span>+ {currency_symbol} {dd_extra_payout:,.2f}</span>
+                </div>"""
+
+            if dd_special_payout > 0:
+                html_content += f"""
+                <div class="payout-row payout-detail-row">
+                    <span>↳ Special Rate Incentive:</span>
+                    <span>+ {currency_symbol} {dd_special_payout:,.2f}</span>
+                </div>"""
+
+        html_content += f"""
                 <div class="payout-row">
                     <span>Pickup Payout ({pickup_parcels} parcel(s) × {currency_symbol}1.00):</span>
                     <span>+ {currency_symbol} {pickup_payout:,.2f}</span>
@@ -3390,6 +3622,21 @@ def main():
     # Calculate payout
     st.subheader(f"💰 Payout Calculation for {selected_dispatcher_name or selected_dispatcher_id}")
 
+    is_designated_driver = PayoutCalculator.is_designated_driver(selected_dispatcher_id, config)
+    designated_driver_config = config.get("designated_driver", {})
+    if is_designated_driver:
+        basic_amount = float(designated_driver_config.get("basic_amount", 1700.0))
+        basic_parcels = int(designated_driver_config.get("basic_parcels", 700))
+        rate_after_basic = float(designated_driver_config.get("rate_after_basic", 1.0))
+        st.info(
+            f"**Designated Driver position:** "
+            f"{config['currency_symbol']}{basic_amount:,.2f} basic for first {basic_parcels:,} parcels, "
+            f"then {config['currency_symbol']}{rate_after_basic:,.2f} per parcel. "
+            f"KPI: {config['currency_symbol']}100 at 3,500 parcels/month, "
+            f"{config['currency_symbol']}150 at 4,500 parcels/month. "
+            f"Special rate incentives from config also apply on qualifying days."
+        )
+
     # Get advance payout configuration
     advance_config = config.get("advance_payout", {"enabled": False, "percentage": 0.0, "description": "Advance Payout"})
     advance_enabled = advance_config.get("enabled", False)
@@ -3428,38 +3675,60 @@ def main():
     pickup_filtered_df = pd.DataFrame()
     qr_order_filtered_df = pd.DataFrame()
     return_filtered_df = pd.DataFrame()
+    designated_driver_breakdown = None
 
     # Create tabs for different views
     tab1, tab2, tab3 = st.tabs(["📊 Payout Details", "📈 Performance Charts", "🧾 Invoice"])
 
     with tab1:
-        # Calculate tiered daily payout
+        # Calculate delivery payout (tiered or designated driver)
         try:
-            (display_df, base_delivery_payout, gross_delivery_payout, kpi_bonus, kpi_description,
-             attendance_bonus, attendance_desc, qualified_days,
-             per_day_df, penalty_breakdown) = PayoutCalculator.calculate_tiered_daily(
-                dispatcher_df,
-                config["tiers"],
-                config.get("kpi_incentives", []),
-                config.get("special_rates", []),
-                config.get("attendance_incentive", {}),
-                config["currency_symbol"],
-                duitnow_df,
-                ldr_df,
-                fake_attempt_df,
-                cod_df,
-                binding_df,
-                pending_parcel_df,
-                parcel_lost_df,
-                attendance_df,
-                config.get("fake_attempt_penalty_per_parcel", 2.0),
-                config.get("pending_parcel_penalty_per_parcel", 2.0),
+            payout_kwargs = dict(
+                filtered_df=dispatcher_df,
+                attendance_config=config.get("attendance_incentive", {}),
+                currency_symbol=config["currency_symbol"],
+                duitnow_df=duitnow_df,
+                ldr_df=ldr_df,
+                fake_df=fake_attempt_df,
+                cod_df=cod_df,
+                binding_df=binding_df,
+                pending_parcel_df=pending_parcel_df,
+                parcel_lost_df=parcel_lost_df,
+                attendance_df=attendance_df,
+                fake_attempt_penalty_per_parcel=config.get("fake_attempt_penalty_per_parcel", 2.0),
+                pending_parcel_penalty_per_parcel=config.get("pending_parcel_penalty_per_parcel", 2.0),
                 return_df=return_df,
                 route_penalty_per_dispatcher=route_penalty_per_dispatcher,
                 route_penalty_dispatcher_count=route_penalty_dispatcher_count,
                 route_penalty_pool_total=route_penalty_total,
                 pickup_df=pickup_df,
+                special_rates_config=config.get("special_rates", []),
             )
+
+            if is_designated_driver:
+                (display_df, base_delivery_payout, gross_delivery_payout, kpi_bonus, kpi_description,
+                 attendance_bonus, attendance_desc, qualified_days,
+                 per_day_df, penalty_breakdown) = PayoutCalculator.calculate_designated_driver(
+                    designated_driver_config=designated_driver_config,
+                    **payout_kwargs,
+                )
+            else:
+                (display_df, base_delivery_payout, gross_delivery_payout, kpi_bonus, kpi_description,
+                 attendance_bonus, attendance_desc, qualified_days,
+                 per_day_df, penalty_breakdown) = PayoutCalculator.calculate_tiered_daily(
+                    tiers_config=config["tiers"],
+                    kpi_config=config.get("kpi_incentives", []),
+                    **payout_kwargs,
+                )
+
+            if is_designated_driver:
+                total_delivery_parcels = int(display_df['Total Parcel'].sum()) if 'Total Parcel' in display_df.columns else 0
+                designated_driver_breakdown = PayoutCalculator.build_designated_driver_breakdown(
+                    per_day_df,
+                    designated_driver_config,
+                    total_delivery_parcels,
+                    base_delivery_payout,
+                )
 
             # Calculate pickup payout (assuming RM1.00 per pickup parcel)
             pickup_parcels, pickup_payout, pickup_filtered_df = PayoutCalculator.calculate_pickup(
@@ -4016,7 +4285,8 @@ def main():
                 return_count=return_count,
                 kpi_description=kpi_description,
                 attendance_description=attendance_desc,
-                total_awb=total_awb
+                total_awb=total_awb,
+                designated_driver_breakdown=designated_driver_breakdown,
             )
 
             # Display invoice
@@ -4052,6 +4322,25 @@ def main():
 
             with col3:
                 # Download summary as text
+                base_delivery_lines = f"Base Delivery Payout: {config['currency_symbol']}{base_delivery_payout:,.2f}\n"
+                if designated_driver_breakdown:
+                    dd = designated_driver_breakdown
+                    base_delivery_lines += (
+                        f"  Basic Amount (first {dd['basic_parcels']:,} parcels): "
+                        f"{config['currency_symbol']}{dd['basic_amount']:,.2f}\n"
+                    )
+                    if dd.get("extra_payout", 0) > 0:
+                        base_delivery_lines += (
+                            f"  Extra Parcels ({dd['extra_parcels']:,} × "
+                            f"{config['currency_symbol']}{dd['rate_after_basic']:,.2f}): "
+                            f"+{config['currency_symbol']}{dd['extra_payout']:,.2f}\n"
+                        )
+                    if dd.get("special_payout", 0) > 0:
+                        base_delivery_lines += (
+                            f"  Special Rate Incentive: "
+                            f"+{config['currency_symbol']}{dd['special_payout']:,.2f}\n"
+                        )
+
                 summary_text = f"""
 INVOICE SUMMARY
 ===============
@@ -4070,8 +4359,7 @@ Return Parcels: {return_count:,}
 
 PAYOUT BREAKDOWN
 ----------------
-Base Delivery Payout: {config['currency_symbol']}{base_delivery_payout:,.2f}
-Pickup Payout: +{config['currency_symbol']}{pickup_payout:,.2f}
+{base_delivery_lines}Pickup Payout: +{config['currency_symbol']}{pickup_payout:,.2f}
 QR Order Payout: +{config['currency_symbol']}{qr_order_payout:,.2f}
 Return Payout: +{config['currency_symbol']}{return_payout:,.2f}
 KPI Bonus: +{config['currency_symbol']}{kpi_bonus:,.2f}

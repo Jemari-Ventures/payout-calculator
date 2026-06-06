@@ -63,7 +63,7 @@
       "start_date": "2026-05-27",
       "end_date": "2026-05-29",
       "rate": 1.15,
-      "description": "Raya Haji Sale Week",
+      "description": "Raya Haji Clearance",
       "min_parcels": 151
     }
   ],
@@ -107,5 +107,23 @@
   "return_payout_per_parcel": 0.5,
   "fake_attempt_penalty_per_parcel": 2.0,
   "pending_parcel_penalty_per_parcel": 2.0,
-  "route_penalty_amount": 0.0
+  "route_penalty_amount": 0.0,
+  "designated_driver": {
+    "dispatcher_id": "PEN3533252",
+    "basic_amount": 1700.0,
+    "basic_parcels": 700,
+    "rate_after_basic": 1.0,
+    "kpi_incentives": [
+      {
+        "parcels": 3500,
+        "bonus": 100.0,
+        "description": "3500 Parcel/month"
+      },
+      {
+        "parcels": 4500,
+        "bonus": 150.0,
+        "description": "4500 Parcel/month"
+      }
+    ]
+  }
 }
