@@ -278,6 +278,67 @@ def is_return_sheet_dispatch_fallback(return_df: pd.DataFrame) -> bool:
     return has_dispatch_signature and not has_return_markers
 
 
+def find_return_dispatcher_column(df: pd.DataFrame) -> Optional[str]:
+    """Find return dispatcher ID column."""
+    for col in df.columns:
+        c_lower = str(col).strip().lower()
+        if c_lower in ("dispatcher_id", "dispatcher id"):
+            return col
+        if "dispatcher" in c_lower and "id" in c_lower:
+            return col
+    return None
+
+
+def find_dispatch_id_column(df: pd.DataFrame) -> Optional[str]:
+    """Find dispatch dispatcher ID column."""
+    for c in ("Dispatcher ID", "dispatcher_id", "Dispatcher Id"):
+        if c in df.columns:
+            return c
+    for col in df.columns:
+        if "dispatcher" in str(col).lower() and "id" in str(col).lower():
+            return col
+    return None
+
+
+def exclude_dispatch_rows_by_dispatcher_sheet(
+    dispatch_df: pd.DataFrame,
+    sheet_df: pd.DataFrame,
+    sheet_dispatcher_col: Optional[str],
+    dispatch_disp_col: Optional[str],
+    dispatch_wb_col: Optional[str],
+) -> pd.DataFrame:
+    """Remove dispatch rows when the same dispatcher's waybill is on pickup/return."""
+    if (
+        dispatch_df is None
+        or dispatch_df.empty
+        or sheet_df is None
+        or sheet_df.empty
+        or not sheet_dispatcher_col
+        or not dispatch_disp_col
+        or not dispatch_wb_col
+        or dispatch_disp_col not in dispatch_df.columns
+        or dispatch_wb_col not in dispatch_df.columns
+    ):
+        return dispatch_df
+
+    sheet_wb_col = find_waybill_column(sheet_df)
+    if not sheet_wb_col:
+        return dispatch_df
+
+    sheet_map = build_unique_awb_map(sheet_df, sheet_dispatcher_col, sheet_wb_col)
+    if not sheet_map:
+        return dispatch_df
+
+    def _is_on_sheet(row) -> bool:
+        disp = normalize_dispatcher_id(row[dispatch_disp_col])
+        wb = normalize_waybill(row[dispatch_wb_col])
+        if not disp or not wb:
+            return False
+        return wb in sheet_map.get(disp, set())
+
+    return dispatch_df.loc[~dispatch_df.apply(_is_on_sheet, axis=1)].copy()
+
+
 def build_unique_awb_map(
     df: Optional[pd.DataFrame],
     dispatcher_col: Optional[str],
@@ -295,7 +356,7 @@ def build_unique_awb_map(
         return {}
 
     work = df[[dispatcher_col, waybill_col]].copy()
-    work["_key"] = work[dispatcher_col].astype(str).str.strip()
+    work["_key"] = work[dispatcher_col].apply(normalize_dispatcher_id)
     work["_wb"] = work[waybill_col].apply(normalize_waybill)
     work = work[(work["_key"] != "") & (work["_wb"] != "")]
     if work.empty:
@@ -2183,11 +2244,12 @@ class PayoutCalculator:
             return dispatcher_summary_df
 
         # Find pickup dispatcher ID column
-        pickup_dispatcher_col = None
-        for col in pickup_df.columns:
-            if 'pickup_dispatcher_id' in col.lower() or 'Pickup Dispatcher ID' in col:
-                pickup_dispatcher_col = col
-                break
+        pickup_dispatcher_col = find_pickup_dispatcher_column(pickup_df)
+        if not pickup_dispatcher_col:
+            for col in pickup_df.columns:
+                if 'pickup_dispatcher_id' in col.lower() or 'Pickup Dispatcher ID' in col:
+                    pickup_dispatcher_col = col
+                    break
 
         if not pickup_dispatcher_col:
             st.warning("⚠️ No pickup dispatcher ID column found in pickup data")
@@ -2196,11 +2258,12 @@ class PayoutCalculator:
             return dispatcher_summary_df
 
         # Find waybill column in pickup data
-        waybill_col = None
-        for col in pickup_df.columns:
-            if 'waybill' in col.lower() or 'Waybill Number' in col:
-                waybill_col = col
-                break
+        waybill_col = find_waybill_column(pickup_df)
+        if not waybill_col:
+            for col in pickup_df.columns:
+                if 'waybill' in col.lower() or 'Waybill Number' in col:
+                    waybill_col = col
+                    break
 
         if not waybill_col:
             st.warning("⚠️ No waybill column found in pickup data")
@@ -2208,30 +2271,76 @@ class PayoutCalculator:
             dispatcher_summary_df['pickup_payout'] = 0.0
             return dispatcher_summary_df
 
-        # Clean pickup dispatcher IDs
-        pickup_df['clean_pickup_dispatcher_id'] = pickup_df[pickup_dispatcher_col].astype(str).str.strip()
+        pickup_work = pickup_df.copy()
+        pickup_work['_dispatcher_key'] = pickup_work[pickup_dispatcher_col].apply(normalize_dispatcher_id)
+        pickup_work = pickup_work[pickup_work['_dispatcher_key'] != '']
 
-        # Group by pickup dispatcher ID to count unique waybills
-        pickup_summary = pickup_df.groupby('clean_pickup_dispatcher_id').agg(
-            pickup_parcels=(waybill_col, 'nunique')
+        # Count pickup rows (each row = one parcel), same as return counting.
+        pickup_summary = pickup_work.groupby('_dispatcher_key').agg(
+            pickup_parcels=(waybill_col, 'size'),
+            dispatcher_id=(pickup_dispatcher_col, 'first'),
         ).reset_index()
-
-        # Calculate pickup payout
         pickup_summary['pickup_payout'] = pickup_summary['pickup_parcels'] * pickup_payout_per_parcel
 
-        # Rename column for merging
-        pickup_summary = pickup_summary.rename(columns={'clean_pickup_dispatcher_id': 'dispatcher_id'})
-
-        # Merge with dispatcher summary
+        dispatcher_summary_df = dispatcher_summary_df.copy()
+        dispatcher_summary_df['_dispatcher_key'] = dispatcher_summary_df['dispatcher_id'].apply(
+            normalize_dispatcher_id
+        )
+        dispatcher_summary_df = dispatcher_summary_df.drop(
+            columns=['pickup_parcels', 'pickup_payout'], errors='ignore'
+        )
         dispatcher_summary_df = dispatcher_summary_df.merge(
-            pickup_summary[['dispatcher_id', 'pickup_parcels', 'pickup_payout']],
-            on='dispatcher_id',
-            how='left'
+            pickup_summary[['_dispatcher_key', 'pickup_parcels', 'pickup_payout']],
+            on='_dispatcher_key',
+            how='left',
         )
 
-        # Fill NaN values
-        dispatcher_summary_df['pickup_parcels'] = dispatcher_summary_df['pickup_parcels'].fillna(0)
-        dispatcher_summary_df['pickup_payout'] = dispatcher_summary_df['pickup_payout'].fillna(0.0)
+        # Include pickup-only dispatchers (no dispatch rows in period).
+        pickup_only = pickup_summary[
+            ~pickup_summary['_dispatcher_key'].isin(dispatcher_summary_df['_dispatcher_key'])
+        ]
+        if not pickup_only.empty:
+            pickup_only_rows = pd.DataFrame({
+                'dispatcher_id': pickup_only['dispatcher_id'].astype(str),
+                '_dispatcher_key': pickup_only['_dispatcher_key'],
+                'dispatcher_name': 'Unknown',
+                'parcel_count': 0,
+                'pickup_parcels': pickup_only['pickup_parcels'].astype(int),
+                'pickup_payout': pickup_only['pickup_payout'].astype(float),
+                'return_parcels': 0,
+                'return_payout': 0.0,
+                'qr_order_count': 0,
+                'qr_order_payout': 0.0,
+                'dispatch_payout': 0.0,
+                'total_payout': 0.0,
+                'penalty_amount': 0.0,
+                'penalty_count': 0,
+                'penalty_waybills': '',
+                'reward': 0.0,
+                'rental': 0.0,
+                'total_weight': 0.0,
+                'avg_weight': 0.0,
+                'avg_rate': 0.0,
+                'tier1_parcels': 0,
+                'tier2_parcels': 0,
+                'tier3_parcels': 0,
+                'tier4_parcels': 0,
+            })
+            for col in dispatcher_summary_df.columns:
+                if col not in pickup_only_rows.columns:
+                    pickup_only_rows[col] = 0 if dispatcher_summary_df[col].dtype != object else ''
+            pickup_only_rows = pickup_only_rows[dispatcher_summary_df.columns]
+            dispatcher_summary_df = pd.concat(
+                [dispatcher_summary_df, pickup_only_rows], ignore_index=True
+            )
+
+        dispatcher_summary_df['pickup_parcels'] = (
+            pd.to_numeric(dispatcher_summary_df['pickup_parcels'], errors='coerce').fillna(0).astype(int)
+        )
+        dispatcher_summary_df['pickup_payout'] = (
+            pd.to_numeric(dispatcher_summary_df['pickup_payout'], errors='coerce').fillna(0.0)
+        )
+        dispatcher_summary_df = dispatcher_summary_df.drop(columns=['_dispatcher_key'], errors='ignore')
 
         return dispatcher_summary_df
 
@@ -2465,58 +2574,22 @@ class PayoutCalculator:
                     pass
             return s
 
-        # Total AWB unique maps are built from raw dispatch (before return filtering).
-        dispatch_disp_col = None
-        for c in ('Dispatcher ID', 'dispatcher_id', 'Dispatcher Id'):
-            if c in df.columns:
-                dispatch_disp_col = c
-                break
-        if dispatch_disp_col is None:
-            for col in df.columns:
-                if 'dispatcher' in str(col).lower() and 'id' in str(col).lower():
-                    dispatch_disp_col = col
-                    break
+        # Exclude return/pickup waybills from dispatch for the same dispatcher
+        # so delivery counts only true deliveries (pickup/return are counted separately).
+        dispatch_disp_col = find_dispatch_id_column(df)
+        dispatch_wb_col = find_waybill_column(df)
 
-        raw_dispatch_df = df.copy()
-        dispatch_wb_col_for_awb = None
-        for c in ("Waybill Number", "waybill_number", "waybill", "Waybill"):
-            if c in raw_dispatch_df.columns:
-                dispatch_wb_col_for_awb = c
-                break
-        if dispatch_wb_col_for_awb is None:
-            dispatch_wb_col_for_awb = find_waybill_column(raw_dispatch_df)
-        dispatch_awb_map = build_unique_awb_map(
-            raw_dispatch_df, dispatch_disp_col, dispatch_wb_col_for_awb
-        )
+        if return_df is not None and not return_df.empty and not is_return_sheet_dispatch_fallback(return_df):
+            return_disp_col = find_return_dispatcher_column(return_df)
+            df = exclude_dispatch_rows_by_dispatcher_sheet(
+                df, return_df, return_disp_col, dispatch_disp_col, dispatch_wb_col
+            )
 
-        # Exclude return waybills from dispatch *before* any processing so "Parcels Delivered" and tier calc are delivery-only.
-        if return_df is not None and not return_df.empty:
-            return_wb_col = None
-            for col in return_df.columns:
-                c = str(col).strip().lower()
-                if 'waybill' in c or col == 'Waybill Number':
-                    return_wb_col = col
-                    break
-            if return_wb_col is not None:
-                return_waybills = set()
-                for x in return_df[return_wb_col].dropna().unique():
-                    n = _norm_waybill(x)
-                    if n:
-                        return_waybills.add(n)
-                if return_waybills:
-                    # Find waybill column in raw dispatch df (before prepare_dataframe renames)
-                    dispatch_wb_col = None
-                    for c in ('Waybill Number', 'waybill_number', 'waybill', 'Waybill'):
-                        if c in df.columns:
-                            dispatch_wb_col = c
-                            break
-                    if dispatch_wb_col is None:
-                        for col in df.columns:
-                            if 'waybill' in str(col).lower():
-                                dispatch_wb_col = col
-                                break
-                    if dispatch_wb_col is not None:
-                        df = df.loc[~df[dispatch_wb_col].apply(_norm_waybill).isin(return_waybills)].copy()
+        if pickup_df is not None and not pickup_df.empty:
+            pickup_disp_col = find_pickup_dispatcher_column(pickup_df)
+            df = exclude_dispatch_rows_by_dispatcher_sheet(
+                df, pickup_df, pickup_disp_col, dispatch_disp_col, dispatch_wb_col
+            )
 
         # Prepare data (now on delivery-only rows)
         df_clean = DataProcessor.prepare_dataframe(df)
@@ -2744,40 +2817,13 @@ class PayoutCalculator:
             - grouped['rental']
         )
 
-        # Total AWB = unique AWBs across Dispatch + Pickup + Return per dispatcher (no double count).
-        pickup_awb_map: Dict[str, set] = {}
-        if pickup_df is not None and not pickup_df.empty:
-            pickup_disp_col = find_pickup_dispatcher_column(pickup_df)
-            pickup_wb_col = find_waybill_column(pickup_df)
-            pickup_awb_map = build_unique_awb_map(pickup_df, pickup_disp_col, pickup_wb_col)
-
-        return_awb_map: Dict[str, set] = {}
-        if return_df is not None and not return_df.empty and not is_return_sheet_dispatch_fallback(return_df):
-            return_disp_col = None
-            for col in return_df.columns:
-                c_lower = str(col).strip().lower()
-                if c_lower == "dispatcher_id" or str(col).strip() == "Dispatcher ID":
-                    return_disp_col = col
-                    break
-                if "dispatcher" in c_lower and "id" in c_lower:
-                    return_disp_col = col
-                    break
-            return_wb_col = find_waybill_column(return_df)
-            return_awb_map = build_unique_awb_map(return_df, return_disp_col, return_wb_col)
-
-        total_awb_map: Dict[str, int] = {}
-        all_dispatcher_keys = set(dispatch_awb_map) | set(pickup_awb_map) | set(return_awb_map)
-        for dispatcher_key in all_dispatcher_keys:
-            awbs = (
-                dispatch_awb_map.get(dispatcher_key, set())
-                | pickup_awb_map.get(dispatcher_key, set())
-                | return_awb_map.get(dispatcher_key, set())
-            )
-            total_awb_map[dispatcher_key] = len(awbs)
-
-        grouped['total_awb'] = grouped['dispatcher_id'].astype(str).str.strip().map(
-            lambda dispatcher_key: total_awb_map.get(dispatcher_key, 0)
-        ).fillna(0).astype(int)
+        # Total AWB = delivery parcels + pickup parcels + return parcels per dispatcher.
+        grouped['pickup_parcels'] = pd.to_numeric(grouped['pickup_parcels'], errors='coerce').fillna(0).astype(int)
+        grouped['return_parcels'] = pd.to_numeric(grouped['return_parcels'], errors='coerce').fillna(0).astype(int)
+        grouped['parcel_count'] = pd.to_numeric(grouped['parcel_count'], errors='coerce').fillna(0).astype(int)
+        grouped['total_awb'] = (
+            grouped['parcel_count'] + grouped['pickup_parcels'] + grouped['return_parcels']
+        )
 
         # Create display and numeric dataframes
         numeric_df = grouped.rename(columns={
@@ -4252,13 +4298,14 @@ def main():
     with tab_overview:
         st.subheader("📈 Performance Overview")
 
-        # Calculate totals
-        total_awb = int(numeric_df["Total AWB"].sum()) if "Total AWB" in numeric_df.columns else 0
+        # Calculate totals — Total AWB must equal delivery + pickup + return.
+        total_delivery_parcels = int(numeric_df["Parcels Delivered"].sum()) if "Parcels Delivered" in numeric_df.columns else 0
         total_pickup_parcels = int(numeric_df["Pickup Parcels"].sum()) if "Pickup Parcels" in numeric_df.columns else 0
+        total_return_parcels = int(numeric_df["Return Parcels"].sum()) if "Return Parcels" in numeric_df.columns else 0
+        total_awb = total_delivery_parcels + total_pickup_parcels + total_return_parcels
         total_pickup_payout = numeric_df["Pickup Parcels Payout"].sum() if "Pickup Parcels Payout" in numeric_df.columns else 0.0
         total_qr_orders = int(numeric_df["QR Orders"].sum()) if "QR Orders" in numeric_df.columns else 0
         total_qr_order_payout = numeric_df["QR Orders Payout"].sum() if "QR Orders Payout" in numeric_df.columns else 0.0
-        total_return_parcels = int(numeric_df["Return Parcels"].sum()) if "Return Parcels" in numeric_df.columns else 0
         total_return_payout = numeric_df["Return Parcels Payout"].sum() if "Return Parcels Payout" in numeric_df.columns else 0.0
         total_dispatch_payout = numeric_df["Delivery Parcels Payout"].sum() if "Delivery Parcels Payout" in numeric_df.columns else 0.0
         total_reward = numeric_df["Reward"].sum() if "Reward" in numeric_df.columns else 0.0
@@ -4288,8 +4335,8 @@ def main():
                 "Total AWB",
                 f"{total_awb:,}",
                 help=(
-                    "Unique AWBs across Dispatch, Pickup, and Return per dispatcher. "
-                    "Each AWB is counted once even if it appears on multiple sheets."
+                    "Total parcels across Delivery, Pickup, and Return per dispatcher "
+                    "(delivery + pickup + return)."
                 ),
             )
         with row1_col3:

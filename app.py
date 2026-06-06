@@ -1008,47 +1008,13 @@ class PayoutCalculator:
         return None, ""
 
     @staticmethod
-    def count_total_unique_awb(
-        dispatcher_id: str,
-        dispatch_df: pd.DataFrame,
-        pickup_df: Optional[pd.DataFrame] = None,
-        return_df: Optional[pd.DataFrame] = None,
-        dispatch_id_col: Optional[str] = None,
-        dispatch_waybill_col: Optional[str] = None,
+    def count_total_awb(
+        delivery_parcels: int,
+        pickup_parcels: int,
+        return_parcels: int,
     ) -> int:
-        """Count unique AWBs across Dispatch + Pickup + Return for one dispatcher."""
-        awbs: set = set()
-
-        disp_id_col = dispatch_id_col or find_column(
-            dispatch_df, ["Dispatcher ID", "dispatcher_id", "Dispatcher Id", "DISPATCHER ID"]
-        )
-        disp_wb_col = dispatch_waybill_col or find_waybill_column(dispatch_df)
-        awbs |= unique_waybills_for_dispatcher(dispatch_df, dispatcher_id, disp_id_col, disp_wb_col)
-
-        if pickup_df is not None and not pickup_df.empty:
-            pickup_disp_col = find_pickup_dispatcher_column(pickup_df)
-            pickup_wb_col = find_waybill_column(pickup_df)
-            awbs |= unique_waybills_for_dispatcher(
-                pickup_df, dispatcher_id, pickup_disp_col, pickup_wb_col
-            )
-
-        if return_df is not None and not return_df.empty and not is_return_sheet_dispatch_fallback(return_df):
-            return_disp_col = find_column(
-                return_df,
-                ["dispatcher_id", "Dispatcher ID", "dispatcher", "Dispatcher", "DISPATCHER_ID", "DISPATCHER ID"],
-            )
-            if return_disp_col is None:
-                for col in return_df.columns:
-                    col_lower = str(col).lower().strip()
-                    if "dispatcher" in col_lower and "id" in col_lower:
-                        return_disp_col = col
-                        break
-            return_wb_col = find_waybill_column(return_df)
-            awbs |= unique_waybills_for_dispatcher(
-                return_df, dispatcher_id, return_disp_col, return_wb_col
-            )
-
-        return len(awbs)
+        """Total AWB = delivery parcels + pickup parcels + return parcels."""
+        return int(delivery_parcels) + int(pickup_parcels) + int(return_parcels)
 
     @staticmethod
     def calculate_penalty(dispatcher_id: str,
@@ -3756,14 +3722,16 @@ def main():
             # Calculate final payout - round to 2 decimal places
             final_payout = round(gross_total_payout - advance_payout, 2)
 
-            # Total AWB = unique AWBs across Dispatch + Pickup + Return (no double count).
-            total_awb = PayoutCalculator.count_total_unique_awb(
-                selected_dispatcher_id,
-                dispatcher_df,
-                pickup_df=pickup_df,
-                return_df=return_df,
-                dispatch_id_col=dispatcher_id_col,
-                dispatch_waybill_col=waybill_col,
+            # Total AWB = delivery parcels + pickup parcels + return parcels.
+            total_delivery_parcels = (
+                int(display_df['Total Parcel'].sum())
+                if 'Total Parcel' in display_df.columns
+                else 0
+            )
+            total_awb = PayoutCalculator.count_total_awb(
+                total_delivery_parcels,
+                pickup_parcels,
+                return_count,
             )
             row1_col1, row1_col2, row1_col3 = st.columns(3)
             with row1_col1:
@@ -3771,8 +3739,8 @@ def main():
                     "Total AWB",
                     f"{total_awb:,}",
                     help=(
-                        "Unique AWBs across Dispatch, Pickup, and Return for this dispatcher. "
-                        "Each AWB is counted once even if it appears on multiple sheets."
+                        "Total parcels across Delivery, Pickup, and Return for this dispatcher "
+                        f"({total_delivery_parcels:,} delivery + {pickup_parcels:,} pickup + {return_count:,} return)."
                     )
                 )
             with row1_col2:
