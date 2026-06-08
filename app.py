@@ -181,6 +181,122 @@ def find_column(df: pd.DataFrame, possible_names: List[str], case_sensitive: boo
     return None
 
 
+def clean_penalty_dispatcher_id(value) -> str:
+    """Normalize dispatcher ID for penalty sheet matching (strip, drop .0 suffix)."""
+    if pd.isna(value):
+        return ""
+    s = str(value).strip()
+    if not s or s.lower() in ("nan", "none", "null"):
+        return ""
+    if re.fullmatch(r".+\.0", s):
+        s = s[:-2]
+    return s.upper()
+
+
+def find_no_outbound_scan_dispatcher_column(df: pd.DataFrame) -> Optional[str]:
+    """Resolve dispatcher column on No Outbound Scan sheet."""
+    col = find_column(
+        df,
+        [
+            "Dispatcher ID",
+            "dispatcher_id",
+            "Dispatcher Id",
+            "DISPATCHER ID",
+            "Operator | Last",
+            "Operator|Last",
+            "operator | last",
+        ],
+    )
+    if col is not None:
+        return col
+    for c in df.columns:
+        cl = str(c).strip().lower()
+        if "operator" in cl and "last" in cl:
+            return c
+        if "dispatcher" in cl and "id" in cl:
+            return c
+    return None
+
+
+def find_penalty_waybill_column(df: pd.DataFrame) -> Optional[str]:
+    """Resolve waybill/AWB column on penalty sheets (Fake Attempt, LD&R, etc.)."""
+    col = find_column(
+        df,
+        [
+            "AWB No.",
+            "AWB No",
+            "AWB NO.",
+            "AWB NO",
+            "Waybill Number",
+            "waybill_number",
+            "Waybill",
+            "waybill",
+            "AWB",
+            "awb_no",
+        ],
+    )
+    if col is not None:
+        return col
+    for c in df.columns:
+        s = str(c).strip().lower().replace(" ", "")
+        if s in ("awbno", "awbno.", "waybillnumber", "waybillno") or s == "awb_no":
+            return c
+    for c in df.columns:
+        s = str(c).strip().lower()
+        if "awb" in s and "no" in s:
+            return c
+        if "waybill" in s:
+            return c
+    return None
+
+
+def find_no_outbound_scan_awb_column(df: pd.DataFrame) -> Optional[str]:
+    """Resolve AWB column on No Outbound Scan sheet."""
+    return find_penalty_waybill_column(df)
+
+
+def extract_waybill_list(series: pd.Series) -> List[str]:
+    """Normalize and dedupe waybill values from a column."""
+    if series is None or series.empty:
+        return []
+    seen = set()
+    result = []
+    for value in series.dropna():
+        wb = normalize_waybill(value)
+        if wb and wb not in seen:
+            seen.add(wb)
+            result.append(wb)
+    return result
+
+
+def format_waybills_display(waybills: List[str], limit: int = 5) -> str:
+    """Format waybills for inline display with optional truncation."""
+    if not waybills:
+        return ""
+    shown = waybills[:limit]
+    text = ", ".join(shown)
+    if len(waybills) > limit:
+        text += f" (+{len(waybills) - limit} more)"
+    return text
+
+
+def dedupe_no_outbound_scan_by_awb(records: pd.DataFrame, source_df: pd.DataFrame) -> pd.DataFrame:
+    """Keep one row per AWB (RM3 per AWB, not per duplicate row)."""
+    if records is None or records.empty:
+        return pd.DataFrame()
+    awb_col = find_no_outbound_scan_awb_column(source_df)
+    if awb_col is None:
+        awb_col = find_no_outbound_scan_awb_column(records)
+    if awb_col is None:
+        return pd.DataFrame()
+    work = records.copy()
+    work["_awb_norm"] = work[awb_col].apply(normalize_waybill)
+    work = work[work["_awb_norm"].astype(str).str.len() > 0]
+    if work.empty:
+        return work
+    return work.drop_duplicates(subset=["_awb_norm"], keep="first")
+
+
 def normalize_waybill(value) -> str:
     """Normalize a waybill/AWB value for consistent comparison across sheets."""
     if pd.isna(value):
@@ -210,6 +326,79 @@ def normalize_waybill(value) -> str:
         except (ValueError, OverflowError):
             pass
     return s
+
+
+DISPATCHER_PREFIXES = ["JMR", "ECP", "AF", "PEN", "KUL", "JHR"]
+
+
+def normalize_dispatcher_id(value) -> str:
+    """Normalize dispatcher/employee ID to a stable comparable token."""
+    if pd.isna(value):
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    text = str(value).strip()
+    if re.fullmatch(r"\d+\.0", text):
+        text = text[:-2]
+    text = re.sub(r"[^A-Za-z0-9]", "", text)
+    text = text.upper()
+    for prefix in DISPATCHER_PREFIXES:
+        if text.startswith(prefix) and text[len(prefix) :].isdigit():
+            text = text[len(prefix) :]
+            break
+    if text.isdigit():
+        text = text.lstrip("0") or "0"
+    return text
+
+
+def find_dispatch_id_column(df: pd.DataFrame) -> Optional[str]:
+    """Find dispatch dispatcher ID column."""
+    col = find_column(df, ["Dispatcher ID", "dispatcher_id", "Dispatcher Id", "DISPATCHER ID"])
+    if col is not None:
+        return col
+    for c in df.columns:
+        if "dispatcher" in str(c).lower() and "id" in str(c).lower():
+            return c
+    return None
+
+
+def exclude_dispatch_rows_by_dispatcher_sheet(
+    dispatch_df: pd.DataFrame,
+    sheet_df: pd.DataFrame,
+    sheet_dispatcher_col: Optional[str],
+    dispatch_disp_col: Optional[str],
+    dispatch_wb_col: Optional[str],
+) -> pd.DataFrame:
+    """Remove dispatch rows when the same dispatcher's waybill is on pickup/return."""
+    if (
+        dispatch_df is None
+        or dispatch_df.empty
+        or sheet_df is None
+        or sheet_df.empty
+        or not sheet_dispatcher_col
+        or not dispatch_disp_col
+        or not dispatch_wb_col
+        or dispatch_disp_col not in dispatch_df.columns
+        or dispatch_wb_col not in dispatch_df.columns
+    ):
+        return dispatch_df
+
+    sheet_wb_col = find_waybill_column(sheet_df)
+    if not sheet_wb_col:
+        return dispatch_df
+
+    sheet_map = build_unique_awb_map(sheet_df, sheet_dispatcher_col, sheet_wb_col)
+    if not sheet_map:
+        return dispatch_df
+
+    def _is_on_sheet(row) -> bool:
+        disp = normalize_dispatcher_id(row[dispatch_disp_col])
+        wb = normalize_waybill(row[dispatch_wb_col])
+        if not disp or not wb:
+            return False
+        return wb in sheet_map.get(disp, set())
+
+    return dispatch_df.loc[~dispatch_df.apply(_is_on_sheet, axis=1)].copy()
 
 
 def find_waybill_column(df: pd.DataFrame) -> Optional[str]:
@@ -281,8 +470,11 @@ def unique_waybills_for_dispatcher(
     ):
         return set()
 
-    dispatcher_id_str = str(dispatcher_id).strip()
-    matched = df[df[dispatcher_col].astype(str).str.strip() == dispatcher_id_str]
+    dispatcher_id_str = normalize_dispatcher_id(dispatcher_id)
+    if not dispatcher_id_str:
+        return set()
+
+    matched = df[df[dispatcher_col].apply(normalize_dispatcher_id) == dispatcher_id_str]
     if matched.empty:
         return set()
 
@@ -311,7 +503,7 @@ def build_unique_awb_map(
         return {}
 
     work = df[[dispatcher_col, waybill_col]].copy()
-    work["_key"] = work[dispatcher_col].astype(str).str.strip()
+    work["_key"] = work[dispatcher_col].apply(normalize_dispatcher_id)
     work["_wb"] = work[waybill_col].apply(normalize_waybill)
     work = work[(work["_key"] != "") & (work["_wb"] != "")]
     if work.empty:
@@ -732,6 +924,23 @@ class DataSource:
         return None
 
     @staticmethod
+    def load_no_outbound_scan_penalty_data(config: dict) -> Optional[pd.DataFrame]:
+        """Load No Outbound Scan penalty (AWB No., Scanning Time | Last, Dispatcher ID). Amount = unique AWB × RM3."""
+        data_source = config["data_source"]
+        if data_source["type"] == "gsheet" and data_source["gsheet_url"]:
+            try:
+                sheet = config.get("data_source", {}).get("excel_sheets", {}).get(
+                    "no_outbound_scan", "No Outbound Scan"
+                )
+                return DataSource._read_optional_sheet_without_dispatch_fallback(
+                    data_source["gsheet_url"], sheet_name=sheet
+                )
+            except Exception as exc:
+                st.warning(f"Could not load No Outbound Scan penalty data: {exc}")
+                return None
+        return None
+
+    @staticmethod
     def load_parcel_lost_penalty_data(config: dict) -> Optional[pd.DataFrame]:
         """Load Parcel Lost penalty (waybill_number, Dispatcher ID, etc.) from config sheet name."""
         data_source = config["data_source"]
@@ -1024,11 +1233,13 @@ class PayoutCalculator:
                          cod_df: Optional[pd.DataFrame] = None,
                          binding_df: Optional[pd.DataFrame] = None,
                          pending_parcel_df: Optional[pd.DataFrame] = None,
+                         no_outbound_scan_df: Optional[pd.DataFrame] = None,
                          parcel_lost_df: Optional[pd.DataFrame] = None,
                          attendance_df: Optional[pd.DataFrame] = None,
                          working_days: Optional[int] = None,
                          fake_attempt_penalty_per_parcel: float = 2.0,
                          pending_parcel_penalty_per_parcel: float = 2.0,
+                         no_outbound_scan_penalty_per_parcel: float = 3.0,
                          route_penalty_per_dispatcher: float = 0.0,
                          route_penalty_dispatcher_count: int = 0,
                          route_penalty_pool_total: float = 0.0) -> Dict:
@@ -1048,12 +1259,13 @@ class PayoutCalculator:
             Dictionary containing penalty breakdown by type
         """
         penalty_breakdown = {
-            'duitnow': {'amount': 0.0, 'waybills': []},
+            'duitnow': {'amount': 0.0, 'count': 0, 'waybills': []},
             'ldr': {'amount': 0.0, 'count': 0, 'waybills': []},
             'fake_attempt': {'amount': 0.0, 'count': 0, 'waybills': []},
             'cod': {'amount': 0.0, 'count': 0},
             'binding': {'amount': 0.0, 'count': 0},
             'pending_parcel': {'amount': 0.0, 'count': 0, 'waybills': []},
+            'no_outbound_scan': {'amount': 0.0, 'count': 0, 'waybills': []},
             'parcel_lost': {'amount': 0.0, 'count': 0, 'waybills': []},
             'route': {'amount': 0.0, 'count': 0, 'pool_total': 0.0},
             'attendance': {'amount': 0.0, 'count': 0},
@@ -1062,7 +1274,7 @@ class PayoutCalculator:
         }
 
         # Normalize dispatcher_id for comparison
-        dispatcher_id_normalized = str(dispatcher_id).strip()
+        dispatcher_id_normalized = clean_penalty_dispatcher_id(dispatcher_id)
 
         # 1. Process DuitNow penalty (Sheet3) - No waybills
         if duitnow_df is not None and not duitnow_df.empty:
@@ -1135,6 +1347,8 @@ class PayoutCalculator:
                         )
                         penalty_amount = penalty_values.sum()
                         penalty_breakdown['duitnow']['amount'] = round(float(penalty_amount), 2)
+                        if penalty_breakdown['duitnow']['amount'] > 0:
+                            penalty_breakdown['duitnow']['count'] = 1
 
         # 2. Process LD&R penalty (Sheet4)
         if ldr_df is not None and not ldr_df.empty:
@@ -1271,47 +1485,42 @@ class PayoutCalculator:
                         break
 
             if disp_id_col is not None:
-                # Normalize both sides for comparison
-                fake_df_copy = fake_df.copy()
-                fake_df_copy[disp_id_col] = fake_df_copy[disp_id_col].astype(str).str.strip()
-                fake_rows = fake_df_copy[
-                    fake_df_copy[disp_id_col] == dispatcher_id_normalized
-                ]
+                fake_copy = fake_df.copy()
+                fake_copy["_fake_disp_key"] = fake_copy[disp_id_col].apply(clean_penalty_dispatcher_id)
+                fake_rows = fake_copy[fake_copy["_fake_disp_key"] == dispatcher_id_normalized]
 
                 if not fake_rows.empty:
-                    # Configurable fake-attempt penalty (default RM2.00 per parcel)
                     penalty_amount = len(fake_rows) * float(fake_attempt_penalty_per_parcel)
                     penalty_breakdown['fake_attempt']['amount'] = round(float(penalty_amount), 2)
                     penalty_breakdown['fake_attempt']['count'] = len(fake_rows)
 
-                    # Get waybill numbers
-                    waybill_col = None
-                    # Try "Waybill Number" pattern first
-                    for col in fake_df.columns:
-                        col_upper = str(col).upper().strip()
-                        if "WAYBILL NUMBER" in col_upper or "WAYBILLNUMBER" in col_upper.replace(" ", ""):
-                            waybill_col = col
-                            break
+                    waybill_col = find_penalty_waybill_column(fake_df)
+                    if waybill_col is not None and waybill_col in fake_rows.columns:
+                        penalty_breakdown['fake_attempt']['waybills'] = extract_waybill_list(
+                            fake_rows[waybill_col]
+                        )
 
-                    # If not found, try pattern with "WAYBILL" and "NUMBER"
-                    if waybill_col is None:
-                        for col in fake_df.columns:
-                            col_upper = str(col).upper().strip()
-                            if "WAYBILL" in col_upper and "NUMBER" in col_upper:
-                                waybill_col = col
-                                break
+        # 3b. Process No Outbound Scan penalty (RM3 per unique AWB — not sum of PENALTY column)
+        if no_outbound_scan_df is not None and not no_outbound_scan_df.empty:
+            nos_disp_col = find_no_outbound_scan_dispatcher_column(no_outbound_scan_df)
+            if nos_disp_col is not None:
+                nos_copy = no_outbound_scan_df.copy()
+                nos_copy["_nos_disp_key"] = nos_copy[nos_disp_col].apply(clean_penalty_dispatcher_id)
+                nos_rows = nos_copy[nos_copy["_nos_disp_key"] == dispatcher_id_normalized]
 
-                    # If not found, try simpler pattern - just "WAYBILL"
-                    if waybill_col is None:
-                        for col in fake_df.columns:
-                            col_upper = str(col).upper().strip()
-                            if "WAYBILL" in col_upper:
-                                waybill_col = col
-                                break
-
-                    if waybill_col is not None:
-                        waybills = fake_rows[waybill_col].dropna().astype(str).str.strip().tolist()
-                        penalty_breakdown['fake_attempt']['waybills'] = [wb for wb in waybills if wb and wb.lower() != 'nan']
+                if not nos_rows.empty:
+                    deduped = dedupe_no_outbound_scan_by_awb(nos_rows, no_outbound_scan_df)
+                    awb_col = find_no_outbound_scan_awb_column(no_outbound_scan_df)
+                    if awb_col is None:
+                        awb_col = find_no_outbound_scan_awb_column(nos_rows)
+                    if not deduped.empty and awb_col is not None and awb_col in deduped.columns:
+                        penalty_breakdown['no_outbound_scan']['waybills'] = extract_waybill_list(
+                            deduped[awb_col]
+                        )
+                    parcel_count = len(deduped)
+                    penalty_amount = parcel_count * float(no_outbound_scan_penalty_per_parcel)
+                    penalty_breakdown['no_outbound_scan']['amount'] = round(float(penalty_amount), 2)
+                    penalty_breakdown['no_outbound_scan']['count'] = int(parcel_count)
 
         # 4. Process COD penalty (COD sheet)
         if cod_df is not None and not cod_df.empty:
@@ -1427,8 +1636,8 @@ class PayoutCalculator:
                                 break
                     if penalty_col is None:
                         for col in binding_df.columns:
-                            col_upper = str(col).upper().strip()
-                            if "PENALTY" in col_upper:
+                            col_lower = str(col).strip().lower()
+                            if "penalty" in col_lower and "sum of" not in col_lower:
                                 penalty_col = col
                                 break
 
@@ -1436,9 +1645,10 @@ class PayoutCalculator:
                         penalty_values = binding_rows[penalty_col].apply(
                             lambda x: PayoutCalculator._convert_to_float(x)
                         )
+                        penalty_values = penalty_values[penalty_values > 0]
                         penalty_amount = penalty_values.sum()
                         penalty_breakdown['binding']['amount'] = round(float(penalty_amount), 2)
-                        penalty_breakdown['binding']['count'] = len(binding_rows)
+                        penalty_breakdown['binding']['count'] = int(len(penalty_values))
 
         # 6. Pending Parcel penalty (sum Amount column by dispatcher)
         if pending_parcel_df is not None and not pending_parcel_df.empty:
@@ -1579,17 +1789,20 @@ class PayoutCalculator:
             penalty_breakdown['cod']['amount'] +
             penalty_breakdown['binding']['amount'] +
             penalty_breakdown['pending_parcel']['amount'] +
+            penalty_breakdown['no_outbound_scan']['amount'] +
             penalty_breakdown['parcel_lost']['amount'] +
             penalty_breakdown['route']['amount'] +
             penalty_breakdown['attendance']['amount'],
             2
         )
         penalty_breakdown['total_count'] = (
+            penalty_breakdown['duitnow']['count'] +
             penalty_breakdown['ldr']['count'] +
             penalty_breakdown['fake_attempt']['count'] +
             penalty_breakdown['cod']['count'] +
             penalty_breakdown['binding']['count'] +
             penalty_breakdown['pending_parcel']['count'] +
+            penalty_breakdown['no_outbound_scan']['count'] +
             penalty_breakdown['parcel_lost']['count'] +
             penalty_breakdown['attendance']['count'] +
             (1 if penalty_breakdown['route']['amount'] > 0 else 0)
@@ -1984,10 +2197,12 @@ class PayoutCalculator:
                               cod_df: Optional[pd.DataFrame] = None,
                               binding_df: Optional[pd.DataFrame] = None,
                               pending_parcel_df: Optional[pd.DataFrame] = None,
+                              no_outbound_scan_df: Optional[pd.DataFrame] = None,
                               parcel_lost_df: Optional[pd.DataFrame] = None,
                               attendance_df: Optional[pd.DataFrame] = None,
                               fake_attempt_penalty_per_parcel: float = 2.0,
                               pending_parcel_penalty_per_parcel: float = 2.0,
+                              no_outbound_scan_penalty_per_parcel: float = 3.0,
                               return_df: Optional[pd.DataFrame] = None,
                               route_penalty_per_dispatcher: float = 0.0,
                               route_penalty_dispatcher_count: int = 0,
@@ -2033,32 +2248,41 @@ class PayoutCalculator:
             dispatcher_id = str(filtered_df[dispatcher_id_col].iloc[0]).strip()
 
         # Tier base rate uses dispatch rows only, minus this dispatcher's return/pickup AWBs.
-        return_waybills: set = set()
         if (
-            dispatcher_id
-            and return_df is not None
+            return_df is not None
             and not return_df.empty
             and not is_return_sheet_dispatch_fallback(return_df)
         ):
             return_disp_col = find_return_dispatcher_column(return_df)
-            return_wb_col = find_waybill_column(return_df)
-            return_waybills = unique_waybills_for_dispatcher(
-                return_df, dispatcher_id, return_disp_col, return_wb_col
+            work = exclude_dispatch_rows_by_dispatcher_sheet(
+                work, return_df, return_disp_col, dispatcher_id_col, waybill_col
             )
-        if return_waybills:
-            dispatch_norm = work[waybill_col].apply(normalize_waybill)
-            work = work.loc[~dispatch_norm.isin(return_waybills)].copy()
 
-        pickup_waybills: set = set()
-        if dispatcher_id and pickup_df is not None and not pickup_df.empty:
+        if pickup_df is not None and not pickup_df.empty:
             pickup_disp_col = find_pickup_dispatcher_column(pickup_df)
-            pickup_wb_col = find_waybill_column(pickup_df)
-            pickup_waybills = unique_waybills_for_dispatcher(
-                pickup_df, dispatcher_id, pickup_disp_col, pickup_wb_col
+            work = exclude_dispatch_rows_by_dispatcher_sheet(
+                work, pickup_df, pickup_disp_col, dispatcher_id_col, waybill_col
             )
-        if pickup_waybills:
-            dispatch_norm = work[waybill_col].apply(normalize_waybill)
-            work = work.loc[~dispatch_norm.isin(pickup_waybills)].copy()
+
+        return_waybills: set = set()
+        pickup_waybills: set = set()
+        if dispatcher_id:
+            if (
+                return_df is not None
+                and not return_df.empty
+                and not is_return_sheet_dispatch_fallback(return_df)
+            ):
+                return_disp_col = find_return_dispatcher_column(return_df)
+                return_wb_col = find_waybill_column(return_df)
+                return_waybills = unique_waybills_for_dispatcher(
+                    return_df, dispatcher_id, return_disp_col, return_wb_col
+                )
+            if pickup_df is not None and not pickup_df.empty:
+                pickup_disp_col = find_pickup_dispatcher_column(pickup_df)
+                pickup_wb_col = find_waybill_column(pickup_df)
+                pickup_waybills = unique_waybills_for_dispatcher(
+                    pickup_df, dispatcher_id, pickup_disp_col, pickup_wb_col
+                )
 
         # Convert dates - but DON'T drop records with invalid dates
         # Use errors="coerce" to convert invalid dates to NaT, but keep the records
@@ -2391,12 +2615,13 @@ class PayoutCalculator:
         )
 
         # Calculate penalty breakdown
-        penalty_breakdown = {'duitnow': {'amount': 0.0, 'waybills': []},
+        penalty_breakdown = {'duitnow': {'amount': 0.0, 'count': 0, 'waybills': []},
                            'ldr': {'amount': 0.0, 'count': 0, 'waybills': []},
                            'fake_attempt': {'amount': 0.0, 'count': 0, 'waybills': []},
                            'cod': {'amount': 0.0, 'count': 0},
                            'binding': {'amount': 0.0, 'count': 0},
                            'pending_parcel': {'amount': 0.0, 'count': 0, 'waybills': []},
+                           'no_outbound_scan': {'amount': 0.0, 'count': 0, 'waybills': []},
                            'parcel_lost': {'amount': 0.0, 'count': 0, 'waybills': []},
                            'route': {'amount': 0.0, 'count': 0, 'pool_total': 0.0},
                            'attendance': {'amount': 0.0, 'count': 0},
@@ -2422,11 +2647,13 @@ class PayoutCalculator:
                 cod_df,
                 binding_df,
                 pending_parcel_df,
+                no_outbound_scan_df,
                 parcel_lost_df,
                 attendance_df,
                 working_days,
                 fake_attempt_penalty_per_parcel,
                 pending_parcel_penalty_per_parcel,
+                no_outbound_scan_penalty_per_parcel,
                 route_penalty_per_dispatcher,
                 route_penalty_dispatcher_count,
                 route_penalty_pool_total,
@@ -2467,10 +2694,12 @@ class PayoutCalculator:
         cod_df: Optional[pd.DataFrame] = None,
         binding_df: Optional[pd.DataFrame] = None,
         pending_parcel_df: Optional[pd.DataFrame] = None,
+        no_outbound_scan_df: Optional[pd.DataFrame] = None,
         parcel_lost_df: Optional[pd.DataFrame] = None,
         attendance_df: Optional[pd.DataFrame] = None,
         fake_attempt_penalty_per_parcel: float = 2.0,
         pending_parcel_penalty_per_parcel: float = 2.0,
+        no_outbound_scan_penalty_per_parcel: float = 3.0,
         return_df: Optional[pd.DataFrame] = None,
         route_penalty_per_dispatcher: float = 0.0,
         route_penalty_dispatcher_count: int = 0,
@@ -2497,10 +2726,12 @@ class PayoutCalculator:
             cod_df=cod_df,
             binding_df=binding_df,
             pending_parcel_df=pending_parcel_df,
+            no_outbound_scan_df=no_outbound_scan_df,
             parcel_lost_df=parcel_lost_df,
             attendance_df=attendance_df,
             fake_attempt_penalty_per_parcel=fake_attempt_penalty_per_parcel,
             pending_parcel_penalty_per_parcel=pending_parcel_penalty_per_parcel,
+            no_outbound_scan_penalty_per_parcel=no_outbound_scan_penalty_per_parcel,
             return_df=return_df,
             route_penalty_per_dispatcher=route_penalty_per_dispatcher,
             route_penalty_dispatcher_count=route_penalty_dispatcher_count,
@@ -2909,9 +3140,7 @@ class InvoiceGenerator:
 
                 # Fake Attempt penalties
                 if penalty_breakdown['fake_attempt']['count'] > 0:
-                    waybills_fake = ", ".join(penalty_breakdown['fake_attempt']['waybills'][:3])
-                    if len(penalty_breakdown['fake_attempt']['waybills']) > 3:
-                        waybills_fake += f" (+{len(penalty_breakdown['fake_attempt']['waybills']) - 3} more)"
+                    waybills_fake = format_waybills_display(penalty_breakdown['fake_attempt']['waybills'], limit=3)
 
                     html_content += f"""
                         <div class="penalty-item">
@@ -2923,6 +3152,21 @@ class InvoiceGenerator:
                         html_content += f"""
                         <div style="font-size: 11px; opacity: 0.8; padding: 4px 0;">
                             Waybills: {waybills_fake}
+                        </div>
+                        """
+
+                if penalty_breakdown['no_outbound_scan']['count'] > 0:
+                    waybills_nos = format_waybills_display(penalty_breakdown['no_outbound_scan']['waybills'], limit=3)
+                    html_content += f"""
+                        <div class="penalty-item">
+                            <span><strong>No Outbound Scan:</strong> {penalty_breakdown['no_outbound_scan']['count']} AWB(s)</span>
+                            <span>- {currency_symbol} {penalty_breakdown['no_outbound_scan']['amount']:,.2f}</span>
+                        </div>
+                    """
+                    if penalty_breakdown['no_outbound_scan']['waybills']:
+                        html_content += f"""
+                        <div style="font-size: 11px; opacity: 0.8; padding: 4px 0;">
+                            Waybills: {waybills_nos}
                         </div>
                         """
 
@@ -3113,9 +3357,20 @@ class InvoiceGenerator:
                     <span>- {currency_symbol} {penalty_breakdown['fake_attempt']['amount']:,.2f}</span>
                 </div>"""
                 if penalty_breakdown['fake_attempt']['waybills']:
-                    waybills_display = ", ".join(penalty_breakdown['fake_attempt']['waybills'][:5])
-                    if len(penalty_breakdown['fake_attempt']['waybills']) > 5:
-                        waybills_display += f" (+{len(penalty_breakdown['fake_attempt']['waybills']) - 5} more)"
+                    waybills_display = format_waybills_display(penalty_breakdown['fake_attempt']['waybills'], limit=5)
+                    html_content += f"""
+                    <div class="payout-row penalty-detail-row" style="font-size: 12px; padding-left: 40px;">
+                        <span style="color: var(--text-secondary);">Waybills: {waybills_display}</span>
+                    </div>"""
+
+            if penalty_breakdown['no_outbound_scan']['count'] > 0:
+                html_content += f"""
+                <div class="payout-row penalty-detail-row">
+                    <span>↳ No Outbound Scan ({penalty_breakdown['no_outbound_scan']['count']} AWB(s)):</span>
+                    <span>- {currency_symbol} {penalty_breakdown['no_outbound_scan']['amount']:,.2f}</span>
+                </div>"""
+                if penalty_breakdown['no_outbound_scan']['waybills']:
+                    waybills_display = format_waybills_display(penalty_breakdown['no_outbound_scan']['waybills'], limit=5)
                     html_content += f"""
                     <div class="payout-row penalty-detail-row" style="font-size: 12px; padding-left: 40px;">
                         <span style="color: var(--text-secondary);">Waybills: {waybills_display}</span>
@@ -3538,6 +3793,20 @@ def main():
     cod_df = DataSource.load_cod_penalty_data(config)
     binding_df = DataSource.load_binding_penalty_data(config)
     pending_parcel_df = DataSource.load_pending_parcel_penalty_data(config)
+    no_outbound_scan_df = DataSource.load_no_outbound_scan_penalty_data(config)
+    no_outbound_scan_df = filter_sheet_by_date_range(
+        no_outbound_scan_df,
+        start_date,
+        end_date,
+        [
+            "Scanning Time | Last",
+            "Scanning Time|Last",
+            "scanning_time_last",
+            "Scanning Time",
+            "date",
+            "created_at",
+        ],
+    )
     parcel_lost_df = DataSource.load_parcel_lost_penalty_data(config)
 
     route_penalty_total = float(config.get("route_penalty_amount", 1000.0))
@@ -3557,6 +3826,7 @@ def main():
         "COD": cod_df,
         "Binding": binding_df,
         "Pending Parcel": pending_parcel_df,
+        "No Outbound Scan": no_outbound_scan_df,
         "Parcel Lost": parcel_lost_df,
         "QR Order": qr_order_df,
         "Return": return_df,
@@ -3627,12 +3897,13 @@ def main():
     attendance_desc = ""
     qualified_days = 0
     display_df = pd.DataFrame()
-    penalty_breakdown = {'duitnow': {'amount': 0.0, 'waybills': []},
+    penalty_breakdown = {'duitnow': {'amount': 0.0, 'count': 0, 'waybills': []},
                         'ldr': {'amount': 0.0, 'count': 0, 'waybills': []},
                         'fake_attempt': {'amount': 0.0, 'count': 0, 'waybills': []},
                         'cod': {'amount': 0.0, 'count': 0},
                         'binding': {'amount': 0.0, 'count': 0},
                         'pending_parcel': {'amount': 0.0, 'count': 0, 'waybills': []},
+                        'no_outbound_scan': {'amount': 0.0, 'count': 0, 'waybills': []},
                         'parcel_lost': {'amount': 0.0, 'count': 0, 'waybills': []},
                         'route': {'amount': 0.0, 'count': 0, 'pool_total': 0.0},
                         'attendance': {'amount': 0.0, 'count': 0},
@@ -3659,10 +3930,12 @@ def main():
                 cod_df=cod_df,
                 binding_df=binding_df,
                 pending_parcel_df=pending_parcel_df,
+                no_outbound_scan_df=no_outbound_scan_df,
                 parcel_lost_df=parcel_lost_df,
                 attendance_df=attendance_df,
                 fake_attempt_penalty_per_parcel=config.get("fake_attempt_penalty_per_parcel", 2.0),
                 pending_parcel_penalty_per_parcel=config.get("pending_parcel_penalty_per_parcel", 2.0),
+                no_outbound_scan_penalty_per_parcel=config.get("no_outbound_scan_penalty_per_parcel", 3.0),
                 return_df=return_df,
                 route_penalty_per_dispatcher=route_penalty_per_dispatcher,
                 route_penalty_dispatcher_count=route_penalty_dispatcher_count,
@@ -4098,7 +4371,7 @@ def main():
             # Display penalty details if any
             if penalty_breakdown['total_amount'] > 0:
                 with st.expander("⚠️ Penalty Details"):
-                    penalty_col1, penalty_col2, penalty_col3, penalty_col4, penalty_col5, penalty_col6, penalty_col7, penalty_col8, penalty_col9 = st.columns(9)
+                    penalty_col1, penalty_col2, penalty_col3, penalty_col4, penalty_col5, penalty_col6, penalty_col7, penalty_col8, penalty_col9, penalty_col10 = st.columns(10)
 
                     with penalty_col1:
                         if penalty_breakdown['duitnow']['amount'] > 0:
@@ -4114,7 +4387,9 @@ def main():
                         if penalty_breakdown['fake_attempt']['count'] > 0:
                             st.error(f"**Fake Attempt:** {penalty_breakdown['fake_attempt']['count']} parcel(s) - {config['currency_symbol']}{penalty_breakdown['fake_attempt']['amount']:,.2f}")
                             if penalty_breakdown['fake_attempt']['waybills']:
-                                st.caption(f"Waybills: {', '.join(penalty_breakdown['fake_attempt']['waybills'][:5])}")
+                                st.caption("Waybills:")
+                                for wb in penalty_breakdown['fake_attempt']['waybills']:
+                                    st.markdown(f"- `{wb}`")
 
                     with penalty_col4:
                         if penalty_breakdown['cod']['count'] > 0:
@@ -4131,12 +4406,20 @@ def main():
                                 st.caption(f"Waybills: {', '.join(penalty_breakdown['pending_parcel']['waybills'][:5])}")
 
                     with penalty_col7:
+                        if penalty_breakdown['no_outbound_scan']['count'] > 0:
+                            st.error(f"**No Outbound Scan:** {penalty_breakdown['no_outbound_scan']['count']} AWB(s) - {config['currency_symbol']}{penalty_breakdown['no_outbound_scan']['amount']:,.2f}")
+                            if penalty_breakdown['no_outbound_scan']['waybills']:
+                                st.caption("Waybills:")
+                                for wb in penalty_breakdown['no_outbound_scan']['waybills']:
+                                    st.markdown(f"- `{wb}`")
+
+                    with penalty_col8:
                         if penalty_breakdown['parcel_lost']['count'] > 0:
                             st.error(f"**Parcel Lost:** {penalty_breakdown['parcel_lost']['count']} parcel(s) - {config['currency_symbol']}{penalty_breakdown['parcel_lost']['amount']:,.2f}")
                             if penalty_breakdown['parcel_lost']['waybills']:
                                 st.caption(f"Waybills: {', '.join(penalty_breakdown['parcel_lost']['waybills'][:5])}")
 
-                    with penalty_col8:
+                    with penalty_col9:
                         if penalty_breakdown.get('route', {}).get('amount', 0) > 0:
                             rc = penalty_breakdown['route'].get('count', 0) or 0
                             st.error(
@@ -4144,7 +4427,7 @@ def main():
                                 f"{config['currency_symbol']}{penalty_breakdown['route']['amount']:,.2f}"
                             )
 
-                    with penalty_col9:
+                    with penalty_col10:
                         if penalty_breakdown['attendance']['amount'] > 0:
                             st.error(f"**Attendance:** Missing Clock-in - {config['currency_symbol']}{penalty_breakdown['attendance']['amount']:,.2f}")
 

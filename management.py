@@ -91,7 +91,8 @@ class Config:
                 "reward": "Reward",
                 "binding": "Binding",
                 "pending_parcel": "Pending Parcel",
-                "parcel_lost": "Parcel lost"
+                "parcel_lost": "Parcel lost",
+                "no_outbound_scan": "No Outbound Scan"
             }
         },
         "database": {"table_name": "dispatch"},
@@ -108,6 +109,7 @@ class Config:
         "return_payout_per_parcel": 1.50,
         "fake_attempt_penalty_per_parcel": 1.00,
         "pending_parcel_penalty_per_parcel": 2.00,
+        "no_outbound_scan_penalty_per_parcel": 3.00,
         "route_penalty_amount": 1000.0
     }
 
@@ -148,10 +150,14 @@ class Config:
                         config["fake_attempt_penalty_per_parcel"] = 1.00
                     if "pending_parcel_penalty_per_parcel" not in config:
                         config["pending_parcel_penalty_per_parcel"] = 2.00
+                    if "no_outbound_scan_penalty_per_parcel" not in config:
+                        config["no_outbound_scan_penalty_per_parcel"] = 3.00
                     if "pending_parcel" not in config.get("data_source", {}).get("excel_sheets", {}):
                         config["data_source"].setdefault("excel_sheets", {})["pending_parcel"] = "Pending Parcel"
                     if "parcel_lost" not in config.get("data_source", {}).get("excel_sheets", {}):
                         config["data_source"].setdefault("excel_sheets", {})["parcel_lost"] = "Parcel lost"
+                    if "no_outbound_scan" not in config.get("data_source", {}).get("excel_sheets", {}):
+                        config["data_source"].setdefault("excel_sheets", {})["no_outbound_scan"] = "No Outbound Scan"
                     if "route_penalty_amount" not in config:
                         config["route_penalty_amount"] = cls.DEFAULT_CONFIG["route_penalty_amount"]
                     cls._cache = config
@@ -209,6 +215,18 @@ def normalize_dispatcher_id(value) -> str:
     return text
 
 
+def clean_penalty_dispatcher_id(value) -> str:
+    """Normalize dispatcher ID for penalty sheet matching (strip, drop .0 suffix)."""
+    if pd.isna(value):
+        return ""
+    s = str(value).strip()
+    if not s or s.lower() in ("nan", "none", "null"):
+        return ""
+    if re.fullmatch(r".+\.0", s):
+        s = s[:-2]
+    return s.upper()
+
+
 def normalize_waybill(value) -> str:
     """Normalize a waybill/AWB value for consistent comparison across sheets."""
     if pd.isna(value):
@@ -245,7 +263,7 @@ def find_waybill_column(df: pd.DataFrame) -> Optional[str]:
     for col in df.columns:
         c = str(col).strip()
         c_lower = c.lower()
-        if c in ("Waybill Number", "waybill_number", "Waybill", "waybill", "Waybill No", "AWB", "No. AWB"):
+        if c in ("Waybill Number", "waybill_number", "Waybill", "waybill", "Waybill No", "AWB", "No. AWB", "AWB No."):
             return col
         if "waybill" in c_lower or "awb" in c_lower:
             return col
@@ -688,6 +706,8 @@ class DataSource:
                 column_mapping = {}  # No mapping needed, use original column names
             elif table_name == 'parcel_lost_penalty' or table_name.endswith('parcel_lost_penalty'):
                 column_mapping = {}  # No mapping needed, use original column names
+            elif table_name == 'no_outbound_scan_penalty' or table_name.endswith('no_outbound_scan_penalty'):
+                column_mapping = {}  # No mapping needed, use original column names
             elif table_name == 'qr_order' or table_name.endswith('qr_order'):
                 column_mapping = {}  # No mapping needed, use original column names
             elif table_name == 'return' or table_name.endswith('return'):
@@ -905,6 +925,7 @@ class DataSource:
                 "binding": DataSource._get_excel_sheet_name(config, "binding", "Binding"),
                 "pending_parcel": DataSource._get_excel_sheet_name(config, "pending_parcel", "Pending Parcel"),
                 "parcel_lost": DataSource._get_excel_sheet_name(config, "parcel_lost", "Parcel lost"),
+                "no_outbound_scan": DataSource._get_excel_sheet_name(config, "no_outbound_scan", "No Outbound Scan"),
             }
 
             gsheet_url = data_source.get("gsheet_url")
@@ -982,6 +1003,14 @@ class DataSource:
                 penalty_data['parcel_lost'] = parcel_lost_df
         except Exception as exc:
             st.warning(f"Could not load Parcel Lost penalty data: {exc}")
+
+        # Load No Outbound Scan penalty
+        try:
+            no_outbound_scan_df = DataSource.read_postgres_table(engine, 'no_outbound_scan_penalty')
+            if not no_outbound_scan_df.empty:
+                penalty_data['no_outbound_scan'] = no_outbound_scan_df
+        except Exception as exc:
+            st.warning(f"Could not load No Outbound Scan penalty data: {exc}")
 
         return penalty_data if penalty_data else None
 
@@ -1294,6 +1323,10 @@ class PayoutCalculator:
             cu = str(col).upper().strip()
             if "DISPATCHER" in cu and "ID" in cu:
                 return col
+        for col in df.columns:
+            c = str(col).strip().lower()
+            if "operator" in c and "last" in c:
+                return col
         return None
 
     @staticmethod
@@ -1306,6 +1339,107 @@ class PayoutCalculator:
             if "amount" in str(col).strip().lower():
                 return col
         return None
+
+    @staticmethod
+    def _find_no_outbound_scan_date_column(df: pd.DataFrame) -> Optional[str]:
+        """Resolve scan date column on No Outbound Scan sheet."""
+        for col in df.columns:
+            s = str(col).strip().lower()
+            if "scanning time" in s and "last" in s:
+                return col
+        for col in df.columns:
+            if str(col).strip().lower() in ("date", "created_at"):
+                return col
+        return None
+
+    @staticmethod
+    def _find_penalty_amount_column(df: pd.DataFrame) -> Optional[str]:
+        """Resolve penalty amount column (Penalty, PENALTY, PENALTY BINDING RM5, etc.)."""
+        for col in df.columns:
+            if str(col).strip().lower() == "penalty":
+                return col
+        for col in df.columns:
+            col_lower = str(col).strip().lower()
+            if "penalty" in col_lower and "sum of" not in col_lower:
+                return col
+        return None
+
+    @staticmethod
+    def _find_no_outbound_scan_awb_column(df: pd.DataFrame) -> Optional[str]:
+        """Resolve AWB column on No Outbound Scan sheet."""
+        awb_col = PayoutCalculator._find_pending_parcel_awb_column(df)
+        if awb_col is not None:
+            return awb_col
+        for col in df.columns:
+            s = str(col).strip().lower()
+            if "awb" in s and "no" in s:
+                return col
+        return None
+
+    @staticmethod
+    def _sanitize_no_outbound_scan_df(df: pd.DataFrame) -> pd.DataFrame:
+        """Drop summary/pivot rows and rows without a valid dispatcher + AWB."""
+        if df is None or df.empty:
+            return pd.DataFrame()
+        work = df.copy()
+        disp_col = PayoutCalculator._find_dispatcher_id_column(work)
+        awb_col = PayoutCalculator._find_no_outbound_scan_awb_column(work)
+        if disp_col is not None:
+            disp_keys = work[disp_col].apply(clean_penalty_dispatcher_id)
+            work = work[disp_keys.astype(str).str.len() > 0]
+        if awb_col is not None and not work.empty:
+            awb_norm = work[awb_col].apply(normalize_waybill)
+            work = work[awb_norm.astype(str).str.len() > 0]
+        return work
+
+    @staticmethod
+    def _no_outbound_scan_records_for_dispatcher(
+        nos_df: pd.DataFrame, dispatcher_id: str
+    ) -> pd.DataFrame:
+        """Filter No Outbound Scan rows for one dispatcher (exact ID match after clean)."""
+        if nos_df is None or nos_df.empty:
+            return pd.DataFrame()
+        dispatcher_id_col = PayoutCalculator._find_dispatcher_id_column(nos_df)
+        if dispatcher_id_col is None:
+            return pd.DataFrame()
+        target = clean_penalty_dispatcher_id(dispatcher_id)
+        if not target:
+            return pd.DataFrame()
+        series = nos_df[dispatcher_id_col].apply(clean_penalty_dispatcher_id)
+        return nos_df[series == target]
+
+    @staticmethod
+    def _dedupe_no_outbound_scan_by_awb(records: pd.DataFrame, source_df: pd.DataFrame) -> pd.DataFrame:
+        """Keep one row per AWB (RM3 per AWB, not per duplicate row)."""
+        if records is None or records.empty:
+            return pd.DataFrame()
+        awb_col = PayoutCalculator._find_no_outbound_scan_awb_column(source_df)
+        if not awb_col:
+            awb_col = PayoutCalculator._find_no_outbound_scan_awb_column(records)
+        if not awb_col:
+            return pd.DataFrame()
+        work = records.copy()
+        work["_awb_norm"] = work[awb_col].apply(normalize_waybill)
+        work = work[work["_awb_norm"].astype(str).str.len() > 0]
+        if work.empty:
+            return work
+        return work.drop_duplicates(subset=["_awb_norm"], keep="first")
+
+    @staticmethod
+    def _calculate_no_outbound_scan_penalty(
+        nos_records: pd.DataFrame, nos_df: pd.DataFrame
+    ) -> tuple[float, int]:
+        """Calculate No Outbound Scan penalty: unique AWB count × config rate (default RM3)."""
+        if nos_records is None or nos_records.empty:
+            return 0.0, 0
+
+        deduped = PayoutCalculator._dedupe_no_outbound_scan_by_awb(nos_records, nos_df)
+        if deduped.empty:
+            return 0.0, 0
+
+        parcel_count = len(deduped)
+        nos_rate = float(Config.load().get("no_outbound_scan_penalty_per_parcel", 3.00))
+        return parcel_count * nos_rate, parcel_count
 
     @staticmethod
     def _preprocess_penalty_data(penalty_data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
@@ -1439,7 +1573,7 @@ class PayoutCalculator:
                         if "DISPATCHER" in cu and "ID" in cu:
                             dispatcher_id_col = col
                             break
-                penalty_col = next((col for col in df.columns if str(col).strip().lower() == 'penalty'), None)
+                penalty_col = PayoutCalculator._find_penalty_amount_column(df)
 
                 if dispatcher_id_col:
                     df_processed['_dispatcher_id_normalized'] = df_processed[dispatcher_id_col].apply(
@@ -1450,6 +1584,9 @@ class PayoutCalculator:
                     if 'penalty_numeric' not in df_processed.columns:
                         df_processed['penalty_numeric'] = df_processed[penalty_col].apply(penalty_cell_to_decimal)
                     df_processed = df_processed[df_processed['penalty_numeric'] > 0].copy()
+
+            elif penalty_type == 'no_outbound_scan':
+                df_processed = PayoutCalculator._sanitize_no_outbound_scan_df(df_processed)
 
             processed[penalty_type] = df_processed
 
@@ -1582,6 +1719,27 @@ class PayoutCalculator:
                     total_penalty += fake_attempt_penalty
                     total_count += penalty_record_count
 
+        if 'no_outbound_scan' in penalty_data:
+            nos_df = penalty_data['no_outbound_scan']
+            if not nos_df.empty:
+                nos_records = PayoutCalculator._no_outbound_scan_records_for_dispatcher(
+                    nos_df, dispatcher_id
+                )
+                if not nos_records.empty:
+                    awb_col = PayoutCalculator._find_no_outbound_scan_awb_column(nos_df)
+                    if awb_col:
+                        deduped = PayoutCalculator._dedupe_no_outbound_scan_by_awb(nos_records, nos_df)
+                        if not deduped.empty and awb_col in deduped.columns:
+                            waybill_list = deduped[awb_col].dropna().astype(str).unique().tolist()
+                            waybill_numbers.extend(
+                                [wb for wb in waybill_list if wb and wb.lower() != 'nan']
+                            )
+                    nos_penalty, nos_count = PayoutCalculator._calculate_no_outbound_scan_penalty(
+                        nos_records, nos_df
+                    )
+                    total_penalty += nos_penalty
+                    total_count += nos_count
+
         # 4. COD Penalty: dispatcher_id column = dispatcher_id, penalty amount from penalty column (only positive amounts)
         if 'cod' in penalty_data:
             cod_df = penalty_data['cod']
@@ -1634,14 +1792,27 @@ class PayoutCalculator:
                     else:
                         binding_records = pd.DataFrame()
 
-                if not binding_records.empty and 'penalty_numeric' in binding_records.columns:
-                    rounded_penalties = [
-                        penalty.quantize(Decimal('0.01'), rounding='ROUND_HALF_UP')
-                        for penalty in binding_records['penalty_numeric'].tolist()
-                    ]
-                    binding_penalty_rounded = sum(rounded_penalties)
-                    total_penalty += float(binding_penalty_rounded)
-                    total_count += len(binding_records)
+                if not binding_records.empty:
+                    if 'penalty_numeric' in binding_records.columns:
+                        rounded_penalties = [
+                            penalty.quantize(Decimal('0.01'), rounding='ROUND_HALF_UP')
+                            for penalty in binding_records['penalty_numeric'].tolist()
+                        ]
+                        binding_penalty_rounded = sum(rounded_penalties)
+                        total_penalty += float(binding_penalty_rounded)
+                        total_count += len(binding_records)
+                    else:
+                        penalty_col = PayoutCalculator._find_penalty_amount_column(binding_df)
+                        if penalty_col:
+                            penalty_values = binding_records[penalty_col].apply(penalty_cell_to_decimal)
+                            rounded_penalties = [
+                                penalty.quantize(Decimal('0.01'), rounding='ROUND_HALF_UP')
+                                for penalty in penalty_values.tolist()
+                                if penalty > 0
+                            ]
+                            if rounded_penalties:
+                                total_penalty += float(sum(rounded_penalties))
+                                total_count += len(rounded_penalties)
 
         # 6. Pending Parcel penalty: sum Amount per dispatcher
         if 'pending_parcel' in penalty_data:
@@ -1762,6 +1933,7 @@ class PayoutCalculator:
             'cod': 0.0,
             'binding': 0.0,
             'pending_parcel': 0.0,
+            'no_outbound_scan': 0.0,
             'parcel_lost': 0.0,
             'route': 0.0,
             'attendance': 0.0
@@ -1862,6 +2034,18 @@ class PayoutCalculator:
                     fake_attempt_rate = Config.load().get("fake_attempt_penalty_per_parcel", 1.00)
                     breakdown['fake_attempt'] = penalty_record_count * float(fake_attempt_rate)
 
+        if 'no_outbound_scan' in penalty_data:
+            nos_df = penalty_data['no_outbound_scan']
+            if not nos_df.empty:
+                nos_records = PayoutCalculator._no_outbound_scan_records_for_dispatcher(
+                    nos_df, dispatcher_id
+                )
+                if not nos_records.empty:
+                    nos_penalty, _ = PayoutCalculator._calculate_no_outbound_scan_penalty(
+                        nos_records, nos_df
+                    )
+                    breakdown['no_outbound_scan'] = nos_penalty
+
         # 4. COD Penalty: dispatcher_id column = dispatcher_id, penalty amount from penalty column (only positive amounts)
         if 'cod' in penalty_data:
             cod_df = penalty_data['cod']
@@ -1912,12 +2096,23 @@ class PayoutCalculator:
                     else:
                         binding_records = pd.DataFrame()
 
-                if not binding_records.empty and 'penalty_numeric' in binding_records.columns:
-                    rounded_penalties = [
-                        penalty.quantize(Decimal('0.01'), rounding='ROUND_HALF_UP')
-                        for penalty in binding_records['penalty_numeric'].tolist()
-                    ]
-                    breakdown['binding'] = float(sum(rounded_penalties))
+                if not binding_records.empty:
+                    if 'penalty_numeric' in binding_records.columns:
+                        rounded_penalties = [
+                            penalty.quantize(Decimal('0.01'), rounding='ROUND_HALF_UP')
+                            for penalty in binding_records['penalty_numeric'].tolist()
+                        ]
+                        breakdown['binding'] = float(sum(rounded_penalties))
+                    else:
+                        penalty_col = PayoutCalculator._find_penalty_amount_column(binding_df)
+                        if penalty_col:
+                            penalty_values = binding_records[penalty_col].apply(penalty_cell_to_decimal)
+                            rounded_penalties = [
+                                penalty.quantize(Decimal('0.01'), rounding='ROUND_HALF_UP')
+                                for penalty in penalty_values.tolist()
+                                if penalty > 0
+                            ]
+                            breakdown['binding'] = float(sum(rounded_penalties))
 
         if 'pending_parcel' in penalty_data:
             pp_df = penalty_data['pending_parcel']
@@ -2015,6 +2210,7 @@ class PayoutCalculator:
             'cod': 0.0,
             'binding': 0.0,
             'pending_parcel': 0.0,
+            'no_outbound_scan': 0.0,
             'parcel_lost': 0.0,
             'route': 0.0,
             'attendance': 0.0
@@ -2107,6 +2303,14 @@ class PayoutCalculator:
             fake_attempt_rate = Config.load().get("fake_attempt_penalty_per_parcel", 1.00)
             penalty_totals['fake_attempt'] = penalty_record_count * float(fake_attempt_rate)
 
+        if 'no_outbound_scan' in penalty_data:
+            nos_df = penalty_data['no_outbound_scan']
+            if nos_df is not None and not nos_df.empty:
+                nos_df = PayoutCalculator._sanitize_no_outbound_scan_df(nos_df)
+                deduped = PayoutCalculator._dedupe_no_outbound_scan_by_awb(nos_df, nos_df)
+                nos_rate = Config.load().get("no_outbound_scan_penalty_per_parcel", 3.00)
+                penalty_totals["no_outbound_scan"] = len(deduped) * float(nos_rate)
+
         # 4. COD Penalty: sum all penalty amounts (only positive amounts)
         if 'cod' in penalty_data:
             cod_df = penalty_data['cod']
@@ -2146,18 +2350,14 @@ class PayoutCalculator:
                     st.error(f"❌ 'penalty' column not found in COD data. Available columns: {list(cod_df.columns)}")
                     penalty_totals['cod'] = 0.0
 
-        # 5. Binding Penalty: sum all penalty amounts (only positive amounts)
+        # 5. Binding Penalty: sum Penalty column values (only positive amounts)
         if 'binding' in penalty_data:
             binding_df = penalty_data['binding']
 
             if binding_df is None or binding_df.empty:
                 penalty_totals['binding'] = 0.0
             else:
-                penalty_col = None
-                for col in binding_df.columns:
-                    if str(col).strip().lower() == 'penalty':
-                        penalty_col = col
-                        break
+                penalty_col = PayoutCalculator._find_penalty_amount_column(binding_df)
 
                 if penalty_col:
                     binding_df = binding_df.copy()
@@ -2736,6 +2936,7 @@ class PayoutCalculator:
         grouped['cod_penalty'] = 0.0
         grouped['binding_penalty'] = 0.0
         grouped['pending_parcel_penalty'] = 0.0
+        grouped['no_outbound_scan_penalty'] = 0.0
         grouped['parcel_lost_penalty'] = 0.0
         grouped['route_penalty'] = 0.0
         grouped['attendance_penalty'] = 0.0
@@ -2778,6 +2979,7 @@ class PayoutCalculator:
                 'cod_penalty': penalty_breakdown['cod'],
                 'binding_penalty': penalty_breakdown['binding'],
                 'pending_parcel_penalty': penalty_breakdown['pending_parcel'],
+                'no_outbound_scan_penalty': penalty_breakdown['no_outbound_scan'],
                 'parcel_lost_penalty': penalty_breakdown['parcel_lost'],
                 'route_penalty': penalty_breakdown['route'],
                 'attendance_penalty': attendance_penalty
@@ -2786,7 +2988,7 @@ class PayoutCalculator:
         penalty_results = grouped.apply(calculate_penalties, axis=1)
         grouped[['penalty_amount', 'penalty_count', 'penalty_waybills',
                  'duitnow_penalty', 'ldr_penalty', 'fake_attempt_penalty', 'cod_penalty',
-                 'binding_penalty', 'pending_parcel_penalty', 'parcel_lost_penalty', 'route_penalty',
+                 'binding_penalty', 'pending_parcel_penalty', 'no_outbound_scan_penalty', 'parcel_lost_penalty', 'route_penalty',
                  'attendance_penalty']] = penalty_results
 
         grouped['reward'] = grouped['dispatcher_id'].apply(
@@ -2845,6 +3047,7 @@ class PayoutCalculator:
             "cod_penalty": "COD Penalty",
             "binding_penalty": "Binding Penalty",
             "pending_parcel_penalty": "Pending Parcel Penalty",
+            "no_outbound_scan_penalty": "No Outbound Scan Penalty",
             "parcel_lost_penalty": "Parcel Lost Penalty",
             "route_penalty": "Route Penalty",
             "attendance_penalty": "Attendance Penalty",
@@ -2881,6 +3084,10 @@ class PayoutCalculator:
             display_df["Binding Penalty"] = display_df["Binding Penalty"].apply(lambda x: f"-{currency_symbol}{x:,.2f}" if x > 0 else f"{currency_symbol}0.00")
         if "Pending Parcel Penalty" in display_df.columns:
             display_df["Pending Parcel Penalty"] = display_df["Pending Parcel Penalty"].apply(
+                lambda x: f"-{currency_symbol}{x:,.2f}" if x > 0 else f"{currency_symbol}0.00"
+            )
+        if "No Outbound Scan Penalty" in display_df.columns:
+            display_df["No Outbound Scan Penalty"] = display_df["No Outbound Scan Penalty"].apply(
                 lambda x: f"-{currency_symbol}{x:,.2f}" if x > 0 else f"{currency_symbol}0.00"
             )
         if "Parcel Lost Penalty" in display_df.columns:
@@ -3277,6 +3484,7 @@ class InvoiceGenerator:
                 'cod': numeric_df["COD Penalty"].sum() if "COD Penalty" in numeric_df.columns else 0.0,
                 'binding': numeric_df["Binding Penalty"].sum() if "Binding Penalty" in numeric_df.columns else 0.0,
                 'pending_parcel': numeric_df["Pending Parcel Penalty"].sum() if "Pending Parcel Penalty" in numeric_df.columns else 0.0,
+                'no_outbound_scan': numeric_df["No Outbound Scan Penalty"].sum() if "No Outbound Scan Penalty" in numeric_df.columns else 0.0,
                 'parcel_lost': numeric_df["Parcel Lost Penalty"].sum() if "Parcel Lost Penalty" in numeric_df.columns else 0.0,
                 'route': numeric_df["Route Penalty"].sum() if "Route Penalty" in numeric_df.columns else 0.0,
                 'attendance': numeric_df["Attendance Penalty"].sum() if "Attendance Penalty" in numeric_df.columns else 0.0
@@ -3451,6 +3659,7 @@ class InvoiceGenerator:
                                     COD: -{currency_symbol} {penalty_by_type['cod']:,.2f} ·
                                     Binding: -{currency_symbol} {penalty_by_type['binding']:,.2f} ·
                                     Pending Parcel: -{currency_symbol} {penalty_by_type['pending_parcel']:,.2f} ·
+                                    No Outbound Scan: -{currency_symbol} {penalty_by_type['no_outbound_scan']:,.2f} ·
                                     Parcel Lost: -{currency_symbol} {penalty_by_type['parcel_lost']:,.2f} ·
                                     Route: -{currency_symbol} {penalty_by_type['route']:,.2f}<br>
                                     Attendance: -{currency_symbol} {penalty_by_type['attendance']:,.2f}
@@ -3684,6 +3893,18 @@ def main():
         config["pending_parcel_penalty_per_parcel"] = pending_parcel_penalty_per_parcel
         Config.save(config)
 
+    no_outbound_scan_penalty_per_parcel = st.sidebar.number_input(
+        "No Outbound Scan Penalty per AWB",
+        min_value=0.0,
+        step=0.5,
+        value=config.get("no_outbound_scan_penalty_per_parcel", 3.00),
+        format="%.2f",
+        help="Penalty per AWB on the No Outbound Scan sheet",
+    )
+    if no_outbound_scan_penalty_per_parcel != config.get("no_outbound_scan_penalty_per_parcel", 3.00):
+        config["no_outbound_scan_penalty_per_parcel"] = no_outbound_scan_penalty_per_parcel
+        Config.save(config)
+
     route_penalty_amount = st.sidebar.number_input(
         "Route penalty (total pool)",
         min_value=0.0,
@@ -3732,6 +3953,12 @@ def main():
 
     **📦 Pending Parcel Penalty:**
     - RM{pending_parcel_penalty_per_parcel:.2f} per parcel
+
+    **📤 No Outbound Scan Penalty:**
+    - RM{no_outbound_scan_penalty_per_parcel:.2f} per unique AWB (not sum of PENALTY column)
+
+    **🔗 Binding Penalty:**
+    - Sum of **Penalty** column (Binding sheet)
 
     **📦 Parcel Lost Penalty:**
     - Sum of **COD** column (Parcel lost sheet)
@@ -4075,6 +4302,35 @@ def main():
                     else:
                         st.warning("⚠️ Pending Parcel penalty data has no 'date' or 'created_at' column; penalties are not filtered by date range.")
 
+                # Filter No Outbound Scan penalty by scan date (Scanning Time | Last)
+                if (
+                    'no_outbound_scan' in penalty_data
+                    and penalty_data['no_outbound_scan'] is not None
+                    and not penalty_data['no_outbound_scan'].empty
+                ):
+                    nos_df = penalty_data['no_outbound_scan']
+                    nos_date_col = PayoutCalculator._find_no_outbound_scan_date_column(nos_df)
+                    if nos_date_col is not None:
+                        nos_df[nos_date_col] = pd.to_datetime(nos_df[nos_date_col], errors="coerce")
+                        initial_nos_count = len(nos_df)
+                        nos_df = nos_df[
+                            (normalize_series_for_date_compare(nos_df[nos_date_col]) >= start_ts) &
+                            (normalize_series_for_date_compare(nos_df[nos_date_col]) <= end_ts)
+                        ]
+                        filtered_nos_count = len(nos_df)
+                        nos_df = PayoutCalculator._sanitize_no_outbound_scan_df(nos_df)
+                        penalty_data['no_outbound_scan'] = nos_df
+                        if initial_nos_count != filtered_nos_count:
+                            st.info(
+                                f"⚠️ Filtered No Outbound Scan penalty: "
+                                f"{initial_nos_count:,} → {filtered_nos_count:,} records"
+                            )
+                    else:
+                        st.warning(
+                            "⚠️ No Outbound Scan penalty data has no scan date column; "
+                            "penalties are not filtered by date range."
+                        )
+
                 # Filter Parcel Lost penalty (optional date / created_at)
                 if 'parcel_lost' in penalty_data and penalty_data['parcel_lost'] is not None and not penalty_data['parcel_lost'].empty:
                     pl_df = penalty_data['parcel_lost']
@@ -4321,6 +4577,7 @@ def main():
             'cod': numeric_df["COD Penalty"].sum() if "COD Penalty" in numeric_df.columns else 0.0,
             'binding': numeric_df["Binding Penalty"].sum() if "Binding Penalty" in numeric_df.columns else 0.0,
             'pending_parcel': numeric_df["Pending Parcel Penalty"].sum() if "Pending Parcel Penalty" in numeric_df.columns else 0.0,
+            'no_outbound_scan': numeric_df["No Outbound Scan Penalty"].sum() if "No Outbound Scan Penalty" in numeric_df.columns else 0.0,
             'parcel_lost': numeric_df["Parcel Lost Penalty"].sum() if "Parcel Lost Penalty" in numeric_df.columns else 0.0,
             'route': numeric_df["Route Penalty"].sum() if "Route Penalty" in numeric_df.columns else 0.0,
             'attendance': numeric_df["Attendance Penalty"].sum() if "Attendance Penalty" in numeric_df.columns else 0.0
@@ -4384,12 +4641,14 @@ def main():
         with penalty_col6:
             st.metric("Pending Parcel Penalty", f"-{currency} {penalty_by_type['pending_parcel']:,.2f}")
         with penalty_col7:
-            st.metric("Parcel Lost Penalty", f"-{currency} {penalty_by_type['parcel_lost']:,.2f}")
+            st.metric("No Outbound Scan Penalty", f"-{currency} {penalty_by_type['no_outbound_scan']:,.2f}")
         with penalty_col8:
-            st.metric("Route Penalty", f"-{currency} {penalty_by_type['route']:,.2f}")
+            st.metric("Parcel Lost Penalty", f"-{currency} {penalty_by_type['parcel_lost']:,.2f}")
 
         penalty_row3 = st.columns(4)
         with penalty_row3[0]:
+            st.metric("Route Penalty", f"-{currency} {penalty_by_type['route']:,.2f}")
+        with penalty_row3[1]:
             st.metric("Attendance Penalty", f"-{currency} {penalty_by_type['attendance']:,.2f}")
 
     # Charts
@@ -4456,6 +4715,7 @@ def main():
                     cod_penalty = row.get('COD Penalty', 0.0) if 'COD Penalty' in row else 0.0
                     binding_penalty = row.get('Binding Penalty', 0.0) if 'Binding Penalty' in row else 0.0
                     pending_parcel_penalty = row.get('Pending Parcel Penalty', 0.0) if 'Pending Parcel Penalty' in row else 0.0
+                    no_outbound_scan_penalty = row.get('No Outbound Scan Penalty', 0.0) if 'No Outbound Scan Penalty' in row else 0.0
                     parcel_lost_penalty = row.get('Parcel Lost Penalty', 0.0) if 'Parcel Lost Penalty' in row else 0.0
                     route_penalty = row.get('Route Penalty', 0.0) if 'Route Penalty' in row else 0.0
                     attendance_penalty = row.get('Attendance Penalty', 0.0) if 'Attendance Penalty' in row else 0.0
@@ -4473,6 +4733,8 @@ def main():
                         penalty_breakdown.append(f"Binding: {currency}{binding_penalty:,.2f}")
                     if pending_parcel_penalty > 0:
                         penalty_breakdown.append(f"Pending Parcel: {currency}{pending_parcel_penalty:,.2f}")
+                    if no_outbound_scan_penalty > 0:
+                        penalty_breakdown.append(f"No Outbound Scan: {currency}{no_outbound_scan_penalty:,.2f}")
                     if parcel_lost_penalty > 0:
                         penalty_breakdown.append(f"Parcel Lost: {currency}{parcel_lost_penalty:,.2f}")
                     if route_penalty > 0:
@@ -4508,7 +4770,7 @@ def main():
                 "QR Orders", "QR Orders Payout",
                 "Return Parcels", "Return Parcels Payout",
                 "Reward", "Rental",
-                "Penalty", "DuitNow Penalty", "LDR Penalty", "Fake Attempt Penalty", "COD Penalty", "Binding Penalty", "Pending Parcel Penalty", "Parcel Lost Penalty", "Route Penalty", "Attendance Penalty",
+                "Penalty", "DuitNow Penalty", "LDR Penalty", "Fake Attempt Penalty", "COD Penalty", "Binding Penalty", "Pending Parcel Penalty", "No Outbound Scan Penalty", "Parcel Lost Penalty", "Route Penalty", "Attendance Penalty",
                 "Total Payout", "Total Weight (kg)", "Avg Weight (kg)",
                 "Avg Rate per Parcel", "Parcels 0-5kg", "Parcels 5.01-10kg",
                 "Parcels 10.01-30kg", "Parcels 30+kg"

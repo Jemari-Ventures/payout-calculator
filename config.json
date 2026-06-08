@@ -16,7 +16,8 @@
       "return": "Return",
       "attendance": "Attendance",
       "reward": "Reward",
-      "pending_parcel": "Pending Parcel"
+      "pending_parcel": "Pending Parcel",
+      "no_outbound_scan": "No Outbound Scan"
     }
   },
   "database": {
@@ -107,6 +108,7 @@
   "return_payout_per_parcel": 0.5,
   "fake_attempt_penalty_per_parcel": 2.0,
   "pending_parcel_penalty_per_parcel": 2.0,
+  "no_outbound_scan_penalty_per_parcel": 3.0,
   "route_penalty_amount": 0.0,
   "designated_driver": {
     "dispatcher_id": "PEN3533252",
