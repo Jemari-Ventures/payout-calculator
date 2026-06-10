@@ -17,7 +17,10 @@
       "attendance": "Attendance",
       "reward": "Reward",
       "pending_parcel": "Pending Parcel",
-      "no_outbound_scan": "No Outbound Scan"
+      "no_outbound_scan": "No Outbound Scan",
+      "hub": "Hub",
+      "socso": "Socso",
+      "overpaid": "Overpaid"
     }
   },
   "database": {
