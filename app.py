@@ -1011,6 +1011,48 @@ class PayoutCalculator:
         return int(delivery_parcels) + int(pickup_parcels) + int(return_parcels)
 
     @staticmethod
+    def calculate_gross_payout(
+        base_payout: float,
+        pickup_payout: float,
+        qr_order_payout: float,
+        return_payout: float,
+        reward_payout: float,
+        kpi_bonus: float,
+        attendance_bonus: float,
+        penalty_total: float,
+        socso_deduction: float = 0.0,
+        overpaid_deduction: float = 0.0,
+    ) -> float:
+        """Gross = earnings + bonuses − penalties − SOCSO − Overpaid (before Advance)."""
+        earnings = (
+            float(base_payout)
+            + float(pickup_payout)
+            + float(qr_order_payout)
+            + float(return_payout)
+            + float(reward_payout)
+            + float(kpi_bonus)
+            + float(attendance_bonus)
+            - float(penalty_total)
+        )
+        return round(earnings - float(socso_deduction) - float(overpaid_deduction), 2)
+
+    @staticmethod
+    def calculate_advance_payout(
+        base_payout: float,
+        percentage: float,
+        enabled: bool = True,
+    ) -> float:
+        """Advance = percentage of base delivery payout only."""
+        if not enabled or float(percentage) <= 0:
+            return 0.0
+        return round(float(base_payout) * float(percentage) / 100.0, 2)
+
+    @staticmethod
+    def calculate_final_payout(gross_payout: float, advance_payout: float) -> float:
+        """Final = Gross Payout − Advance."""
+        return round(float(gross_payout) - float(advance_payout), 2)
+
+    @staticmethod
     def calculate_benefit_deduction(
         dispatcher_id: str,
         deduction_df: Optional[pd.DataFrame] = None,
@@ -2420,16 +2462,48 @@ class InvoiceGenerator:
         attendance_description: str = "",
         total_awb: int = 0,
         designated_driver_breakdown: Optional[dict] = None,
+        pickup_rate: float = 1.0,
+        qr_order_rate: float = 1.8,
+        return_rate: float = 0.5,
+        advance_percentage: float = 40.0,
+        advance_enabled: bool = True,
     ) -> str:
         total_parcels = df_disp['Total Parcel'].sum() if 'Total Parcel' in df_disp.columns else 0
         total_days = len(df_disp) if 'Date' in df_disp.columns else 0
         cleaned_name = clean_dispatcher_name(name)
 
-        # Calculate final payout after advance and benefit deductions (SOCSO, Overpaid)
-        final_payout = (
-            gross_payout + pickup_payout + qr_order_payout + return_payout + reward_payout
-            - advance_payout - socso_deduction - overpaid_deduction
+        penalty_total = float(penalty_breakdown.get("total_amount", 0.0) or 0.0)
+        gross_payout_amount = PayoutCalculator.calculate_gross_payout(
+            base_payout,
+            pickup_payout,
+            qr_order_payout,
+            return_payout,
+            reward_payout,
+            kpi_bonus,
+            attendance_bonus,
+            penalty_total,
+            socso_deduction,
+            overpaid_deduction,
         )
+        advance_line_amount = PayoutCalculator.calculate_advance_payout(
+            base_payout,
+            advance_percentage,
+            advance_enabled,
+        )
+        final_payout = PayoutCalculator.calculate_final_payout(
+            gross_payout_amount,
+            advance_line_amount,
+        )
+
+        gross_tooltip = (
+            "Base delivery + Pickup + QR Orders + Return + Reward "
+            "+ KPI bonus + Attendance bonus − Total penalty − SOCSO − Overpaid."
+        )
+        advance_tooltip = (
+            f"{advance_percentage:g}% of base delivery payout "
+            f"({currency_symbol}{base_payout:,.2f})."
+        )
+        final_tooltip = "Gross Payout − Advance payout."
 
         html_content = f"""
         <html>
@@ -2594,6 +2668,49 @@ class InvoiceGenerator:
             .total-badge .value {{
               font-size: 28px;
               font-weight: 800;
+            }}
+            .tooltip-wrap {{
+              display: inline-flex;
+              align-items: center;
+              gap: 6px;
+            }}
+            .tooltip-icon {{
+              display: inline-flex;
+              align-items: center;
+              justify-content: center;
+              width: 16px;
+              height: 16px;
+              border-radius: 50%;
+              background: var(--text-secondary);
+              color: white;
+              font-size: 11px;
+              font-weight: 700;
+              cursor: help;
+              position: relative;
+            }}
+            .tooltip-icon .tooltiptext {{
+              visibility: hidden;
+              opacity: 0;
+              width: 280px;
+              background: #1f2937;
+              color: #fff;
+              text-align: left;
+              border-radius: 8px;
+              padding: 10px 12px;
+              position: absolute;
+              z-index: 10;
+              bottom: 125%;
+              left: 50%;
+              margin-left: -140px;
+              font-size: 12px;
+              font-weight: 400;
+              line-height: 1.45;
+              box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+              transition: opacity 0.2s;
+            }}
+            .tooltip-icon:hover .tooltiptext {{
+              visibility: visible;
+              opacity: 1;
             }}
             @media (max-width: 768px) {{
               .header {{ grid-template-columns: 1fr; text-align: center; }}
@@ -2841,7 +2958,7 @@ class InvoiceGenerator:
                 html_content += "</tr>"
             html_content += "</tbody></table>"
 
-        # Payout summary
+        # Payout breakdown
         html_content += f"""
             <div class="payout-summary">
                 <div class="payout-row">
@@ -2879,19 +2996,19 @@ class InvoiceGenerator:
 
         html_content += f"""
                 <div class="payout-row">
-                    <span>Pickup Payout ({pickup_parcels} parcel(s) × {currency_symbol}1.00):</span>
+                    <span>Pickup Payout ({pickup_parcels} parcel(s) × {currency_symbol}{pickup_rate:.2f}):</span>
                     <span>+ {currency_symbol} {pickup_payout:,.2f}</span>
                 </div>
                 <div class="payout-row">
-                    <span>QR Order Payout ({qr_order_count} order(s) × {currency_symbol}1.80):</span>
+                    <span>QR Order Payout ({qr_order_count} order(s) × {currency_symbol}{qr_order_rate:.2f}):</span>
                     <span>+ {currency_symbol} {qr_order_payout:,.2f}</span>
                 </div>
                 <div class="payout-row">
-                    <span>Return Payout ({return_count} parcel(s) × {currency_symbol}0.50):</span>
+                    <span>Return Payout ({return_count} parcel(s) × {currency_symbol}{return_rate:.2f}):</span>
                     <span>+ {currency_symbol} {return_payout:,.2f}</span>
                 </div>"""
 
-        if reward_payout > 0:
+        if reward_payout > 0 or reward_count > 0:
             html_content += f"""
                 <div class="payout-row">
                     <span>Reward ({reward_count} record(s)):</span>
@@ -2908,7 +3025,6 @@ class InvoiceGenerator:
                     <span>+ {currency_symbol} {attendance_bonus:,.2f}</span>
                 </div>"""
 
-        # Penalty details
         if penalty_breakdown['total_amount'] > 0:
             html_content += f"""
                 <div class="payout-row" style="color: var(--error);">
@@ -2926,17 +3042,9 @@ class InvoiceGenerator:
             if penalty_breakdown['ldr']['count'] > 0:
                 html_content += f"""
                 <div class="payout-row penalty-detail-row">
-                    <span>↳ LD&R ({penalty_breakdown['ldr']['count']} parcel(s)):</span>
+                    <span>↳ LD&amp;R ({penalty_breakdown['ldr']['count']} parcel(s)):</span>
                     <span>- {currency_symbol} {penalty_breakdown['ldr']['amount']:,.2f}</span>
                 </div>"""
-                if penalty_breakdown['ldr']['waybills']:
-                    waybills_display = ", ".join(penalty_breakdown['ldr']['waybills'][:5])
-                    if len(penalty_breakdown['ldr']['waybills']) > 5:
-                        waybills_display += f" (+{len(penalty_breakdown['ldr']['waybills']) - 5} more)"
-                    html_content += f"""
-                    <div class="payout-row penalty-detail-row" style="font-size: 12px; padding-left: 40px;">
-                        <span style="color: var(--text-secondary);">Waybills: {waybills_display}</span>
-                    </div>"""
 
             if penalty_breakdown['fake_attempt']['count'] > 0:
                 html_content += f"""
@@ -2944,12 +3052,6 @@ class InvoiceGenerator:
                     <span>↳ Fake Attempt ({penalty_breakdown['fake_attempt']['count']} parcel(s)):</span>
                     <span>- {currency_symbol} {penalty_breakdown['fake_attempt']['amount']:,.2f}</span>
                 </div>"""
-                if penalty_breakdown['fake_attempt']['waybills']:
-                    waybills_display = format_waybills_display(penalty_breakdown['fake_attempt']['waybills'], limit=5)
-                    html_content += f"""
-                    <div class="payout-row penalty-detail-row" style="font-size: 12px; padding-left: 40px;">
-                        <span style="color: var(--text-secondary);">Waybills: {waybills_display}</span>
-                    </div>"""
 
             if penalty_breakdown['no_outbound_scan']['count'] > 0:
                 html_content += f"""
@@ -2957,12 +3059,6 @@ class InvoiceGenerator:
                     <span>↳ No Outbound Scan ({penalty_breakdown['no_outbound_scan']['count']} AWB(s)):</span>
                     <span>- {currency_symbol} {penalty_breakdown['no_outbound_scan']['amount']:,.2f}</span>
                 </div>"""
-                if penalty_breakdown['no_outbound_scan']['waybills']:
-                    waybills_display = format_waybills_display(penalty_breakdown['no_outbound_scan']['waybills'], limit=5)
-                    html_content += f"""
-                    <div class="payout-row penalty-detail-row" style="font-size: 12px; padding-left: 40px;">
-                        <span style="color: var(--text-secondary);">Waybills: {waybills_display}</span>
-                    </div>"""
 
             if penalty_breakdown['cod']['count'] > 0:
                 html_content += f"""
@@ -2991,14 +3087,6 @@ class InvoiceGenerator:
                     <span>↳ Pending Parcel ({penalty_breakdown['pending_parcel']['count']} parcel(s)):</span>
                     <span>- {currency_symbol} {penalty_breakdown['pending_parcel']['amount']:,.2f}</span>
                 </div>"""
-                if penalty_breakdown['pending_parcel']['waybills']:
-                    waybills_display = ", ".join(penalty_breakdown['pending_parcel']['waybills'][:5])
-                    if len(penalty_breakdown['pending_parcel']['waybills']) > 5:
-                        waybills_display += f" (+{len(penalty_breakdown['pending_parcel']['waybills']) - 5} more)"
-                    html_content += f"""
-                    <div class="payout-row penalty-detail-row" style="font-size: 12px; padding-left: 40px;">
-                        <span style="color: var(--text-secondary);">Waybills: {waybills_display}</span>
-                    </div>"""
 
             if penalty_breakdown['parcel_lost']['count'] > 0:
                 html_content += f"""
@@ -3006,14 +3094,6 @@ class InvoiceGenerator:
                     <span>↳ Parcel Lost ({penalty_breakdown['parcel_lost']['count']} parcel(s)):</span>
                     <span>- {currency_symbol} {penalty_breakdown['parcel_lost']['amount']:,.2f}</span>
                 </div>"""
-                if penalty_breakdown['parcel_lost']['waybills']:
-                    waybills_display = ", ".join(penalty_breakdown['parcel_lost']['waybills'][:5])
-                    if len(penalty_breakdown['parcel_lost']['waybills']) > 5:
-                        waybills_display += f" (+{len(penalty_breakdown['parcel_lost']['waybills']) - 5} more)"
-                    html_content += f"""
-                    <div class="payout-row penalty-detail-row" style="font-size: 12px; padding-left: 40px;">
-                        <span style="color: var(--text-secondary);">Waybills: {waybills_display}</span>
-                    </div>"""
 
             if penalty_breakdown.get('route', {}).get('amount', 0) > 0:
                 rc = penalty_breakdown['route'].get('count', 0) or 0
@@ -3031,28 +3111,10 @@ class InvoiceGenerator:
                     <span>- {currency_symbol} {penalty_breakdown['attendance']['amount']:,.2f}</span>
                 </div>"""
 
-        # Add gross payout calculation
-        html_content += f"""
-                <div class="payout-row" style="border-top: 1px dashed var(--border); margin-top: 8px; padding-top: 8px;">
-                    <span><strong>Gross Payout (Delivery + Pickup + QR Order + Return + Reward + Bonuses - Penalties):</strong></span>
-                    <span><strong>{currency_symbol} {gross_payout + pickup_payout + qr_order_payout + return_payout + reward_payout:,.2f}</strong></span>
-                </div>
-                <div class="payout-row">
-                    <span>{advance_payout_desc}:</span>
-                    <span>- {currency_symbol} {advance_payout:,.2f}</span>
-                </div>"""
-
-        if socso_deduction > 0 or overpaid_deduction > 0:
-            html_content += """
-                <div class="payout-row" style="border-top: 1px dashed var(--border); margin-top: 8px; padding-top: 8px;">
-                    <span><strong>Benefit Deductions:</strong></span>
-                    <span></span>
-                </div>"""
-
         if socso_deduction > 0:
             html_content += f"""
                 <div class="payout-row">
-                    <span>Insurance Scheme Deduction (SOCSO{f' · {socso_deduction_count} record(s)' if socso_deduction_count else ''}):</span>
+                    <span>SOCSO (Insurance{f' · {socso_deduction_count} record(s)' if socso_deduction_count else ''}):</span>
                     <span>- {currency_symbol} {socso_deduction:,.2f}</span>
                 </div>"""
 
@@ -3064,8 +3126,33 @@ class InvoiceGenerator:
                 </div>"""
 
         html_content += f"""
+                <div class="payout-row" style="border-top: 1px dashed var(--border); margin-top: 8px; padding-top: 8px;">
+                    <span class="tooltip-wrap">
+                        <strong>Gross Payout:</strong>
+                        <span class="tooltip-icon" title="{gross_tooltip}">?
+                            <span class="tooltiptext">{gross_tooltip}</span>
+                        </span>
+                    </span>
+                    <span><strong>{currency_symbol} {gross_payout_amount:,.2f}</strong></span>
+                </div>"""
+
+        html_content += f"""
+                <div class="payout-row">
+                    <span class="tooltip-wrap">
+                        <span>{advance_payout_desc or 'Advance Payout'}:</span>
+                        <span class="tooltip-icon" title="{advance_tooltip}">?
+                            <span class="tooltiptext">{advance_tooltip}</span>
+                        </span>
+                    </span>
+                    <span>- {currency_symbol} {advance_line_amount:,.2f}</span>
+                </div>
                 <div class="payout-row total">
-                    <span>Final Payout (Gross - Advance - Benefit Deductions):</span>
+                    <span class="tooltip-wrap">
+                        <strong>Final Payout:</strong>
+                        <span class="tooltip-icon" title="{final_tooltip}">?
+                            <span class="tooltiptext">{final_tooltip}</span>
+                        </span>
+                    </span>
                     <span>{currency_symbol} {final_payout:,.2f}</span>
                 </div>
             </div>
@@ -3695,21 +3782,28 @@ def main():
                 overpaid_df,
             )
 
-            # Calculate gross total payout (delivery + pickup + QR order + return + bonuses - penalties) - round to 2 decimal places
-            gross_total_payout = round(
-                gross_delivery_payout + pickup_payout + qr_order_payout + return_payout + reward_payout,
-                2,
+            gross_total_payout = PayoutCalculator.calculate_gross_payout(
+                base_delivery_payout,
+                pickup_payout,
+                qr_order_payout,
+                return_payout,
+                reward_payout,
+                kpi_bonus,
+                attendance_bonus,
+                penalty_breakdown["total_amount"],
+                socso_deduction,
+                overpaid_deduction,
             )
 
-            # Calculate advance payout (40% of base delivery payout only, not including pickup, bonuses, penalties)
-            advance_payout = 0.0
-            if advance_enabled and advance_percentage > 0:
-                advance_payout = round((base_delivery_payout * advance_percentage) / 100.0, 2)
+            advance_payout = PayoutCalculator.calculate_advance_payout(
+                base_delivery_payout,
+                advance_percentage,
+                advance_enabled,
+            )
 
-            # Calculate final payout - round to 2 decimal places
-            final_payout = round(
-                gross_total_payout - advance_payout - socso_deduction - overpaid_deduction,
-                2,
+            final_payout = PayoutCalculator.calculate_final_payout(
+                gross_total_payout,
+                advance_payout,
             )
 
             # Total AWB = delivery parcels + pickup parcels + return parcels.
@@ -3757,19 +3851,22 @@ def main():
                 st.metric(
                     "Gross Payout",
                     f"{config['currency_symbol']}{gross_total_payout:,.2f}",
-                    help="Total gross payout including bonuses and penalties"
+                    help=(
+                        "Base delivery + Pickup + QR Orders + Return + Reward "
+                        "+ KPI bonus + Attendance bonus − Total penalty − SOCSO − Overpaid."
+                    ),
                 )
             with row2_col3:
                 st.metric(
                     "Advance Payout",
                     f"{config['currency_symbol']}{advance_payout:,.2f}",
-                    help="40% of base delivery payout"
+                    help=f"{advance_percentage:g}% of base delivery payout",
                 )
             with row2_col4:
                 st.metric(
                     "Final Payout",
                     f"{config['currency_symbol']}{final_payout:,.2f}",
-                    help="Gross payout minus advance payout"
+                    help="Gross Payout − Advance payout",
                 )
 
             # Display daily breakdown
@@ -4202,22 +4299,17 @@ def main():
                 """)
 
             with breakdown_col3:
-                benefit_lines = ""
-                if socso_deduction > 0:
-                    benefit_lines += f"- SOCSO (Insurance): -{config['currency_symbol']}{socso_deduction:,.2f}\n"
-                if overpaid_deduction > 0:
-                    benefit_lines += f"- Overpaid: -{config['currency_symbol']}{overpaid_deduction:,.2f}\n"
                 if advance_enabled:
                     st.warning(f"""
                     **Advance & Final:**
-                    - Advance (40% of Base Delivery): -{config['currency_symbol']}{advance_payout:,.2f}
-                    {benefit_lines}- **Final Payout:** {config['currency_symbol']}{final_payout:,.2f}
+                    - Advance ({advance_percentage:g}% of Base Delivery): -{config['currency_symbol']}{advance_payout:,.2f}
+                    - **Final Payout:** {config['currency_symbol']}{final_payout:,.2f}
                     """)
                 else:
                     st.success(f"""
                     **Final Payout:**
-                    - **Gross Total:** {config['currency_symbol']}{gross_total_payout:,.2f}
-                    {benefit_lines}- **Final Payout:** {config['currency_symbol']}{final_payout:,.2f}
+                    - **Gross Payout:** {config['currency_symbol']}{gross_total_payout:,.2f}
+                    - **Final Payout:** {config['currency_symbol']}{final_payout:,.2f}
                     """)
 
         except Exception as e:
@@ -4297,6 +4389,11 @@ def main():
                 attendance_description=attendance_desc,
                 total_awb=total_awb,
                 designated_driver_breakdown=designated_driver_breakdown,
+                pickup_rate=float(config.get("pickup_payout_per_parcel", 1.0)),
+                qr_order_rate=float(config.get("qr_order_payout_per_order", 1.8)),
+                return_rate=float(config.get("return_payout_per_parcel", 0.5)),
+                advance_percentage=float(advance_percentage),
+                advance_enabled=bool(advance_enabled),
             )
 
             # Display invoice
@@ -4376,23 +4473,20 @@ Reward: +{config['currency_symbol']}{reward_payout:,.2f}
 KPI Bonus: +{config['currency_symbol']}{kpi_bonus:,.2f}
 Attendance Bonus: +{config['currency_symbol']}{attendance_bonus:,.2f}
 Total Penalties: -{config['currency_symbol']}{penalty_breakdown['total_amount']:,.2f}
+SOCSO: -{config['currency_symbol']}{socso_deduction:,.2f}
+Overpaid: -{config['currency_symbol']}{overpaid_deduction:,.2f}
 
-GROSS TOTAL PAYOUT
-------------------
+GROSS PAYOUT
+------------
 Gross Payout: {config['currency_symbol']}{gross_total_payout:,.2f}
 
 ADVANCE PAYOUT
 --------------
-Advance (40% of Base Delivery): -{config['currency_symbol']}{advance_payout:,.2f}
-
-BENEFIT DEDUCTIONS
-------------------
-SOCSO: -{config['currency_symbol']}{socso_deduction:,.2f}
-Overpaid: -{config['currency_symbol']}{overpaid_deduction:,.2f}
+Advance ({advance_percentage:g}% of Base Delivery): -{config['currency_symbol']}{advance_payout:,.2f}
 
 FINAL PAYOUT
 ------------
-Final Payout (Gross - Advance - Benefit Deductions): {config['currency_symbol']}{final_payout:,.2f}
+Final Payout: {config['currency_symbol']}{final_payout:,.2f}
 
 Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M')}
                 """
