@@ -112,7 +112,7 @@
   "fake_attempt_penalty_per_parcel": 2.0,
   "pending_parcel_penalty_per_parcel": 2.0,
   "no_outbound_scan_penalty_per_parcel": 3.0,
-  "route_penalty_amount": 0.0,
+  "route_penalty_amount": 3000.0,
   "designated_driver": {
     "dispatcher_id": "PEN3533252",
     "basic_amount": 1700.0,
