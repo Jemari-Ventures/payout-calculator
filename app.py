@@ -4215,9 +4215,7 @@ def main():
                         if penalty_breakdown['fake_attempt']['count'] > 0:
                             st.error(f"**Fake Attempt:** {penalty_breakdown['fake_attempt']['count']} parcel(s) - {config['currency_symbol']}{penalty_breakdown['fake_attempt']['amount']:,.2f}")
                             if penalty_breakdown['fake_attempt']['waybills']:
-                                st.caption("Waybills:")
-                                for wb in penalty_breakdown['fake_attempt']['waybills']:
-                                    st.markdown(f"- `{wb}`")
+                                st.caption(f"Waybills: {', '.join(penalty_breakdown['fake_attempt']['waybills'][:5])}")
 
                     with penalty_col4:
                         if penalty_breakdown['cod']['count'] > 0:
