@@ -1,7 +1,7 @@
 {
   "data_source": {
     "type": "excel",
-    "gsheet_url": "https://docs.google.com/spreadsheets/d/1QEAr5WKHoeVGxvOqcILChfCU1yo6bp9gsFuiOE0hNtc/edit?usp=sharing",
+    "gsheet_url": "https://docs.google.com/spreadsheets/d/1t2dC77Xt200IpVZ1ci5qRCwoeFn3-zAF2GMtSA3fI7c",
     "postgres_table": "dispatch",
     "pickup_table": "pickup",
     "excel_file": "",
@@ -112,7 +112,7 @@
   "fake_attempt_penalty_per_parcel": 2.0,
   "pending_parcel_penalty_per_parcel": 2.0,
   "no_outbound_scan_penalty_per_parcel": 3.0,
-  "route_penalty_amount": 3000.0,
+  "route_penalty_amount": 0.0,
   "designated_driver": {
     "dispatcher_id": "PEN3533252",
     "basic_amount": 1700.0,
