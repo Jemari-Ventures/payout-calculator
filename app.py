@@ -37,6 +37,7 @@ from penalty_common import (
     normalize_waybill,
     filter_rows_for_penalty_dispatcher,
     find_penalty_amount_column,
+    compute_pickup_commission_series,
     find_pickup_commission_column,
     find_amount_column,
     find_reward_dispatcher_name_column,
@@ -759,10 +760,6 @@ class DataSource:
         return DataSource._load_optional_sheet(config, "parcel_lost", "Parcel lost")
 
     @staticmethod
-    def load_qr_order_data(config: dict) -> Optional[pd.DataFrame]:
-        return DataSource._load_optional_sheet(config, "qr_order", "QR Order")
-
-    @staticmethod
     def load_reward_data(config: dict) -> Optional[pd.DataFrame]:
         return DataSource._load_optional_sheet(config, "reward", "Reward")
 
@@ -1014,7 +1011,6 @@ class PayoutCalculator:
     def calculate_gross_payout(
         base_payout: float,
         pickup_payout: float,
-        qr_order_payout: float,
         return_payout: float,
         reward_payout: float,
         kpi_bonus: float,
@@ -1027,7 +1023,6 @@ class PayoutCalculator:
         earnings = (
             float(base_payout)
             + float(pickup_payout)
-            + float(qr_order_payout)
             + float(return_payout)
             + float(reward_payout)
             + float(kpi_bonus)
@@ -1328,9 +1323,10 @@ class PayoutCalculator:
     @staticmethod
     def calculate_pickup(pickup_df: pd.DataFrame, dispatcher_id: str, rate: float = 1.00) -> Tuple[int, float, pd.DataFrame]:
         """
-        Counts total parcels (rows) for selected dispatcher in Sheet2
-        based on Pick Up Dispatcher ID matching the dispatcher_id.
-        Filters out rows with empty or invalid waybill numbers.
+        Count pickup parcels for a dispatcher and compute payout from Order Source rules.
+
+        Uses Order Source + Billing Weight when available; otherwise commission column
+        or flat fallback rate per parcel.
 
         Returns:
             Tuple of (parcel_count, payout, filtered_pickup_df)
@@ -1433,161 +1429,16 @@ class PayoutCalculator:
 
         parcel_count = len(valid_records)
 
+        commission_values = compute_pickup_commission_series(valid_records, fallback_rate=rate).round(2)
         commission_col = find_pickup_commission_column(valid_records)
-        if commission_col is not None:
-            payout = round(
-                float(valid_records[commission_col].apply(penalty_cell_to_float).sum()),
-                2,
-            )
+        if commission_col is None:
+            valid_records["Commission"] = commission_values
         else:
-            payout = round(parcel_count * rate, 2)
+            valid_records[commission_col] = commission_values
+
+        payout = round(float(commission_values.sum()), 2)
 
         return parcel_count, payout, valid_records
-
-    @staticmethod
-    def calculate_qr_order(qr_order_df: pd.DataFrame, dispatcher_id: str, rate: float = 1.80, dispatcher_name: Optional[str] = None) -> Tuple[int, float, pd.DataFrame]:
-        """
-        Counts total QR orders for selected dispatcher based on dispatcher column matching the dispatcher_id.
-        Filters out rows with empty or invalid order numbers.
-
-        Returns:
-            Tuple of (order_count, payout, filtered_qr_order_df)
-        """
-        if qr_order_df is None or qr_order_df.empty or not dispatcher_id:
-            return 0, 0.0, pd.DataFrame()
-
-        # Guard: if requested QR sheet falls back to Dispatch data (when tab is missing),
-        # do not count delivery rows as QR orders.
-        qr_cols_lower = {str(c).strip().lower() for c in qr_order_df.columns}
-        has_dispatch_signature = (
-            "delivery signature" in qr_cols_lower and
-            ("waybill number" in qr_cols_lower or "waybill" in qr_cols_lower) and
-            ("dispatcher id" in qr_cols_lower or "dispatcher_id" in qr_cols_lower)
-        )
-        has_qr_markers = any(
-            ("qr" in col) or ("order" in col) or ("awb" in col)
-            for col in qr_cols_lower
-        )
-        if has_dispatch_signature and not has_qr_markers:
-            return 0, 0.0, pd.DataFrame()
-
-        # Find dispatcher column - handle multiple possible column name formats
-        dispatcher_col = None
-        possible_dispatcher_cols = [
-            "dispatcher_id", "Dispatcher ID", "DISPATCHER_ID", "DISPATCHER ID",
-            "dispatcher", "Dispatcher", "DISPATCHER",
-            "pickup_dispatcher_id", "Pickup Dispatcher ID"
-        ]
-        for col_name in possible_dispatcher_cols:
-            if col_name in qr_order_df.columns:
-                dispatcher_col = col_name
-                break
-
-        # If not found, try case-insensitive search
-        if dispatcher_col is None:
-            for col in qr_order_df.columns:
-                col_lower = str(col).lower().strip()
-                if "dispatcher" in col_lower:
-                    dispatcher_col = col
-                    break
-
-        # Find order number column - handle multiple possible column name formats
-        order_col = None
-        possible_order_cols = [
-            "no_awb", "No Awb", "No AWB",
-            "order_no", "Order No", "Order Number", "order_number"
-        ]
-        for col_name in possible_order_cols:
-            if col_name in qr_order_df.columns:
-                order_col = col_name
-                break
-
-        # If not found, try case-insensitive search
-        if order_col is None:
-            for col in qr_order_df.columns:
-                col_lower = str(col).lower().strip()
-                if "awb" in col_lower or "order" in col_lower:
-                    order_col = col
-                    break
-
-        # Make sure required columns exist
-        if dispatcher_col is None or order_col is None:
-            return 0, 0.0, pd.DataFrame()
-
-        # Normalize dispatcher_id for comparison (handle numeric IDs like 1234.0)
-        def safe_dispatcher_to_string(value):
-            """Safely convert dispatcher ID to string, preserving format."""
-            if pd.isna(value):
-                return None
-            if isinstance(value, (int, float)):
-                if isinstance(value, float) and value.is_integer():
-                    return str(int(value))
-                return str(value)
-            value_str = str(value).strip()
-            if value_str == "" or value_str.lower() == "nan":
-                return None
-            return value_str
-
-        dispatcher_id_str = safe_dispatcher_to_string(dispatcher_id)
-        if dispatcher_id_str is None:
-            return 0, 0.0, pd.DataFrame()
-
-        # Clean and prepare the dispatcher column
-        qr_order_df = qr_order_df.copy()
-        qr_order_df[dispatcher_col] = qr_order_df[dispatcher_col].apply(safe_dispatcher_to_string)
-
-        # Filter records for this dispatcher
-        dispatcher_col_lower = str(dispatcher_col).lower().strip()
-        dispatcher_name_str = safe_dispatcher_to_string(dispatcher_name) if dispatcher_name else None
-        match_values = [dispatcher_id_str]
-        if dispatcher_name_str and "id" not in dispatcher_col_lower:
-            match_values.append(dispatcher_name_str)
-
-        matched_records = qr_order_df[qr_order_df[dispatcher_col].isin(match_values)]
-
-        if matched_records.empty:
-            return 0, 0.0, pd.DataFrame()
-
-        # Count unique orders - TREAT ALL ORDER NUMBERS AS STRINGS
-        # Convert to string to preserve format
-        # Only filter out NaN values, keep everything else
-        def safe_order_to_string(value):
-            """Safely convert order number to string, preserving original format."""
-            if pd.isna(value):
-                return None
-            # Handle numeric types (int/float) - convert to string without decimal notation
-            if isinstance(value, (int, float)):
-                # If it's a float with no decimal part, convert to int first
-                if isinstance(value, float) and value.is_integer():
-                    return str(int(value))
-                else:
-                    return str(value)
-            # For strings and other types, convert to string and strip
-            order_str = str(value).strip()
-            if order_str == "" or order_str.lower() == "nan":
-                return None
-            return order_str
-
-        order_strings = matched_records[order_col].apply(safe_order_to_string)
-
-        # Filter records to only include those with valid order numbers
-        valid_order_mask = order_strings.notna() & (order_strings != "")
-        valid_records = matched_records[valid_order_mask].copy()
-
-        if valid_records.empty:
-            return 0, 0.0, pd.DataFrame()
-
-        # Convert order column to string in the returned DataFrame
-        # This ensures order numbers are treated as strings and preserves format
-        if order_col in valid_records.columns:
-            valid_records[order_col] = valid_records[order_col].apply(safe_order_to_string)
-
-        # Count total orders (rows) - each row represents one order
-        order_count = len(valid_records)
-
-        payout = round(order_count * rate, 2)
-
-        return order_count, payout, valid_records
 
     @staticmethod
     def calculate_reward(
@@ -2454,8 +2305,6 @@ class InvoiceGenerator:
         reward_count: int = 0,
         pickup_payout: float = 0.0,
         pickup_parcels: int = 0,
-        qr_order_payout: float = 0.0,
-        qr_order_count: int = 0,
         return_payout: float = 0.0,
         return_count: int = 0,
         kpi_description: str = "",
@@ -2463,7 +2312,6 @@ class InvoiceGenerator:
         total_awb: int = 0,
         designated_driver_breakdown: Optional[dict] = None,
         pickup_rate: float = 1.0,
-        qr_order_rate: float = 1.8,
         return_rate: float = 0.5,
         advance_percentage: float = 40.0,
         advance_enabled: bool = True,
@@ -2476,7 +2324,6 @@ class InvoiceGenerator:
         gross_payout_amount = PayoutCalculator.calculate_gross_payout(
             base_payout,
             pickup_payout,
-            qr_order_payout,
             return_payout,
             reward_payout,
             kpi_bonus,
@@ -2496,7 +2343,7 @@ class InvoiceGenerator:
         )
 
         gross_tooltip = (
-            "Base delivery + Pickup + QR Orders + Return + Reward "
+            "Base delivery + Pickup + Return + Reward "
             "+ KPI bonus + Attendance bonus − Total penalty − SOCSO − Overpaid."
         )
         advance_tooltip = (
@@ -2728,8 +2575,8 @@ class InvoiceGenerator:
                         <div class="idline">From: JEMARI VENTURES &nbsp;&nbsp;|&nbsp;&nbsp; To: {cleaned_name}</div>
                     </div>
                     <div class="total-badge">
-                        <div class="label">Final Payout</div>
-                        <div class="value">{currency_symbol} {final_payout:,.2f}</div>
+                        <div class="label">Gross Payout</div>
+                        <div class="value">{currency_symbol} {gross_payout_amount:,.2f}</div>
                     </div>
                 </div>
 
@@ -2749,10 +2596,6 @@ class InvoiceGenerator:
                     <div class="chip">
                         <div class="label">Pickup Parcels</div>
                         <div class="value">{pickup_parcels:,}</div>
-                    </div>
-                    <div class="chip">
-                        <div class="label">QR Orders</div>
-                        <div class="value">{qr_order_count:,}</div>
                     </div>
                     <div class="chip">
                         <div class="label">Return Parcels</div>
@@ -2996,12 +2839,8 @@ class InvoiceGenerator:
 
         html_content += f"""
                 <div class="payout-row">
-                    <span>Pickup Payout ({pickup_parcels} parcel(s) × {currency_symbol}{pickup_rate:.2f}):</span>
+                    <span>Pickup Payout ({pickup_parcels} parcel(s)):</span>
                     <span>+ {currency_symbol} {pickup_payout:,.2f}</span>
-                </div>
-                <div class="payout-row">
-                    <span>QR Order Payout ({qr_order_count} order(s) × {currency_symbol}{qr_order_rate:.2f}):</span>
-                    <span>+ {currency_symbol} {qr_order_payout:,.2f}</span>
                 </div>
                 <div class="payout-row">
                     <span>Return Payout ({return_count} parcel(s) × {currency_symbol}{return_rate:.2f}):</span>
@@ -3396,7 +3235,7 @@ def main():
         value=(default_start, max_date),
         min_value=min_date,
         max_value=max_date,
-        help="Dispatch (Delivery Signature), pickup/QR (date_pick_up), and return (Delivery Signature).",
+        help="Dispatch (Delivery Signature), pickup (date_pick_up), and return (Delivery Signature).",
     )
 
     if isinstance(selected_range, tuple) and len(selected_range) == 2:
@@ -3426,7 +3265,6 @@ def main():
 
     # Load supplemental sheets before dispatcher selection
     pickup_df = DataSource.load_pickup_data(config)
-    qr_order_df = DataSource.load_qr_order_data(config)
     reward_df = DataSource.load_reward_data(config)
     return_df = DataSource.load_return_data(config)
     attendance_df = DataSource.load_attendance_data(config)
@@ -3447,9 +3285,6 @@ def main():
     )
     return_df = filter_sheet_by_date_range(
         return_df, start_date, end_date, ["Delivery Signature", "delivery_signature"]
-    )
-    qr_order_df = filter_sheet_by_date_range(
-        qr_order_df, start_date, end_date, ["date_pick_up", "Date Pick Up", "date pick up"]
     )
     penalty_filtered = filter_penalty_data_by_date(
         {
@@ -3596,7 +3431,6 @@ def main():
         "Pending Parcel": pending_parcel_df,
         "No Outbound Scan": no_outbound_scan_df,
         "Parcel Lost": parcel_lost_df,
-        "QR Order": qr_order_df,
         "Return": return_df,
         "Reward": reward_df,
         "Attendance": attendance_df,
@@ -3658,8 +3492,6 @@ def main():
     attendance_bonus = 0.0
     pickup_payout = 0.0
     pickup_parcels = 0
-    qr_order_payout = 0.0
-    qr_order_count = 0
     return_payout = 0.0
     return_count = 0
     reward_payout = 0.0
@@ -3686,7 +3518,6 @@ def main():
                         'total_amount': 0.0, 'total_count': 0}
     per_day_df = pd.DataFrame()
     pickup_filtered_df = pd.DataFrame()
-    qr_order_filtered_df = pd.DataFrame()
     return_filtered_df = pd.DataFrame()
     reward_filtered_df = pd.DataFrame()
     designated_driver_breakdown = None
@@ -3748,18 +3579,11 @@ def main():
                     base_delivery_payout,
                 )
 
-            # Calculate pickup payout (assuming RM1.00 per pickup parcel)
+            # Calculate pickup payout (Order Source rules; fallback rate from config)
             pickup_parcels, pickup_payout, pickup_filtered_df = PayoutCalculator.calculate_pickup(
                 pickup_df,
                 selected_dispatcher_id,
                 rate=float(config.get("pickup_payout_per_parcel", 1.0)),
-            )
-
-            qr_order_count, qr_order_payout, qr_order_filtered_df = PayoutCalculator.calculate_qr_order(
-                qr_order_df,
-                selected_dispatcher_id,
-                rate=float(config.get("qr_order_payout_per_order", 1.8)),
-                dispatcher_name=selected_dispatcher_name,
             )
 
             return_count, return_payout, return_filtered_df = PayoutCalculator.calculate_return(
@@ -3785,7 +3609,6 @@ def main():
             gross_total_payout = PayoutCalculator.calculate_gross_payout(
                 base_delivery_payout,
                 pickup_payout,
-                qr_order_payout,
                 return_payout,
                 reward_payout,
                 kpi_bonus,
@@ -3852,7 +3675,7 @@ def main():
                     "Gross Payout",
                     f"{config['currency_symbol']}{gross_total_payout:,.2f}",
                     help=(
-                        "Base delivery + Pickup + QR Orders + Return + Reward "
+                        "Base delivery + Pickup + Return + Reward "
                         "+ KPI bonus + Attendance bonus − Total penalty − SOCSO − Overpaid."
                     ),
                 )
@@ -3889,7 +3712,7 @@ def main():
             # Display bonuses and penalties
             st.subheader("🎯 Incentives & Penalties")
 
-            col1, col2, col3, col4, col5, col6 = st.columns(6)
+            col1, col2, col3, col4, col5 = st.columns(5)
 
             with col1:
                 st.metric(
@@ -3924,22 +3747,6 @@ def main():
                     )
 
             with col4:
-                if qr_order_count > 0:
-                    st.metric(
-                        "QR Order Payout",
-                        f"{config['currency_symbol']}{qr_order_payout:,.2f}",
-                        delta=f"{qr_order_count} orders",
-                        delta_color="normal"
-                    )
-                else:
-                    st.metric(
-                        "QR Order Payout",
-                        f"{config['currency_symbol']}0.00",
-                        delta="No QR orders",
-                        delta_color="off"
-                    )
-
-            with col5:
                 if return_count > 0:
                     st.metric(
                         "Return Payout",
@@ -3955,7 +3762,7 @@ def main():
                         delta_color="off"
                     )
 
-            with col6:
+            with col5:
                 if penalty_breakdown['total_amount'] > 0:
                     st.metric(
                         "Total Penalty",
@@ -3987,7 +3794,7 @@ def main():
                     st.info(
                         f"**Total Pickup Parcels: {pickup_parcels}** | "
                         f"**Payout: {config['currency_symbol']}{pickup_payout:,.2f}** "
-                        f"(sum of commission column)"
+                        f"(Order Source commission rules)"
                     )
 
                     # Clean up column names for display and remove unnamed columns
@@ -4048,88 +3855,6 @@ def main():
             else:
                 with st.expander("📦 Pickup Details", expanded=False):
                     st.info("No pickup records found for this dispatcher.")
-
-            # Display QR order details if available
-            if qr_order_count > 0 and not qr_order_filtered_df.empty:
-                with st.expander("📱 QR Order Details", expanded=False):
-                    st.info(f"**Total QR Orders: {qr_order_count}** | **Payout: {config['currency_symbol']}{qr_order_payout:,.2f}** (RM1.80 per order)")
-
-                    # Clean up column names for display and remove unnamed columns
-                    display_qr_order_df = qr_order_filtered_df.copy()
-
-                    # Ensure Order No is treated as string BEFORE filtering columns
-                    order_col_display = None
-                    for col in display_qr_order_df.columns:
-                        col_lower = str(col).lower()
-                        if ("order" in col_lower and ("no" in col_lower or "number" in col_lower)) or "waybill" in col_lower or "awb" in col_lower:
-                            order_col_display = col
-                            break
-
-                    if order_col_display:
-                        def safe_order_display(value):
-                            """Safely convert order number to string for display, preserving format."""
-                            if pd.isna(value):
-                                return ""
-                            # Handle numeric types - remove .0 from floats
-                            if isinstance(value, (int, float)):
-                                if isinstance(value, float) and value.is_integer():
-                                    return str(int(value))
-                                return str(value)
-                            # For strings, return as-is
-                            return str(value).strip()
-
-                        display_qr_order_df[order_col_display] = display_qr_order_df[order_col_display].apply(safe_order_display)
-
-                    # Filter out unnamed columns (columns that start with "Unnamed" or are empty)
-                    valid_columns = [
-                        col for col in display_qr_order_df.columns
-                        if not (str(col).startswith('Unnamed') or str(col).strip() == '' or str(col).lower() == 'nan')
-                    ]
-                    display_qr_order_df = display_qr_order_df[valid_columns]
-
-                    # Remove technical QR columns if present (safe when missing)
-                    drop_qr_columns = []
-                    for col in display_qr_order_df.columns:
-                        col_normalized = re.sub(r"[\s_]+", "", str(col).strip().lower())
-                        if col_normalized in {"orderstatus", "orderno"}:
-                            drop_qr_columns.append(col)
-                    if drop_qr_columns:
-                        display_qr_order_df = display_qr_order_df.drop(columns=drop_qr_columns, errors="ignore")
-
-                    # Clean up column names for display
-                    display_qr_order_df.columns = [str(col).title() for col in display_qr_order_df.columns]
-
-                    # Configure column display - ensure order number is shown as text (not number)
-                    column_config = {}
-                    # Find order column after title transformation
-                    order_col_final = None
-                    for col in display_qr_order_df.columns:
-                        col_lower = col.lower()
-                        if ("order" in col_lower and ("no" in col_lower or "number" in col_lower)) or "waybill" in col_lower or "awb" in col_lower:
-                            order_col_final = col
-                            break
-
-                    if order_col_final:
-                        column_config[order_col_final] = st.column_config.TextColumn(order_col_final)
-
-                    # Display the filtered QR order dataframe
-                    st.dataframe(
-                        display_qr_order_df,
-                        use_container_width=True,
-                        hide_index=True,
-                        column_config=column_config if column_config else None
-                    )
-            else:
-                with st.expander("📱 QR Order Details", expanded=False):
-                    st.info("No QR order records found for this dispatcher.")
-                    if qr_order_df is None:
-                        st.warning("QR Order sheet could not be loaded.")
-                    elif qr_order_df.empty:
-                        st.warning("QR Order sheet is empty.")
-                    else:
-                        columns_preview = ", ".join([str(col) for col in qr_order_df.columns])
-                        st.caption(f"QR Order rows: {len(qr_order_df)} | Columns: {columns_preview}")
-                        st.caption(f"Selected dispatcher ID: {selected_dispatcher_id}")
 
             # Display return details if available
             if return_count > 0 and not return_filtered_df.empty:
@@ -4290,7 +4015,6 @@ def main():
                 st.info(f"""
                 **Additional Earnings:**
                 - Pickup ({pickup_parcels} parcels): +{config['currency_symbol']}{pickup_payout:,.2f}
-                - QR Order ({qr_order_count} orders): +{config['currency_symbol']}{qr_order_payout:,.2f}
                 - Return ({return_count} parcels): +{config['currency_symbol']}{return_payout:,.2f}
                 - Reward ({reward_count} record(s)): +{config['currency_symbol']}{reward_payout:,.2f}
                 - Gross Total: {config['currency_symbol']}{gross_total_payout:,.2f}
@@ -4379,8 +4103,6 @@ def main():
                 currency_symbol=config["currency_symbol"],
                 pickup_payout=pickup_payout,
                 pickup_parcels=pickup_parcels,
-                qr_order_payout=qr_order_payout,
-                qr_order_count=qr_order_count,
                 return_payout=return_payout,
                 return_count=return_count,
                 kpi_description=kpi_description,
@@ -4388,7 +4110,6 @@ def main():
                 total_awb=total_awb,
                 designated_driver_breakdown=designated_driver_breakdown,
                 pickup_rate=float(config.get("pickup_payout_per_parcel", 1.0)),
-                qr_order_rate=float(config.get("qr_order_payout_per_order", 1.8)),
                 return_rate=float(config.get("return_payout_per_parcel", 0.5)),
                 advance_percentage=float(advance_percentage),
                 advance_enabled=bool(advance_enabled),
@@ -4459,13 +4180,11 @@ Total AWB: {total_awb:,}
 Total Delivery Parcels: {display_df['Total Parcel'].sum():,}
 Working Days: {len(display_df)}
 Pickup Parcels: {pickup_parcels:,}
-QR Orders: {qr_order_count:,}
 Return Parcels: {return_count:,}
 
 PAYOUT BREAKDOWN
 ----------------
 {base_delivery_lines}Pickup Payout: +{config['currency_symbol']}{pickup_payout:,.2f}
-QR Order Payout: +{config['currency_symbol']}{qr_order_payout:,.2f}
 Return Payout: +{config['currency_symbol']}{return_payout:,.2f}
 Reward: +{config['currency_symbol']}{reward_payout:,.2f}
 KPI Bonus: +{config['currency_symbol']}{kpi_bonus:,.2f}

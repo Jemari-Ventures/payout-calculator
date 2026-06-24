@@ -33,7 +33,8 @@ from penalty_common import (
     find_employee_id_column,
     find_penalty_dispatcher_column,
     find_penalty_waybill_column,
-    find_pickup_commission_column,
+    compute_pickup_commission_series,
+    sum_pickup_commission,
     find_rider_column,
     find_achieve_column,
     penalty_cell_to_float,
@@ -1081,40 +1082,6 @@ class DataSource:
             return df
         except Exception as exc:
             st.warning(f"Could not load pickup data from PostgreSQL table '{pickup_table}': {exc}")
-            return None
-
-    @staticmethod
-    def load_qr_order_data(config: dict, excel_source=None) -> Optional[pd.DataFrame]:
-        """Load QR order data from qr_order table."""
-        data_source = config.get("data_source", {})
-        source_type = data_source.get("type", "postgres")
-
-        if source_type == "excel":
-            try:
-                sheet_name = DataSource._get_excel_sheet_name(config, "qr_order", "QR Order")
-                dispatch_sheet_name = DataSource._get_excel_sheet_name(config, "dispatch", "Dispatch")
-                gsheet_url = data_source.get("gsheet_url")
-                if not gsheet_url:
-                    return None
-                qr_df = DataSource.read_google_sheet(gsheet_url, sheet_name=sheet_name)
-                dispatch_df = DataSource.read_google_sheet(gsheet_url, sheet_name=dispatch_sheet_name)
-                if DataSource._is_fallback_dispatch_sheet(qr_df, dispatch_df):
-                    return pd.DataFrame()
-                return qr_df
-            except Exception as exc:
-                st.warning(f"Could not load QR order data from Excel sheet '{sheet_name}': {exc}")
-                return None
-
-        engine = DataSource.get_postgres_engine()
-
-        if not engine:
-            return None
-
-        try:
-            df = DataSource.read_postgres_table(engine, 'qr_order')
-            return df
-        except Exception as exc:
-            st.warning(f"Could not load QR order data from PostgreSQL table 'qr_order': {exc}")
             return None
 
     @staticmethod
@@ -2514,15 +2481,10 @@ class PayoutCalculator:
     @staticmethod
     def calculate_pickup_payout(pickup_df: pd.DataFrame, dispatcher_summary_df: pd.DataFrame, pickup_payout_per_parcel: float = 1.50) -> pd.DataFrame:
         """
-        Calculate pickup payout based on pickup data.
+        Calculate pickup payout per dispatcher from Order Source commission rules.
 
-        Args:
-            pickup_df: DataFrame containing pickup data
-            dispatcher_summary_df: DataFrame containing dispatcher summary (must have 'Dispatcher ID' column)
-            pickup_payout_per_parcel: Payout per pickup parcel
-
-        Returns:
-            DataFrame with pickup payout added to dispatcher summary
+        Uses Order Source + Billing Weight when available; otherwise commission column
+        or flat fallback rate per parcel.
         """
         if pickup_df is None or pickup_df.empty:
             dispatcher_summary_df['pickup_parcels'] = 0
@@ -2561,20 +2523,15 @@ class PayoutCalculator:
         pickup_work['_dispatcher_key'] = pickup_work[pickup_dispatcher_col].apply(normalize_dispatcher_id)
         pickup_work = pickup_work[pickup_work['_dispatcher_key'] != '']
 
-        commission_col = find_pickup_commission_column(pickup_work)
-        if commission_col is not None:
-            pickup_work['_pickup_commission'] = pickup_work[commission_col].apply(penalty_cell_to_float)
-            pickup_summary = pickup_work.groupby('_dispatcher_key').agg(
-                pickup_parcels=(waybill_col, 'size'),
-                pickup_payout=('_pickup_commission', 'sum'),
-                dispatcher_id=(pickup_dispatcher_col, 'first'),
-            ).reset_index()
-        else:
-            pickup_summary = pickup_work.groupby('_dispatcher_key').agg(
-                pickup_parcels=(waybill_col, 'size'),
-                dispatcher_id=(pickup_dispatcher_col, 'first'),
-            ).reset_index()
-            pickup_summary['pickup_payout'] = pickup_summary['pickup_parcels'] * pickup_payout_per_parcel
+        pickup_work['_pickup_commission'] = compute_pickup_commission_series(
+            pickup_work,
+            fallback_rate=pickup_payout_per_parcel,
+        )
+        pickup_summary = pickup_work.groupby('_dispatcher_key').agg(
+            pickup_parcels=(waybill_col, 'size'),
+            pickup_payout=('_pickup_commission', 'sum'),
+            dispatcher_id=(pickup_dispatcher_col, 'first'),
+        ).reset_index()
 
         dispatcher_summary_df = dispatcher_summary_df.copy()
         dispatcher_summary_df['_dispatcher_key'] = dispatcher_summary_df['dispatcher_id'].apply(
@@ -2603,8 +2560,6 @@ class PayoutCalculator:
                 'pickup_payout': pickup_only['pickup_payout'].astype(float),
                 'return_parcels': 0,
                 'return_payout': 0.0,
-                'qr_order_count': 0,
-                'qr_order_payout': 0.0,
                 'dispatch_payout': 0.0,
                 'total_payout': 0.0,
                 'penalty_amount': 0.0,
@@ -2634,114 +2589,6 @@ class PayoutCalculator:
         dispatcher_summary_df['pickup_payout'] = (
             pd.to_numeric(dispatcher_summary_df['pickup_payout'], errors='coerce').fillna(0.0).round(2)
         )
-        dispatcher_summary_df = dispatcher_summary_df.drop(columns=['_dispatcher_key'], errors='ignore')
-
-        return dispatcher_summary_df
-
-    @staticmethod
-    def calculate_qr_order_payout(qr_order_df: pd.DataFrame, dispatcher_summary_df: pd.DataFrame, qr_order_payout_per_order: float = 1.80) -> pd.DataFrame:
-        """
-        Calculate QR order payout based on QR order data.
-
-        Args:
-            qr_order_df: DataFrame containing QR order data
-            dispatcher_summary_df: DataFrame containing dispatcher summary (must have 'Dispatcher ID' column)
-            qr_order_payout_per_order: Payout per QR order (RM 1.80 per order_no)
-
-        Returns:
-            DataFrame with QR order payout added to dispatcher summary
-        """
-        if qr_order_df is None or qr_order_df.empty:
-            dispatcher_summary_df['qr_order_count'] = 0
-            dispatcher_summary_df['qr_order_payout'] = 0.0
-            return dispatcher_summary_df
-
-        # Find dispatcher columns in QR order data (priority fallback per row)
-        dispatcher_col_priority = ('dispatcher_id', 'dispatcher', 'pickup_dispatcher_id')
-        dispatcher_cols = []
-        for preferred_col in dispatcher_col_priority:
-            matched_col = next(
-                (col for col in qr_order_df.columns if str(col).lower() == preferred_col),
-                None
-            )
-            if matched_col:
-                dispatcher_cols.append(matched_col)
-
-        if not dispatcher_cols:
-            st.warning("⚠️ No dispatcher column found in QR order data")
-            dispatcher_summary_df['qr_order_count'] = 0
-            dispatcher_summary_df['qr_order_payout'] = 0.0
-            return dispatcher_summary_df
-
-        # Find waybill_number column (unique identifier for each order)
-        order_no_col = None
-        for col in qr_order_df.columns:
-            col_lower = str(col).lower()
-            if col_lower in ('waybill_number', 'no_awb'):
-                order_no_col = col
-                break
-
-        if not order_no_col:
-            st.warning("⚠️ No waybill_number column found in QR order data")
-            dispatcher_summary_df['qr_order_count'] = 0
-            dispatcher_summary_df['qr_order_payout'] = 0.0
-            return dispatcher_summary_df
-
-        # Normalize dispatcher IDs and order identifiers before grouping.
-        # This avoids mismatches like "1234" vs "1234.0" and ignores blank/null order keys.
-        qr_order_work = qr_order_df.copy()
-        qr_order_work['clean_dispatcher_id'] = ""
-        for disp_col in dispatcher_cols:
-            normalized_series = qr_order_work[disp_col].apply(normalize_dispatcher_id)
-            qr_order_work['clean_dispatcher_id'] = qr_order_work['clean_dispatcher_id'].where(
-                qr_order_work['clean_dispatcher_id'] != "",
-                normalized_series
-            )
-
-        order_series = qr_order_work[order_no_col].astype(str).str.strip()
-        order_series = order_series.replace({
-            "": pd.NA,
-            "nan": pd.NA,
-            "NaN": pd.NA,
-            "None": pd.NA,
-            "none": pd.NA,
-            "NULL": pd.NA,
-            "null": pd.NA
-        })
-        qr_order_work['_clean_order_key'] = order_series
-
-        qr_order_work = qr_order_work[
-            (qr_order_work['clean_dispatcher_id'] != "") &
-            (qr_order_work['_clean_order_key'].notna())
-        ]
-
-        # Group by normalized dispatcher ID to count valid order rows.
-        # This matches app.py behavior: each valid row is one QR order.
-        qr_order_summary = qr_order_work.groupby('clean_dispatcher_id').agg(
-            qr_order_count=('_clean_order_key', 'size')
-        ).reset_index()
-
-        # Calculate QR order payout
-        qr_order_summary['qr_order_payout'] = qr_order_summary['qr_order_count'] * qr_order_payout_per_order
-
-        # Rename column for merging
-        qr_order_summary = qr_order_summary.rename(columns={'clean_dispatcher_id': '_dispatcher_key'})
-
-        # Merge with dispatcher summary
-        dispatcher_summary_df = dispatcher_summary_df.copy()
-        dispatcher_summary_df['_dispatcher_key'] = dispatcher_summary_df['dispatcher_id'].apply(
-            lambda x: normalize_dispatcher_id(str(x))
-        )
-
-        dispatcher_summary_df = dispatcher_summary_df.merge(
-            qr_order_summary[['_dispatcher_key', 'qr_order_count', 'qr_order_payout']],
-            on='_dispatcher_key',
-            how='left'
-        )
-
-        # Fill NaN values
-        dispatcher_summary_df['qr_order_count'] = dispatcher_summary_df['qr_order_count'].fillna(0).astype(int)
-        dispatcher_summary_df['qr_order_payout'] = dispatcher_summary_df['qr_order_payout'].fillna(0.0)
         dispatcher_summary_df = dispatcher_summary_df.drop(columns=['_dispatcher_key'], errors='ignore')
 
         return dispatcher_summary_df
@@ -2829,8 +2676,6 @@ class PayoutCalculator:
     def calculate_payout(df: pd.DataFrame, currency_symbol: str, penalty_data: Optional[Dict[str, pd.DataFrame]] = None,
                         pickup_df: Optional[pd.DataFrame] = None,
                         pickup_payout_per_parcel: float = 1.50,
-                        qr_order_df: Optional[pd.DataFrame] = None,
-                        qr_order_payout_per_order: float = 1.80,
                         return_df: Optional[pd.DataFrame] = None,
                         return_payout_per_parcel: float = 1.50,
                         reward_df: Optional[pd.DataFrame] = None,
@@ -3119,9 +2964,6 @@ class PayoutCalculator:
         # Calculate pickup payout
         grouped = PayoutCalculator.calculate_pickup_payout(pickup_df, grouped, pickup_payout_per_parcel)
 
-        # Calculate QR order payout
-        grouped = PayoutCalculator.calculate_qr_order_payout(qr_order_df, grouped, qr_order_payout_per_order)
-
         # Calculate return payout
         grouped = PayoutCalculator.calculate_return_payout(return_df, grouped, return_payout_per_parcel)
 
@@ -3133,12 +2975,11 @@ class PayoutCalculator:
             lambda x: float(overpaid_map.get(normalize_dispatcher_id(str(x)), 0.0))
         )
 
-        # Calculate total payout: dispatch - penalty + pickup + QR order + return + reward - rental - benefit deductions
+        # Calculate total payout: dispatch - penalty + pickup + return + reward - rental - benefit deductions
         grouped['total_payout'] = (
             grouped['dispatch_payout']
             - grouped['penalty_amount']
             + grouped['pickup_payout']
-            + grouped['qr_order_payout']
             + grouped['return_payout']
             + grouped['reward']
             - grouped['rental']
@@ -3183,8 +3024,6 @@ class PayoutCalculator:
             "attendance_penalty": "Attendance Penalty",
             "pickup_parcels": "Pickup Parcels",
             "pickup_payout": "Pickup Parcels Payout",
-            "qr_order_count": "QR Orders",
-            "qr_order_payout": "QR Orders Payout",
             "return_parcels": "Return Parcels",
             "return_payout": "Return Parcels Payout",
             "reward": "Reward",
@@ -3237,8 +3076,6 @@ class PayoutCalculator:
         if "Attendance Penalty" in display_df.columns:
             display_df["Attendance Penalty"] = display_df["Attendance Penalty"].apply(lambda x: f"-{currency_symbol}{x:,.2f}" if x > 0 else f"{currency_symbol}0.00")
         display_df["Pickup Parcels Payout"] = display_df["Pickup Parcels Payout"].apply(lambda x: f"{currency_symbol}{x:,.2f}")
-        if "QR Orders Payout" in display_df.columns:
-            display_df["QR Orders Payout"] = display_df["QR Orders Payout"].apply(lambda x: f"{currency_symbol}{x:,.2f}")
         if "Return Parcels Payout" in display_df.columns:
             display_df["Return Parcels Payout"] = display_df["Return Parcels Payout"].apply(lambda x: f"{currency_symbol}{x:,.2f}")
         if "Reward" in display_df.columns:
@@ -3293,7 +3130,6 @@ class PayoutCalculator:
         # Calculate breakdown for info message
         total_dispatch_payout = numeric_df["Delivery Parcels Payout"].sum()
         total_pickup_payout = numeric_df["Pickup Parcels Payout"].sum()
-        total_qr_order_payout = numeric_df["QR Orders Payout"].sum() if "QR Orders Payout" in numeric_df.columns else 0.0
         total_return_payout = numeric_df["Return Parcels Payout"].sum() if "Return Parcels Payout" in numeric_df.columns else 0.0
         total_reward = numeric_df["Reward"].sum() if "Reward" in numeric_df.columns else 0.0
         total_rental = numeric_df["Rental"].sum() if "Rental" in numeric_df.columns else 0.0
@@ -3305,7 +3141,6 @@ class PayoutCalculator:
         💰 **Payout Breakdown:**
         - Delivery Parcels Payout: {currency_symbol} {total_dispatch_payout:,.2f}
         + Pickup Parcels Payout: {currency_symbol} {total_pickup_payout:,.2f}
-        + QR Orders Payout: {currency_symbol} {total_qr_order_payout:,.2f}
         + Return Parcels Payout: {currency_symbol} {total_return_payout:,.2f}
         + Reward: {currency_symbol} {total_reward:,.2f}
         - Penalties (excl. SOCSO/Overpaid): {currency_symbol} {total_penalty:,.2f}
@@ -3607,16 +3442,15 @@ class InvoiceGenerator:
                           pickup_payout_per_parcel: float = 1.50) -> str:
         """Build management summary invoice HTML with original layout."""
         try:
-            total_parcels = int(numeric_df["Parcels Delivered"].sum())
+            total_delivery_parcels = int(numeric_df["Parcels Delivered"].sum()) if "Parcels Delivered" in numeric_df.columns else 0
+            total_pickup_parcels = int(numeric_df["Pickup Parcels"].sum()) if "Pickup Parcels" in numeric_df.columns else 0
+            total_return_parcels = int(numeric_df["Return Parcels"].sum()) if "Return Parcels" in numeric_df.columns else 0
+            total_awb = total_delivery_parcels + total_pickup_parcels + total_return_parcels
             total_dispatchers = len(numeric_df)
             total_weight = numeric_df["Total Weight (kg)"].sum()
             total_dispatch_payout = numeric_df["Delivery Parcels Payout"].sum() if "Delivery Parcels Payout" in numeric_df.columns else 0.0
             total_pickup_payout = numeric_df["Pickup Parcels Payout"].sum() if "Pickup Parcels Payout" in numeric_df.columns else 0.0
-            total_pickup_parcels = int(numeric_df["Pickup Parcels"].sum()) if "Pickup Parcels" in numeric_df.columns else 0
             total_return_payout = numeric_df["Return Parcels Payout"].sum() if "Return Parcels Payout" in numeric_df.columns else 0.0
-            total_return_parcels = int(numeric_df["Return Parcels"].sum()) if "Return Parcels" in numeric_df.columns else 0
-            total_qr_orders = int(numeric_df["QR Orders"].sum()) if "QR Orders" in numeric_df.columns else 0
-            total_qr_order_payout = numeric_df["QR Orders Payout"].sum() if "QR Orders Payout" in numeric_df.columns else 0.0
             total_reward = numeric_df["Reward"].sum() if "Reward" in numeric_df.columns else 0.0
             total_rental = numeric_df["Rental"].sum() if "Rental" in numeric_df.columns else 0.0
             penalty_by_type = {
@@ -3643,7 +3477,6 @@ class InvoiceGenerator:
                 total_dispatch_payout
                 + total_pickup_payout
                 + total_return_payout
-                + total_qr_order_payout
                 + total_reward
                 - total_rental
             )
@@ -3698,6 +3531,33 @@ class InvoiceGenerator:
                 }}
                 .summary-row {{
                   display: flex; gap: 12px; flex-wrap: wrap; justify-content: center; margin-bottom: 12px;
+                  width: 100%;
+                }}
+                .summary-row.metric-row {{
+                  justify-content: center;
+                  align-items: stretch;
+                }}
+                .summary-row.metric-row .chip {{
+                  flex: 1 1 160px;
+                  max-width: 220px;
+                }}
+                .chip .label .info-icon {{
+                  display: inline-flex;
+                  align-items: center;
+                  justify-content: center;
+                  width: 14px;
+                  height: 14px;
+                  margin-left: 4px;
+                  border-radius: 50%;
+                  background: var(--text-secondary);
+                  color: white;
+                  font-size: 10px;
+                  font-weight: 700;
+                  cursor: help;
+                  vertical-align: middle;
+                }}
+                .summary-row.payout-summary .chip {{
+                  flex: 0 1 280px;
                 }}
                 .chip {{
                   border: 1px solid var(--border); border-radius: 12px;
@@ -3762,14 +3622,20 @@ class InvoiceGenerator:
                     </div>
 
                     <div class="summary">
-                        <div class="summary-row">
+                        <div class="summary-row metric-row">
                         <div class="chip">
-                            <div class="label">Total Dispatchers</div>
-                            <div class="value">{total_dispatchers}</div>
+                            <div class="label">Dispatchers</div>
+                            <div class="value">{total_dispatchers:,}</div>
                         </div>
                         <div class="chip">
-                            <div class="label">Total Parcels</div>
-                            <div class="value">{total_parcels:,}</div>
+                            <div class="label" title="Total parcels across Delivery, Pickup, and Return per dispatcher (delivery + pickup + return).">
+                                Total AWB<span class="info-icon">?</span>
+                            </div>
+                            <div class="value">{total_awb:,}</div>
+                        </div>
+                        <div class="chip">
+                            <div class="label">Delivery Parcels</div>
+                            <div class="value">{total_delivery_parcels:,}</div>
                         </div>
                         <div class="chip">
                             <div class="label">Pickup Parcels</div>
@@ -3779,22 +3645,15 @@ class InvoiceGenerator:
                             <div class="label">Return Parcels</div>
                             <div class="value">{total_return_parcels:,}</div>
                         </div>
-                        <div class="chip">
-                            <div class="label">QR Orders</div>
-                            <div class="value">{total_qr_orders:,}</div>
                         </div>
-                        </div>
-                        <div class="summary-row">
+                        <div class="summary-row payout-summary">
                             <div class="chip">
                                 <div class="label">Total Payout</div>
                                 <div class="value">{currency_symbol} {invoice_total_payout:,.2f}</div>
                                 <div class="subtext">
                                     Delivery: {currency_symbol} {total_dispatch_payout:,.2f} ·
                                     Pickup: {currency_symbol} {total_pickup_payout:,.2f} ·
-                                    Return: {currency_symbol} {total_return_payout:,.2f}<br>
-                                    QR Orders: {currency_symbol} {total_qr_order_payout:,.2f} ·
-                                    Reward: {currency_symbol} {total_reward:,.2f} ·
-                                    Rental: -{currency_symbol} {total_rental:,.2f}
+                                    Return: {currency_symbol} {total_return_payout:,.2f}
                                 </div>
                             </div>
                             <div class="chip">
@@ -3844,9 +3703,6 @@ class InvoiceGenerator:
                         <table style="width:100%; background:var(--surface); border-radius:8px; margin-top:2rem; border:1px solid var(--border)">
                             <tr><th style="background:var(--primary);color:white;text-align:left;">Summary</th><th style="background:var(--primary);color:white;text-align:right;">Amount</th></tr>
                             <tr><td>Delivery Parcels Payout</td><td style="text-align:right;">{currency_symbol} {total_dispatch_payout:,.2f}</td></tr>
-                            <tr><td>Pickup Parcels Payout</td><td style="text-align:right;">{currency_symbol} {total_pickup_payout:,.2f}</td></tr>
-                            <tr><td>Return Parcels Payout</td><td style="text-align:right;">{currency_symbol} {total_return_payout:,.2f}</td></tr>
-                            <tr><td>QR Orders Payout</td><td style="text-align:right;">{currency_symbol} {total_qr_order_payout:,.2f}</td></tr>
                             <tr><td>Total Reward</td><td style="text-align:right;">{currency_symbol} {total_reward:,.2f}</td></tr>
                             <tr><td>Total Rental (deduction)</td><td style="text-align:right;">-{currency_symbol} {total_rental:,.2f}</td></tr>
                             <tr><td><strong>Total Payout</strong></td><td style="text-align:right;"><strong>{currency_symbol} {invoice_total_payout:,.2f}</strong></td></tr>
@@ -3992,21 +3848,6 @@ def main():
         config["pickup_payout_per_parcel"] = pickup_payout_per_parcel
         Config.save(config)
 
-    # Add configuration for QR order payout per order
-    qr_order_payout_per_order = st.sidebar.number_input(
-        "QR Order Payout per Order",
-        min_value=0.0,
-        max_value=100.0,
-        value=config.get("qr_order_payout_per_order", 1.80),
-        step=0.10,
-        help="Payout amount per QR order"
-    )
-
-    # Update config with new value
-    if qr_order_payout_per_order != config.get("qr_order_payout_per_order", 1.80):
-        config["qr_order_payout_per_order"] = qr_order_payout_per_order
-        Config.save(config)
-
     # Add configuration for return payout per parcel
     return_payout_per_parcel = st.sidebar.number_input(
         "Return Payout per Parcel",
@@ -4097,10 +3938,12 @@ def main():
     - 30kg+: RM4.00
 
     **📦 Pickup Parcels Payout:**
-    - Sum of **commission** column per pickup row (fallback: RM{pickup_payout_per_parcel:.2f}/parcel)
-
-    **📱 QR Orders Payout:**
-    - RM{qr_order_payout_per_order:.2f} per order
+    - **JTD QR:** RM1.80
+    - **EASYPARCEL:** RM1.00 (≤10 kg) / RM3.00 (>10 kg)
+    - **TT-RETURN, LAZADA-RETURN, SHEIN-RETURN, CAINIAO-RETURN, APP-ANDROID, APP-IOS, APP-HORMONY, WEBSITE, WHATSAPP, WECHAT:** RM1.00
+    - **Other sources:** RM0.05
+    - Fallback when Order Source is missing: RM{pickup_payout_per_parcel:.2f}/parcel
+    - **JTD QR** orders are included in pickup payout (RM1.80)
 
     **↩️ Return Parcels Payout:**
     - RM{return_payout_per_parcel:.2f} per parcel
@@ -4244,10 +4087,9 @@ def main():
         else:
             st.sidebar.warning("Selected date column has no valid date values; showing all data.")
 
-    # Load penalty, pickup, QR order, return, reward, and attendance data
+    # Load penalty, pickup, return, reward, and attendance data
     penalty_data = DataSource.load_penalty_data(config, excel_source)
     pickup_df = DataSource.load_pickup_data(config, excel_source)
-    qr_order_df = DataSource.load_qr_order_data(config, excel_source)
     return_df = DataSource.load_return_data(config, excel_source)
     reward_df = DataSource.load_reward_data(config, excel_source)
     rental_df = DataSource.load_rental_data(config, excel_source)
@@ -4525,47 +4367,6 @@ def main():
                     else:
                         st.warning("⚠️ Parcel Lost penalty data has no 'date' or 'created_at' column; penalties are not filtered by date range.")
 
-                # Filter QR order data by selected date range
-                if qr_order_df is not None and not qr_order_df.empty:
-                    qr_order_date_col = None
-                    # Prefer date_pick_up for QR orders, fallback to created_at
-                    if 'date_pick_up' in qr_order_df.columns:
-                        qr_order_date_col = 'date_pick_up'
-                    elif 'created_at' in qr_order_df.columns:
-                        qr_order_date_col = 'created_at'
-                    else:
-                        # Try case-insensitive search
-                        for col in qr_order_df.columns:
-                            col_lower = str(col).lower()
-                            if col_lower in ("date_pick_up", "created_at"):
-                                qr_order_date_col = col
-                                break
-
-                    if qr_order_date_col is not None:
-                        qr_order_df[qr_order_date_col] = pd.to_datetime(qr_order_df[qr_order_date_col], errors="coerce")
-                        initial_qr_count = len(qr_order_df)
-
-                        # Check for valid dates before filtering
-                        valid_dates = qr_order_df[qr_order_date_col].notna()
-                        invalid_date_count = (~valid_dates).sum()
-
-                        if invalid_date_count > 0:
-                            st.warning(f"⚠️ QR Orders: {invalid_date_count:,} records have invalid/null dates in '{qr_order_date_col}' column")
-
-                        # Filter by date range
-                        qr_order_df = qr_order_df[
-                            (normalize_series_for_date_compare(qr_order_df[qr_order_date_col]) >= start_ts) &
-                            (normalize_series_for_date_compare(qr_order_df[qr_order_date_col]) <= end_ts)
-                        ]
-                        filtered_qr_count = len(qr_order_df)
-
-                        if filtered_qr_count == 0:
-                            st.error(f"❌ All QR order records filtered out! Initial: {initial_qr_count:,} records, after date filter: 0 records.")
-                        elif initial_qr_count != filtered_qr_count:
-                            st.info(f"📦 Filtered QR orders using '{qr_order_date_col}': {initial_qr_count:,} → {filtered_qr_count:,} records")
-                    else:
-                        st.warning("⚠️ QR order table has no 'date_pick_up' column; QR orders are not filtered by date range.")
-
                 # Filter return data by selected date range
                 if return_df is not None and not return_df.empty:
                     return_date_col = None
@@ -4645,12 +4446,11 @@ def main():
 
     # Calculate payouts
     currency = config.get("currency_symbol", "RM")
-    qr_order_payout_per_order = config.get("qr_order_payout_per_order", 1.80)
     return_payout_per_parcel = config.get("return_payout_per_parcel", 1.50)
 
     display_df, numeric_df, total_payout = PayoutCalculator.calculate_payout(
         df, currency, penalty_data, pickup_df, pickup_payout_per_parcel,
-        qr_order_df, qr_order_payout_per_order, return_df, return_payout_per_parcel,
+        return_df, return_payout_per_parcel,
         reward_df=reward_df,
         rental_df=rental_df,
         attendance_df=attendance_df,
@@ -4699,8 +4499,6 @@ def main():
         total_return_parcels = int(numeric_df["Return Parcels"].sum()) if "Return Parcels" in numeric_df.columns else 0
         total_awb = total_delivery_parcels + total_pickup_parcels + total_return_parcels
         total_pickup_payout = numeric_df["Pickup Parcels Payout"].sum() if "Pickup Parcels Payout" in numeric_df.columns else 0.0
-        total_qr_orders = int(numeric_df["QR Orders"].sum()) if "QR Orders" in numeric_df.columns else 0
-        total_qr_order_payout = numeric_df["QR Orders Payout"].sum() if "QR Orders Payout" in numeric_df.columns else 0.0
         total_return_payout = numeric_df["Return Parcels Payout"].sum() if "Return Parcels Payout" in numeric_df.columns else 0.0
         total_dispatch_payout = numeric_df["Delivery Parcels Payout"].sum() if "Delivery Parcels Payout" in numeric_df.columns else 0.0
         total_reward = numeric_df["Reward"].sum() if "Reward" in numeric_df.columns else 0.0
@@ -4727,8 +4525,8 @@ def main():
             'overpaid': numeric_df["Overpaid"].sum() if "Overpaid" in numeric_df.columns else 0.0,
         }
 
-        # Row 1: Dispatchers | Total AWB | Delivery Parcels | Pickup Parcels | Return Parcels | QR Orders
-        row1_col1, row1_col2, row1_col3, row1_col4, row1_col5, row1_col6 = st.columns(6)
+        # Row 1: Dispatchers | Total AWB | Delivery Parcels | Pickup Parcels | Return Parcels
+        row1_col1, row1_col2, row1_col3, row1_col4, row1_col5 = st.columns(5)
         with row1_col1:
             st.metric("Dispatchers", f"{len(display_df):,}")
         with row1_col2:
@@ -4746,10 +4544,8 @@ def main():
             st.metric("Pickup Parcels", f"{total_pickup_parcels:,}")
         with row1_col5:
             st.metric("Return Parcels", f"{total_return_parcels:,}")
-        with row1_col6:
-            st.metric("QR Orders", f"{total_qr_orders:,}")
 
-        # Row 2: Total Payout | Delivery Parcels Payout | Pickup Parcels Payout | Return Parcels Payout | QR Orders Payout
+        # Row 2: Total Payout | Delivery Parcels Payout | Pickup Parcels Payout | Return Parcels Payout | Reward
         row2_col1, row2_col2, row2_col3, row2_col4, row2_col5 = st.columns(5)
         with row2_col1:
             st.metric("Total Payout", f"{currency} {total_payout:,.2f}")
@@ -4762,10 +4558,8 @@ def main():
         with row2_col5:
             st.metric("Return Parcels Payout", f"{currency} {total_return_payout:,.2f}")
 
-        row3_cols = st.columns(5)
-        with row3_cols[0]:
-            st.metric("QR Orders Payout", f"{currency} {total_qr_order_payout:,.2f}")
-        with row3_cols[1]:
+        row3_col1, = st.columns(1)
+        with row3_col1:
             st.metric("Rental (deduction)", f"-{currency} {total_rental:,.2f}")
 
         st.markdown("#### 🏛️ Benefit Deductions")
@@ -4835,21 +4629,19 @@ def main():
                 parcels_delivered = int(row.get('Parcels Delivered', 0))
                 pickup_parcels = int(row.get('Pickup Parcels', 0))
                 return_parcels = int(row.get('Return Parcels', 0))
-                qr_orders = int(row.get('QR Orders', 0))
                 delivery_payout = float(row.get('Delivery Parcels Payout', 0.0))
                 pickup_payout = float(row.get('Pickup Parcels Payout', 0.0))
                 return_payout = float(row.get('Return Parcels Payout', 0.0))
-                qr_orders_payout = float(row.get('QR Orders Payout', 0.0))
                 reward_amount = float(row.get('Reward', 0.0))
 
                 st.markdown(f"""
                 <div style="background: white; padding: 12px; border-radius: 8px; border: 1px solid #e2e8f0; margin: 8px 0; min-height: 90px; height: 90px; display: flex; flex-direction: column; justify-content: space-between;">
                     <div style="font-weight: 600; color: {ColorScheme.PRIMARY}; margin-bottom: 8px; font-size: 0.95rem;">{row['Dispatcher Name']}</div>
                     <div style="color: #64748b; font-size: 0.85rem; margin-bottom: 4px; line-height: 1.4;">
-                        <strong>Parcels:</strong> {parcels_delivered} | <strong>Pickup Parcels:</strong> {pickup_parcels} | <strong>Return Parcels:</strong> {return_parcels} | <strong>QR Orders:</strong> {qr_orders}
+                        <strong>Parcels:</strong> {parcels_delivered} | <strong>Pickup Parcels:</strong> {pickup_parcels} | <strong>Return Parcels:</strong> {return_parcels}
                     </div>
                     <div style="color: #64748b; font-size: 0.85rem; line-height: 1.4;">
-                        <strong>Parcel Payout:</strong> {currency}{delivery_payout:,.2f} | <strong>Pickup Payout:</strong> {currency}{pickup_payout:,.2f} | <strong>Return Payout:</strong> {currency}{return_payout:,.2f} | <strong>QR Orders Payout:</strong> {currency}{qr_orders_payout:,.2f} | <strong>Reward:</strong> {currency}{reward_amount:,.2f}
+                        <strong>Parcel Payout:</strong> {currency}{delivery_payout:,.2f} | <strong>Pickup Payout:</strong> {currency}{pickup_payout:,.2f} | <strong>Return Payout:</strong> {currency}{return_payout:,.2f} | <strong>Reward:</strong> {currency}{reward_amount:,.2f}
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
@@ -4931,12 +4723,10 @@ def main():
                 "Parcels 30+kg",
                 "Return Parcels",
                 "Pickup Parcels",
-                "QR Orders",
                 "Parcels Delivered",
                 "Total AWB",
                 "Return Parcels Payout",
                 "Pickup Parcels Payout",
-                "QR Orders Payout",
                 "Delivery Parcels Payout",
                 "Reward",
                 "Rental",
@@ -5040,57 +4830,6 @@ def main():
                     st.dataframe(return_df, use_container_width=True, hide_index=True)
                 else:
                     st.dataframe(return_df, use_container_width=True, hide_index=True)
-
-        # QR Orders Details
-        if qr_order_df is not None and not qr_order_df.empty:
-            with st.expander("📱 QR Orders Details", expanded=False):
-                st.subheader("📱 QR Orders Details")
-                # Find waybill_number column
-                order_no_col = None
-                for col in qr_order_df.columns:
-                    if col.lower() in ('waybill_number', 'no_awb'):
-                        order_no_col = col
-                        break
-
-                if order_no_col:
-                    # Build dispatcher key with row-level fallback to match payout logic
-                    qr_work = qr_order_df.copy()
-                    qr_work['_dispatcher_key'] = ""
-
-                    for preferred_col in ('dispatcher_id', 'dispatcher', 'pickup_dispatcher_id'):
-                        matched_col = next((c for c in qr_work.columns if str(c).lower() == preferred_col), None)
-                        if matched_col:
-                            normalized_series = qr_work[matched_col].apply(normalize_dispatcher_id)
-                            qr_work['_dispatcher_key'] = qr_work['_dispatcher_key'].where(
-                                qr_work['_dispatcher_key'] != "",
-                                normalized_series
-                            )
-
-                    # Keep only valid order rows (same as payout logic)
-                    order_series = qr_work[order_no_col].astype(str).str.strip().replace({
-                        "": pd.NA,
-                        "nan": pd.NA,
-                        "NaN": pd.NA,
-                        "None": pd.NA,
-                        "none": pd.NA,
-                        "NULL": pd.NA,
-                        "null": pd.NA
-                    })
-                    qr_work = qr_work[(qr_work['_dispatcher_key'] != "") & (order_series.notna())]
-
-                    # Show summary by dispatcher (row count, not unique count)
-                    qr_summary = qr_work.groupby('_dispatcher_key').agg(
-                        order_count=('_dispatcher_key', 'size')
-                    ).reset_index()
-                    qr_summary = qr_summary.rename(columns={'_dispatcher_key': 'Dispatcher ID', 'order_count': 'QR Orders'})
-                    qr_summary = qr_summary.sort_values('QR Orders', ascending=False)
-                    st.dataframe(qr_summary, use_container_width=True, hide_index=True)
-
-                    # Show full details
-                    st.markdown("#### Full QR Orders Data")
-                    st.dataframe(qr_order_df, use_container_width=True, hide_index=True)
-                else:
-                    st.dataframe(qr_order_df, use_container_width=True, hide_index=True)
 
         # Penalty Details Section
         if 'Penalty Parcels' in numeric_df.columns and numeric_df['Penalty Parcels'].sum() > 0:

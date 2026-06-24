@@ -133,6 +133,102 @@ def find_pickup_commission_column(df: pd.DataFrame) -> Optional[str]:
     return None
 
 
+PICKUP_JTD_QR_COMMISSION = 1.80
+PICKUP_EASYPARCEL_LOW_WEIGHT_COMMISSION = 1.00
+PICKUP_EASYPARCEL_HIGH_WEIGHT_COMMISSION = 3.00
+PICKUP_EASYPARCEL_WEIGHT_THRESHOLD_KG = 10.0
+PICKUP_STANDARD_SOURCE_COMMISSION = 1.00
+PICKUP_DEFAULT_SOURCE_COMMISSION = 0.05
+
+PICKUP_ONE_RM_ORDER_SOURCES = frozenset({
+    "TT-RETURN",
+    "LAZADA-RETURN",
+    "SHEIN-RETURN",
+    "CAINIAO-RETURN",
+    "APP-ANDROID",
+    "APP-IOS",
+    "APP-HORMONY",
+    "WEBSITE",
+    "WHATSAPP",
+    "WECHAT",
+})
+
+
+def normalize_pickup_order_source(value) -> str:
+    if pd.isna(value):
+        return ""
+    text = str(value).strip()
+    if not text or text.lower() in ("nan", "none", "null"):
+        return ""
+    return text.upper()
+
+
+def find_pickup_order_source_column(df: pd.DataFrame) -> Optional[str]:
+    return find_column(df, ["Order Source", "order_source", "ORDER SOURCE", "Order source"])
+
+
+def find_pickup_billing_weight_column(df: pd.DataFrame) -> Optional[str]:
+    return find_column(
+        df,
+        ["Billing Weight", "billing_weight", "Billing weight", "Weight", "weight", "weight_kg"],
+    )
+
+
+def pickup_commission_for_source_weight(order_source, billing_weight=0.0) -> float:
+    """Commission (RM) from Order Source and Billing Weight."""
+    src = normalize_pickup_order_source(order_source)
+    if src == "JTD QR":
+        return PICKUP_JTD_QR_COMMISSION
+    if src == "EASYPARCEL":
+        weight = penalty_cell_to_float(billing_weight)
+        if weight > PICKUP_EASYPARCEL_WEIGHT_THRESHOLD_KG:
+            return PICKUP_EASYPARCEL_HIGH_WEIGHT_COMMISSION
+        return PICKUP_EASYPARCEL_LOW_WEIGHT_COMMISSION
+    if src in PICKUP_ONE_RM_ORDER_SOURCES:
+        return PICKUP_STANDARD_SOURCE_COMMISSION
+    if src:
+        return PICKUP_DEFAULT_SOURCE_COMMISSION
+    return PICKUP_DEFAULT_SOURCE_COMMISSION
+
+
+def compute_pickup_commission_series(
+    df: pd.DataFrame,
+    *,
+    fallback_rate: float = 1.0,
+) -> pd.Series:
+    """Per-row pickup commission: Order Source rules, else sheet commission, else flat rate."""
+    if df is None or df.empty:
+        return pd.Series(dtype=float)
+
+    order_source_col = find_pickup_order_source_column(df)
+    if order_source_col is not None:
+        weight_col = find_pickup_billing_weight_column(df)
+        if weight_col is not None:
+            weights = df[weight_col]
+        else:
+            weights = pd.Series(0.0, index=df.index)
+        return pd.Series(
+            [
+                pickup_commission_for_source_weight(src, weight)
+                for src, weight in zip(df[order_source_col], weights)
+            ],
+            index=df.index,
+            dtype=float,
+        )
+
+    commission_col = find_pickup_commission_column(df)
+    if commission_col is not None:
+        return df[commission_col].map(penalty_cell_to_float)
+
+    return pd.Series(float(fallback_rate), index=df.index, dtype=float)
+
+
+def sum_pickup_commission(df: pd.DataFrame, *, fallback_rate: float = 1.0) -> float:
+    if df is None or df.empty:
+        return 0.0
+    return round(float(compute_pickup_commission_series(df, fallback_rate=fallback_rate).sum()), 2)
+
+
 def find_penalty_dispatcher_column(df: pd.DataFrame) -> Optional[str]:
     col = find_column(
         df,
