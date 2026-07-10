@@ -81,13 +81,49 @@ def normalize_waybill(value) -> str:
         return ""
     if s.endswith(".0") and s[:-2].isdigit():
         s = s[:-2]
-    if "e" in s.lower():
+    # Only treat scientific notation when the whole token is numeric sci-notation.
+    # Do not use `"e" in s` — that breaks alphanumeric AWBs containing the letter E.
+    if re.fullmatch(r"[+-]?\d+(?:\.\d+)?[eE][+-]?\d+", s):
         try:
             f = float(s)
             return str(int(f)) if f == int(f) else str(f).strip()
         except (ValueError, OverflowError):
             pass
     return s
+
+
+def is_waybill_column_name(name) -> bool:
+    """Return True if a column header is a waybill/AWB field."""
+    s = str(name).replace("\ufeff", "").strip().lower()
+    if not s:
+        return False
+    if s in {
+        "waybill_number",
+        "waybill number",
+        "waybill",
+        "waybill no",
+        "waybill no.",
+        "awb",
+        "awb no.",
+        "awb no",
+        "awb_no",
+        "no. awb",
+        "awbno",
+        "awbno.",
+    }:
+        return True
+    return "waybill" in s or "awb" in s
+
+
+def waybill_column_read_dtypes(columns) -> Dict[str, str]:
+    """Build a pandas read_csv dtype map so waybill columns load as text."""
+    dtype: Dict[str, str] = {}
+    for raw in columns:
+        col = str(raw).replace("\ufeff", "").strip()
+        if is_waybill_column_name(col):
+            # Use the raw header token so pandas matches the CSV column name.
+            dtype[str(raw)] = str
+    return dtype
 
 
 def find_penalty_waybill_column(df: pd.DataFrame) -> Optional[str]:
@@ -604,6 +640,87 @@ def filter_rows_for_penalty_dispatcher(
         return pd.DataFrame()
     keys = df[dispatcher_col].apply(clean_penalty_dispatcher_id)
     return df[keys == target]
+
+
+def find_bulky_date_column(df: pd.DataFrame) -> Optional[str]:
+    """Find the delivery date column on the Bulky sheet."""
+    if df is None or df.empty:
+        return None
+    date_col = find_column(
+        df,
+        ["Delivery Signature", "delivery_signature", "delivery_sig", "Created At", "created_at"],
+    )
+    if date_col is not None:
+        return date_col
+    for col_name in df.columns:
+        col_lower = str(col_name).lower()
+        if "delivery" in col_lower and "signature" in col_lower:
+            return col_name
+        if col_lower in ("created_at", "created at", "date"):
+            return col_name
+    return None
+
+
+def filter_bulky_for_dispatcher(bulky_df: pd.DataFrame, dispatcher_id: str) -> pd.DataFrame:
+    """Return bulky sheet rows for one dispatcher."""
+    if bulky_df is None or bulky_df.empty or not dispatcher_id:
+        return pd.DataFrame()
+    dispatcher_col = find_penalty_dispatcher_column(bulky_df)
+    if dispatcher_col is None:
+        return pd.DataFrame()
+    return filter_rows_for_penalty_dispatcher(bulky_df, dispatcher_col, dispatcher_id)
+
+
+def count_bulky_parcels_for_dispatcher(bulky_df: pd.DataFrame, dispatcher_id: str) -> int:
+    """Count bulky sheet rows for one dispatcher (matches management.py)."""
+    matched = filter_bulky_for_dispatcher(bulky_df, dispatcher_id)
+    return int(len(matched))
+
+
+def bulky_only_records_for_dispatcher(
+    bulky_df: pd.DataFrame,
+    dispatcher_id: str,
+    dispatch_waybills: set,
+) -> pd.DataFrame:
+    """Return bulky sheet rows not already present on the Dispatch sheet."""
+    matched = filter_bulky_for_dispatcher(bulky_df, dispatcher_id)
+    if matched.empty:
+        return pd.DataFrame()
+
+    waybill_col = _find_bulky_waybill_column(matched)
+    if not waybill_col:
+        return pd.DataFrame()
+
+    skip = dispatch_waybills or set()
+    work = matched.copy()
+    work["_wb_key"] = work[waybill_col].apply(normalize_waybill)
+    work = work[(work["_wb_key"] != "") & (~work["_wb_key"].isin(skip))]
+    return work.drop(columns=["_wb_key"], errors="ignore")
+
+
+def _find_bulky_waybill_column(df: pd.DataFrame) -> Optional[str]:
+    waybill_col = find_penalty_waybill_column(df)
+    if waybill_col:
+        return waybill_col
+    for col in df.columns:
+        cl = str(col).lower()
+        if "waybill" in cl or "awb" in cl:
+            return col
+    return None
+
+
+def bulky_waybills_for_dispatcher(bulky_df: pd.DataFrame, dispatcher_id: str) -> set:
+    """Normalized waybill set from the Bulky sheet for one dispatcher."""
+    matched = filter_bulky_for_dispatcher(bulky_df, dispatcher_id)
+    if matched.empty:
+        return set()
+    waybill_col = find_penalty_waybill_column(matched)
+    if not waybill_col:
+        return set()
+    return {
+        wb for wb in matched[waybill_col].apply(normalize_waybill)
+        if wb
+    }
 
 
 def route_penalty_dispatcher_key(dispatcher_id) -> str:

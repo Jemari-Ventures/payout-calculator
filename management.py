@@ -3141,6 +3141,20 @@ class PayoutCalculator:
         # Calculate bulky payout
         grouped = PayoutCalculator.calculate_bulky_payout(bulky_df, grouped, bulky_config)
 
+        # Parcels Delivered = dispatch + return + bulky (pickup excluded).
+        grouped['pickup_parcels'] = pd.to_numeric(grouped['pickup_parcels'], errors='coerce').fillna(0).astype(int)
+        grouped['return_parcels'] = pd.to_numeric(grouped['return_parcels'], errors='coerce').fillna(0).astype(int)
+        grouped['bulky_parcels'] = pd.to_numeric(grouped['bulky_parcels'], errors='coerce').fillna(0).astype(int)
+        grouped['parcel_count'] = pd.to_numeric(grouped['parcel_count'], errors='coerce').fillna(0).astype(int)
+        grouped['parcel_count'] = (
+            grouped['parcel_count']
+            + grouped['return_parcels']
+            + grouped['bulky_parcels']
+        )
+
+        # Total AWB = parcels delivered + pickup (bulky already in parcels delivered).
+        grouped['total_awb'] = grouped['parcel_count'] + grouped['pickup_parcels']
+
         # Benefit deductions (after pickup-only rows are added so all dispatchers are covered).
         grouped['socso_deduction'] = grouped['dispatcher_id'].apply(
             lambda x: float(socso_map.get(normalize_dispatcher_id(str(x)), 0.0))
@@ -3160,18 +3174,6 @@ class PayoutCalculator:
             - grouped['rental']
             - grouped['socso_deduction']
             - grouped['overpaid_deduction']
-        )
-
-        # Total AWB = delivery parcels + pickup parcels + return parcels + bulky parcels per dispatcher.
-        grouped['pickup_parcels'] = pd.to_numeric(grouped['pickup_parcels'], errors='coerce').fillna(0).astype(int)
-        grouped['return_parcels'] = pd.to_numeric(grouped['return_parcels'], errors='coerce').fillna(0).astype(int)
-        grouped['bulky_parcels'] = pd.to_numeric(grouped['bulky_parcels'], errors='coerce').fillna(0).astype(int)
-        grouped['parcel_count'] = pd.to_numeric(grouped['parcel_count'], errors='coerce').fillna(0).astype(int)
-        grouped['total_awb'] = (
-            grouped['parcel_count']
-            + grouped['pickup_parcels']
-            + grouped['return_parcels']
-            + grouped['bulky_parcels']
         )
 
         # Create display and numeric dataframes
@@ -3631,7 +3633,7 @@ class InvoiceGenerator:
             total_pickup_parcels = int(numeric_df["Pickup Parcels"].sum()) if "Pickup Parcels" in numeric_df.columns else 0
             total_return_parcels = int(numeric_df["Return Parcels"].sum()) if "Return Parcels" in numeric_df.columns else 0
             total_bulky_parcels = int(numeric_df["Bulky Parcels"].sum()) if "Bulky Parcels" in numeric_df.columns else 0
-            total_awb = total_delivery_parcels + total_pickup_parcels + total_return_parcels + total_bulky_parcels
+            total_awb = total_delivery_parcels + total_pickup_parcels
             total_dispatchers = len(numeric_df)
             total_weight = numeric_df["Total Weight (kg)"].sum()
             total_dispatch_payout = numeric_df["Delivery Parcels Payout"].sum() if "Delivery Parcels Payout" in numeric_df.columns else 0.0
@@ -3817,13 +3819,13 @@ class InvoiceGenerator:
                             <div class="value">{total_dispatchers:,}</div>
                         </div>
                         <div class="chip">
-                            <div class="label" title="Total parcels across Delivery, Pickup, and Return per dispatcher (delivery + pickup + return).">
+                            <div class="label" title="Parcels delivered (dispatch + return + bulky) + pickup per dispatcher.">
                                 Total AWB<span class="info-icon">?</span>
                             </div>
                             <div class="value">{total_awb:,}</div>
                         </div>
                         <div class="chip">
-                            <div class="label">Delivery Parcels</div>
+                            <div class="label">Parcels Delivered</div>
                             <div class="value">{total_delivery_parcels:,}</div>
                         </div>
                         <div class="chip">
@@ -4720,12 +4722,12 @@ def main():
     with tab_overview:
         st.subheader("📈 Performance Overview")
 
-        # Calculate totals — Total AWB must equal delivery + pickup + return.
+        # Calculate totals — Total AWB = parcels delivered + pickup.
         total_delivery_parcels = int(numeric_df["Parcels Delivered"].sum()) if "Parcels Delivered" in numeric_df.columns else 0
         total_pickup_parcels = int(numeric_df["Pickup Parcels"].sum()) if "Pickup Parcels" in numeric_df.columns else 0
         total_return_parcels = int(numeric_df["Return Parcels"].sum()) if "Return Parcels" in numeric_df.columns else 0
         total_bulky_parcels = int(numeric_df["Bulky Parcels"].sum()) if "Bulky Parcels" in numeric_df.columns else 0
-        total_awb = total_delivery_parcels + total_pickup_parcels + total_return_parcels + total_bulky_parcels
+        total_awb = total_delivery_parcels + total_pickup_parcels
         total_pickup_payout = numeric_df["Pickup Parcels Payout"].sum() if "Pickup Parcels Payout" in numeric_df.columns else 0.0
         total_return_payout = numeric_df["Return Parcels Payout"].sum() if "Return Parcels Payout" in numeric_df.columns else 0.0
         total_bulky_payout = numeric_df["Bulky Parcels Payout"].sum() if "Bulky Parcels Payout" in numeric_df.columns else 0.0
@@ -4754,7 +4756,7 @@ def main():
             'overpaid': numeric_df["Overpaid"].sum() if "Overpaid" in numeric_df.columns else 0.0,
         }
 
-        # Row 1: Dispatchers | Total AWB | Delivery Parcels | Pickup Parcels | Return Parcels
+        # Row 1: Dispatchers | Total AWB | Parcels Delivered | Pickup Parcels | Return Parcels
         row1_col1, row1_col2, row1_col3, row1_col4, row1_col5 = st.columns(5)
         with row1_col1:
             st.metric("Dispatchers", f"{len(display_df):,}")
@@ -4762,13 +4764,14 @@ def main():
             st.metric(
                 "Total AWB",
                 f"{total_awb:,}",
-                help=(
-                    "Total parcels across Delivery, Pickup, and Return per dispatcher "
-                    "(delivery + pickup + return)."
-                ),
+                help="Parcels delivered (dispatch + return + bulky) + pickup per dispatcher.",
             )
         with row1_col3:
-            st.metric("Delivery Parcels", f"{int(numeric_df['Parcels Delivered'].sum()):,}")
+            st.metric(
+                "Parcels Delivered",
+                f"{int(numeric_df['Parcels Delivered'].sum()):,}",
+                help="Dispatch + return + bulky parcels (pickup excluded).",
+            )
         with row1_col4:
             st.metric("Pickup Parcels", f"{total_pickup_parcels:,}")
         with row1_col5:

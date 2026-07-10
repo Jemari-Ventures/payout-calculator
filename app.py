@@ -35,7 +35,10 @@ from penalty_common import (
     route_penalty_dispatcher_key,
     sanitize_no_outbound_scan_df,
     normalize_waybill,
+    waybill_column_read_dtypes,
     filter_rows_for_penalty_dispatcher,
+    filter_bulky_for_dispatcher,
+    find_bulky_date_column,
     find_penalty_amount_column,
     compute_pickup_commission_series,
     find_pickup_commission_column,
@@ -249,6 +252,7 @@ def exclude_dispatch_rows_by_dispatcher_sheet(
     sheet_dispatcher_col: Optional[str],
     dispatch_disp_col: Optional[str],
     dispatch_wb_col: Optional[str],
+    preserve_waybills: Optional[set] = None,
 ) -> pd.DataFrame:
     """Remove dispatch rows when the same dispatcher's waybill is on pickup/return."""
     if (
@@ -272,10 +276,14 @@ def exclude_dispatch_rows_by_dispatcher_sheet(
     if not sheet_map:
         return dispatch_df
 
+    preserve = preserve_waybills or set()
+
     def _is_on_sheet(row) -> bool:
         disp = normalize_dispatcher_id(row[dispatch_disp_col])
         wb = normalize_waybill(row[dispatch_wb_col])
         if not disp or not wb:
+            return False
+        if wb in preserve:
             return False
         return wb in sheet_map.get(disp, set())
 
@@ -331,40 +339,6 @@ def is_return_sheet_dispatch_fallback(return_df: pd.DataFrame) -> bool:
     )
     has_return_markers = any("return" in col for col in return_cols_lower)
     return has_dispatch_signature and not has_return_markers
-
-
-def unique_waybills_for_dispatcher(
-    df: Optional[pd.DataFrame],
-    dispatcher_id: str,
-    dispatcher_col: Optional[str],
-    waybill_col: Optional[str],
-) -> set:
-    """Return normalized unique waybills for one dispatcher from a sheet."""
-    if (
-        df is None
-        or df.empty
-        or not dispatcher_id
-        or not dispatcher_col
-        or not waybill_col
-        or dispatcher_col not in df.columns
-        or waybill_col not in df.columns
-    ):
-        return set()
-
-    dispatcher_id_str = normalize_dispatcher_id(dispatcher_id)
-    if not dispatcher_id_str:
-        return set()
-
-    matched = df[df[dispatcher_col].apply(normalize_dispatcher_id) == dispatcher_id_str]
-    if matched.empty:
-        return set()
-
-    awbs = set()
-    for value in matched[waybill_col].dropna().unique():
-        normalized = normalize_waybill(value)
-        if normalized:
-            awbs.add(normalized)
-    return awbs
 
 
 def build_unique_awb_map(
@@ -511,9 +485,6 @@ class DataSource:
                         return pd.DataFrame()
                 raise
 
-            # CRITICAL: Read CSV and preserve waybills exactly as they appear
-            # Strategy: Read WITHOUT dtype specification first, then convert to string immediately
-            # This prevents pandas from doing type inference that could lose waybills
             resp_content = resp.content
 
             # If a specific sheet name was requested but doesn't exist, Sheets returns HTML/error text.
@@ -529,86 +500,23 @@ class DataSource:
                 ):
                     return pd.DataFrame()
 
-            # Read the full CSV WITHOUT forcing dtype - let pandas read it naturally
-            # Then we'll convert the Waybill Number column to string immediately
-            # This approach is more reliable for preserving waybills that might have mixed formats
+            # Read CSV with waybill columns as text.
+            header_preview = pd.read_csv(
+                io.BytesIO(resp_content),
+                nrows=0,
+                encoding="utf-8-sig",
+            )
+            raw_columns = list(header_preview.columns)
+            clean_columns = [str(c).replace("\ufeff", "").strip() for c in raw_columns]
             df = pd.read_csv(
                 io.BytesIO(resp_content),
-                keep_default_na=False,  # Don't automatically convert strings to NaN
-                na_values=[],  # Don't treat any specific values as NaN
-                encoding="utf-8-sig",  # utf-8-sig strips UTF-8 BOM (else first header can be "\ufeffemployee_id")
-                low_memory=False  # Read entire file to determine dtypes, eliminates DtypeWarning
+                dtype=waybill_column_read_dtypes(raw_columns) or None,
+                keep_default_na=False,
+                na_values=[],
+                encoding="utf-8-sig",
+                low_memory=False,
             )
-            # Normalize headers: BOM remnants, leading/trailing spaces (Google Sheets / Excel CSV quirks)
-            df.columns = [str(c).replace("\ufeff", "").strip() for c in df.columns]
-
-            # CRITICAL: Convert Waybill Number to string IMMEDIATELY after reading
-            # This must happen before any other processing to preserve all waybill formats
-            waybill_col = find_column(df, ["Waybill Number", "waybill_number", "Waybill", "waybill"])
-            if waybill_col:
-                # First, convert the entire column to string type
-                # This ensures all waybills are strings, regardless of how pandas read them
-                # Use astype(str) which is more reliable than dtype=str during read
-                df[waybill_col] = df[waybill_col].astype(str)
-
-                # Now apply conversion function to clean up and handle edge cases
-                def simple_waybill_converter(x):
-                    """CRITICAL: Preserve ALL waybills that have ANY value.
-
-                    RULE: If waybill has ANY non-empty content, preserve it.
-                    Only return None if the value is truly empty or explicitly NaN.
-
-                    This function NEVER converts a valid waybill to None.
-                    """
-                    # Step 1: If already a string (which it should be after astype(str))
-                    # Check if it's a valid non-empty string
-                    if isinstance(x, str):
-                        x_stripped = x.strip()
-                        # If it has content and is not a "nan" string, return it
-                        if x_stripped and x_stripped.lower() not in ["nan", "none", "null", ""]:
-                            return x_stripped
-                        # If it's empty or "nan" string, check original value
-                        if not x_stripped or x_stripped.lower() in ["nan", "none", "null"]:
-                            return None
-
-                    # Step 2: Try to convert to string (handles numeric types)
-                    try:
-                        waybill_str = str(x).strip()
-                        # If we got a string with content, return it
-                        if waybill_str and waybill_str.lower() not in ["nan", "none", "null", ""]:
-                            # Handle numeric types - remove .0 from floats
-                            if isinstance(x, (float, int)) and not pd.isna(x):
-                                # If it's a float that's an integer, convert to int first
-                                if isinstance(x, float) and x.is_integer():
-                                    return str(int(x))
-                                # Otherwise, return as string
-                                return waybill_str
-                            return waybill_str
-                    except Exception:
-                        pass
-
-                    # Step 3: Check if it's truly None or NaN
-                    if x is None:
-                        return None
-
-                    try:
-                        if pd.isna(x):
-                            return None
-                    except:
-                        # If pd.isna fails, the value is probably valid
-                        # Try one more time to convert to string
-                        try:
-                            result = str(x).strip()
-                            if result and result.lower() not in ["nan", "none", "null", ""]:
-                                return result
-                        except:
-                            pass
-
-                    # Only return None if we truly can't get any value
-                    return None
-
-                # Apply conversion - this preserves ALL waybills with values
-                df[waybill_col] = df[waybill_col].apply(simple_waybill_converter)
+            df.columns = clean_columns
 
             return df
         except Exception as exc:
@@ -783,14 +691,10 @@ class DataSource:
             return None
         sheet_name = DataSource._get_excel_sheet_name(config, "bulky", "Bulky")
         try:
-            bulky_df = DataSource.read_google_sheet(gsheet_url, sheet_name=sheet_name)
+            return DataSource.read_google_sheet(gsheet_url, sheet_name=sheet_name)
         except Exception as exc:
             st.warning(f"Could not load bulky data from sheet '{sheet_name}': {exc}")
             return None
-
-        if bulky_df is None or bulky_df.empty:
-            return bulky_df
-        return bulky_df
 
     @staticmethod
     def load_attendance_data(config: dict) -> Optional[pd.DataFrame]:
@@ -1057,61 +961,33 @@ class PayoutCalculator:
         bulky_df: Optional[pd.DataFrame],
         dispatcher_id: str,
     ) -> pd.DataFrame:
-        """Add bulky-sheet parcels to delivery work when they are not already counted."""
+        """Add all bulky sheet rows for this dispatcher as delivery records."""
         if work is None:
             work = pd.DataFrame()
         if bulky_df is None or bulky_df.empty or not dispatcher_id:
             return work
 
-        bulky_disp_col = find_dispatch_id_column(bulky_df)
-        if bulky_disp_col is None:
-            bulky_disp_col = find_column(bulky_df, ["Dispatcher ID", "dispatcher_id", "Dispatcher Id"])
-        bulky_wb_col = find_waybill_column(bulky_df)
-        bulky_date_col = find_column(
-            bulky_df,
-            ["Delivery Signature", "delivery_signature", "delivery_sig", "Delivery Signature Date"],
-        )
-        if not bulky_disp_col or not bulky_wb_col or not bulky_date_col:
+        all_bulky = filter_bulky_for_dispatcher(bulky_df, dispatcher_id)
+        if all_bulky.empty:
             return work
 
-        matched = filter_rows_for_penalty_dispatcher(bulky_df, bulky_disp_col, dispatcher_id)
-        if matched.empty:
+        bulky_wb_col = find_waybill_column(all_bulky)
+        bulky_date_col = find_bulky_date_column(all_bulky)
+        if not bulky_wb_col or not bulky_date_col:
             return work
 
-        def normalize_waybill(wb):
-            if wb is None or (isinstance(wb, float) and pd.isna(wb)):
-                return None
-            if isinstance(wb, (int, float)):
-                if isinstance(wb, float) and wb.is_integer():
-                    return str(int(wb))
-                return str(wb)
-            text = str(wb).strip()
-            return text if text and text.lower() not in ("nan", "none", "null") else None
+        additions = all_bulky.copy()
+        additions["__date"] = pd.to_datetime(
+            additions[bulky_date_col], errors="coerce"
+        ).dt.date
+        additions["__date"] = additions["__date"].fillna(pd.Timestamp.today().date())
+        additions["__waybill"] = additions[bulky_wb_col].apply(normalize_waybill)
+        additions["__waybill_original"] = additions[bulky_wb_col]
+        additions = additions[additions["__waybill"] != ""]
 
-        existing = set()
-        if not work.empty and "__waybill" in work.columns:
-            existing = {
-                w for w in work["__waybill"].dropna().astype(str).str.strip()
-                if w and w.lower() not in ("nan", "none", "null")
-            }
-
-        new_rows = []
-        for _, row in matched.iterrows():
-            wb = normalize_waybill(row[bulky_wb_col])
-            if not wb or wb in existing:
-                continue
-            day = pd.to_datetime(row[bulky_date_col], errors="coerce")
-            day = day.date() if pd.notna(day) else pd.Timestamp.today().date()
-            new_rows.append({
-                "__date": day,
-                "__waybill": wb,
-                "__waybill_original": row[bulky_wb_col],
-            })
-            existing.add(wb)
-
-        if not new_rows:
+        if additions.empty:
             return work
-        return pd.concat([work, pd.DataFrame(new_rows)], ignore_index=True)
+        return pd.concat([work, additions], ignore_index=True)
 
     @staticmethod
     def calculate_gross_payout(
@@ -1717,28 +1593,133 @@ class PayoutCalculator:
                               fallback_dispatcher_id: Optional[str] = None) -> Tuple:
         """Calculate tiered base delivery payout from dispatch and bulky sheet rows.
 
-        Dispatch AWBs that also appear on this dispatcher's Return or Pickup sheet are
-        excluded from tier counting. Bulky parcels are counted as normal delivery.
+        Dispatch AWBs on Return or Pickup are excluded. Dispatch rows that also appear on
+        the Bulky sheet are excluded from dispatch counting and counted via Bulky instead.
         """
-        if filtered_df is None or filtered_df.empty:
-            if bulky_df is not None and not bulky_df.empty and fallback_dispatcher_id:
+        penalty_id = clean_penalty_dispatcher_id(fallback_dispatcher_id or "")
+        dispatcher_id = str(fallback_dispatcher_id or "").strip()
+        work = filtered_df.copy() if filtered_df is not None and not filtered_df.empty else pd.DataFrame()
+
+        if not work.empty:
+            dispatcher_id_col = find_dispatch_id_column(work)
+            if dispatcher_id_col and dispatcher_id_col in work.columns:
+                dispatcher_id = str(work[dispatcher_id_col].iloc[0]).strip() or dispatcher_id
+                penalty_id = clean_penalty_dispatcher_id(dispatcher_id) or penalty_id
+
+        def map_rate(daily_parcels: float) -> Tuple[str, float]:
+            return PayoutCalculator.map_tier_rate(daily_parcels, tiers_config)
+
+        delivery_sig_col = (
+            find_column(work, ["Delivery Signature", "delivery_signature", "Delivery Signature", "delivery_sig"])
+            if not work.empty
+            else find_bulky_date_column(bulky_df)
+        )
+        waybill_col = find_waybill_column(work) if not work.empty else find_waybill_column(bulky_df)
+        dispatcher_id_col = find_dispatch_id_column(work) if not work.empty else find_dispatch_id_column(bulky_df)
+
+        if delivery_sig_col is None or waybill_col is None:
+            if bulky_df is None or bulky_df.empty:
+                per_day = pd.DataFrame(
+                    columns=["__date", "daily_parcels", "tier", "rate_per_parcel", "payout_per_day"]
+                )
+                penalty_breakdown = PayoutCalculator.calculate_penalty(
+                    penalty_id,
+                    duitnow_df,
+                    ldr_df,
+                    fake_df,
+                    cod_df,
+                    binding_df,
+                    hub_df,
+                    pending_parcel_df,
+                    no_outbound_scan_df,
+                    parcel_lost_df,
+                    attendance_df,
+                    0,
+                    fake_attempt_penalty_per_parcel,
+                    pending_parcel_penalty_per_parcel,
+                    no_outbound_scan_penalty_per_parcel,
+                    route_penalty_per_dispatcher,
+                    route_penalty_dispatcher_count,
+                    route_penalty_pool_total,
+                ) if penalty_id else {
+                    'duitnow': {'amount': 0.0, 'count': 0, 'waybills': []},
+                    'ldr': {'amount': 0.0, 'count': 0, 'waybills': []},
+                    'fake_attempt': {'amount': 0.0, 'count': 0, 'waybills': []},
+                    'cod': {'amount': 0.0, 'count': 0},
+                    'binding': {'amount': 0.0, 'count': 0},
+                    'hub': {'amount': 0.0, 'count': 0},
+                    'pending_parcel': {'amount': 0.0, 'count': 0, 'waybills': []},
+                    'no_outbound_scan': {'amount': 0.0, 'count': 0, 'waybills': []},
+                    'parcel_lost': {'amount': 0.0, 'count': 0, 'waybills': []},
+                    'route': {'amount': 0.0, 'count': 0, 'pool_total': 0.0},
+                    'attendance': {'amount': 0.0, 'count': 0},
+                    'total_amount': 0.0,
+                    'total_count': 0,
+                }
+                display_df = pd.DataFrame(
+                    columns=["Date", "Total Parcel", "Tier", "Payout Rate", "Payout"]
+                )
+                return (
+                    display_df, 0.0, round(-penalty_breakdown['total_amount'], 2), 0.0, "",
+                    0.0, "No delivery records in selected period", 0, per_day, penalty_breakdown,
+                )
+            raise ValueError("Required columns (Delivery Signature and Waybill Number) not found in data")
+
+        if not work.empty:
+            if (
+                return_df is not None
+                and not return_df.empty
+                and not is_return_sheet_dispatch_fallback(return_df)
+            ):
+                return_disp_col = find_return_dispatcher_column(return_df)
+                work = exclude_dispatch_rows_by_dispatcher_sheet(
+                    work,
+                    return_df,
+                    return_disp_col,
+                    dispatcher_id_col,
+                    waybill_col,
+                )
+
+            if pickup_df is not None and not pickup_df.empty:
+                pickup_disp_col = find_pickup_dispatcher_column(pickup_df)
+                work = exclude_dispatch_rows_by_dispatcher_sheet(
+                    work,
+                    pickup_df,
+                    pickup_disp_col,
+                    dispatcher_id_col,
+                    waybill_col,
+                )
+
+            if bulky_df is not None and not bulky_df.empty:
                 bulky_disp_col = find_dispatch_id_column(bulky_df)
                 if bulky_disp_col is None:
                     bulky_disp_col = find_column(
                         bulky_df, ["Dispatcher ID", "dispatcher_id", "Dispatcher Id"]
                     )
-                if bulky_disp_col:
-                    bulky_subset = filter_rows_for_penalty_dispatcher(
-                        bulky_df, bulky_disp_col, fallback_dispatcher_id
-                    )
-                    if not bulky_subset.empty:
-                        filtered_df = bulky_subset.copy()
+                work = exclude_dispatch_rows_by_dispatcher_sheet(
+                    work,
+                    bulky_df,
+                    bulky_disp_col,
+                    dispatcher_id_col,
+                    waybill_col,
+                )
 
-        if filtered_df is None or filtered_df.empty:
-            penalty_id = clean_penalty_dispatcher_id(fallback_dispatcher_id or "")
-            per_day = pd.DataFrame(
-                columns=["__date", "daily_parcels", "tier", "rate_per_parcel", "payout_per_day"]
-            )
+            work["__date"] = pd.to_datetime(work[delivery_sig_col], errors="coerce").dt.date
+            work["__waybill_original"] = work[waybill_col].copy()
+            work["__waybill"] = work[waybill_col].apply(normalize_waybill)
+            work.loc[work["__waybill"] == "", "__waybill"] = pd.NA
+            work["__date"] = work["__date"].fillna(pd.Timestamp.today().date())
+
+        if not dispatcher_id and fallback_dispatcher_id:
+            dispatcher_id = str(fallback_dispatcher_id).strip()
+
+        work = PayoutCalculator._append_bulky_delivery_records(
+            work,
+            bulky_df,
+            dispatcher_id or "",
+        )
+
+        if work.empty:
             penalty_breakdown = PayoutCalculator.calculate_penalty(
                 penalty_id,
                 duitnow_df,
@@ -1773,6 +1754,9 @@ class PayoutCalculator:
                 'total_amount': 0.0,
                 'total_count': 0,
             }
+            per_day = pd.DataFrame(
+                columns=["__date", "daily_parcels", "tier", "rate_per_parcel", "payout_per_day"]
+            )
             display_df = pd.DataFrame(
                 columns=["Date", "Total Parcel", "Tier", "Payout Rate", "Payout"]
             )
@@ -1781,353 +1765,15 @@ class PayoutCalculator:
                 0.0, "No delivery records in selected period", 0, per_day, penalty_breakdown,
             )
 
-        def map_rate(daily_parcels: float) -> Tuple[str, float]:
-            return PayoutCalculator.map_tier_rate(daily_parcels, tiers_config)
-
-        work = filtered_df.copy()
-
-        # Find column names with flexible matching
-        delivery_sig_col = find_column(work, ["Delivery Signature", "delivery_signature", "Delivery Signature", "delivery_sig"])
-        waybill_col = find_waybill_column(work)
-        dispatcher_id_col = find_dispatch_id_column(work)
-
-        if delivery_sig_col is None or waybill_col is None:
-            raise ValueError("Required columns (Delivery Signature and Waybill Number) not found in data")
-
-        dispatcher_id = None
-        if dispatcher_id_col and dispatcher_id_col in filtered_df.columns and len(filtered_df) > 0:
-            dispatcher_id = str(filtered_df[dispatcher_id_col].iloc[0]).strip()
-        if not dispatcher_id and fallback_dispatcher_id:
-            dispatcher_id = str(fallback_dispatcher_id).strip()
-
-        # Tier base rate uses dispatch rows only, minus this dispatcher's return/pickup AWBs.
-        if (
-            return_df is not None
-            and not return_df.empty
-            and not is_return_sheet_dispatch_fallback(return_df)
-        ):
-            return_disp_col = find_return_dispatcher_column(return_df)
-            work = exclude_dispatch_rows_by_dispatcher_sheet(
-                work, return_df, return_disp_col, dispatcher_id_col, waybill_col
-            )
-
-        if pickup_df is not None and not pickup_df.empty:
-            pickup_disp_col = find_pickup_dispatcher_column(pickup_df)
-            work = exclude_dispatch_rows_by_dispatcher_sheet(
-                work, pickup_df, pickup_disp_col, dispatcher_id_col, waybill_col
-            )
-
-        return_waybills: set = set()
-        pickup_waybills: set = set()
-        if dispatcher_id:
-            if (
-                return_df is not None
-                and not return_df.empty
-                and not is_return_sheet_dispatch_fallback(return_df)
-            ):
-                return_disp_col = find_return_dispatcher_column(return_df)
-                return_wb_col = find_waybill_column(return_df)
-                return_waybills = unique_waybills_for_dispatcher(
-                    return_df, dispatcher_id, return_disp_col, return_wb_col
-                )
-            if pickup_df is not None and not pickup_df.empty:
-                pickup_disp_col = find_pickup_dispatcher_column(pickup_df)
-                pickup_wb_col = find_waybill_column(pickup_df)
-                pickup_waybills = unique_waybills_for_dispatcher(
-                    pickup_df, dispatcher_id, pickup_disp_col, pickup_wb_col
-                )
-
-        # Convert dates - but DON'T drop records with invalid dates
-        # Use errors="coerce" to convert invalid dates to NaT, but keep the records
-        work["__date"] = pd.to_datetime(work[delivery_sig_col], errors="coerce").dt.date
-
-        # Preserve original waybill
-        work["__waybill_original"] = work[waybill_col].copy()
-
-        # Convert waybill to string - TREAT ALL WAYBILLS AS STRINGS
-        # This ensures waybills with "-", letters, numbers are preserved exactly as they are
-        # Handle NaN values by checking before conversion to avoid "nan" strings
-        def safe_waybill_to_string(value):
-            """CRITICAL: Preserve ALL waybills that have ANY value.
-
-            RULE: If waybill has ANY non-empty content, preserve it.
-            Only return None if the value is truly empty or explicitly NaN.
-
-            This function NEVER converts a valid waybill to None.
-            """
-            # Step 1: If already a string, check if it's valid
-            if isinstance(value, str):
-                value_stripped = value.strip()
-                # If it has content and is not a "nan" string, return it
-                if value_stripped and value_stripped.lower() not in ["nan", "none", "null", ""]:
-                    return value_stripped
-                # If it's empty or "nan" string, return None
-                if not value_stripped or value_stripped.lower() in ["nan", "none", "null"]:
-                    return None
-
-            # Step 2: Try to convert to string (handles numeric types)
-            try:
-                waybill_str = str(value).strip()
-                # If we got a string with content, return it
-                if waybill_str and waybill_str.lower() not in ["nan", "none", "null", ""]:
-                    # Handle numeric types - remove .0 from floats
-                    if isinstance(value, (float, int)) and not pd.isna(value):
-                        # If it's a float that's an integer, convert to int first
-                        if isinstance(value, float) and value.is_integer():
-                            return str(int(value))
-                        # Otherwise, return as string
-                        return waybill_str
-                    return waybill_str
-            except Exception:
-                pass
-
-            # Step 3: Check if it's truly None or NaN
-            if value is None:
-                return None
-
-            try:
-                if pd.isna(value):
-                    return None
-            except:
-                # If pd.isna fails, the value is probably valid
-                # Try one more time to convert to string
-                try:
-                    result = str(value).strip()
-                    if result and result.lower() not in ["nan", "none", "null", ""]:
-                        return result
-                except:
-                    pass
-
-            # Only return None if we truly can't get any value
-            return None
-
-        # CRITICAL: Convert waybills - NEVER convert a valid waybill to None
-        # If waybill has ANY value in raw data, preserve it
-        work["__waybill"] = work[waybill_col].apply(safe_waybill_to_string)
-
-        # CRITICAL RECOVERY LAYER 1: If waybill became None but original has value, recover it
-        # This ensures NO valid waybill from raw data is lost
-        none_waybills = work[work["__waybill"].isna()]
-        if not none_waybills.empty:
-            for idx in none_waybills.index:
-                original_wb = work.loc[idx, waybill_col]
-                # If original waybill exists and is not NaN, recover it
-                if pd.notna(original_wb):
-                    try:
-                        # Convert to string and use it if it has content
-                        recovered = str(original_wb).strip()
-                        if recovered and recovered.lower() not in ["nan", "none", "null", ""]:
-                            # Handle numeric types - remove .0 from floats
-                            if isinstance(original_wb, (float, int)) and not pd.isna(original_wb):
-                                if isinstance(original_wb, float) and original_wb.is_integer():
-                                    recovered = str(int(original_wb))
-                            work.loc[idx, "__waybill"] = recovered
-                    except Exception:
-                        # If recovery fails, try one more time with direct string conversion
-                        try:
-                            direct_str = str(original_wb)
-                            if direct_str and direct_str.strip() and direct_str.lower() not in ["nan", "none", "null"]:
-                                work.loc[idx, "__waybill"] = direct_str.strip()
-                        except:
-                            pass
-
-        # CRITICAL RECOVERY LAYER 2: Final check - if waybill is still None but original has value
-        # This is a last resort to ensure NO waybill is lost
-        none_mask = work["__waybill"].isna()
-        if none_mask.any():
-            for idx in work[none_mask].index:
-                original_wb = work.loc[idx, waybill_col]
-                # If original has ANY value (even if pandas thinks it's NaN), try to recover it
-                # Check both the original column and the preserved original
-                if pd.notna(original_wb):
-                    try:
-                        waybill_str = str(original_wb).strip()
-                        if waybill_str and waybill_str.lower() not in ["nan", "none", "null", ""]:
-                            # Handle numeric types
-                            if isinstance(original_wb, (float, int)) and not pd.isna(original_wb):
-                                if isinstance(original_wb, float) and original_wb.is_integer():
-                                    waybill_str = str(int(original_wb))
-                            work.loc[idx, "__waybill"] = waybill_str
-                    except Exception:
-                        # Last resort: try direct conversion without any checks
-                        try:
-                            direct = str(original_wb)
-                            if direct and direct != "nan":
-                                work.loc[idx, "__waybill"] = direct.strip()
-                        except:
-                            pass
-
-        # Store count before processing
-        total_before_filter = len(work)
-
-        # NO FILTERING - Keep ALL waybills that have any value
-        # Only filter out records where waybill is explicitly None/NaN
-        # This ensures ALL waybills are included:
-        # - Waybills with "-" (like "673002663768-01")
-        # - Waybills with letters (like "CNMYJ000930823", "CNMYJ000937478")
-        # - Waybills with numbers only (like "680009861506502")
-        # - Waybills with any combination of characters
-        # - Waybills with invalid dates (we'll handle dates separately)
-        #
-        # IMPORTANT: Only exclude if waybill is explicitly None (from NaN values)
-        # Handle records with missing waybills - generate unique placeholder waybills
-        # This ensures records without waybills are still included in the count
-        # The user wants ALL records included, even if waybill is missing
-        missing_waybill_mask = work["__waybill"].isna()
-        if missing_waybill_mask.any():
-            # Generate unique placeholder waybills for records without waybills
-            # Format: "MISSING_WAYBILL_{row_index}_{date}_{dispatcher}"
-            missing_indices = work[missing_waybill_mask].index
-            for idx in missing_indices:
-                date_str = str(work.loc[idx, "__date"]) if pd.notna(work.loc[idx, "__date"]) else "UNKNOWN"
-                dispatcher = work.loc[idx, dispatcher_id_col] if dispatcher_id_col and dispatcher_id_col in work.columns and pd.notna(work.loc[idx, dispatcher_id_col]) else "UNKNOWN"
-                placeholder_waybill = f"MISSING_WAYBILL_{idx}_{date_str}_{dispatcher}"
-                work.loc[idx, "__waybill"] = placeholder_waybill
-                # Also update the original waybill
-                if pd.isna(work.loc[idx, "__waybill_original"]):
-                    work.loc[idx, "__waybill_original"] = placeholder_waybill
-
-        # Now all records should have a waybill - no need to filter
-        # work = work[work["__waybill"].notna()]  # REMOVED - we now include all records with placeholder waybills
-
-        # Handle invalid dates - keep the waybill but use the date from Delivery Signature if possible
-        # If date is invalid, we'll still count the waybill but group it separately
-        # This ensures waybills aren't dropped just because of date parsing issues
-        invalid_date_mask = work["__date"].isna()
-        if invalid_date_mask.any():
-            # Try to extract date from Delivery Signature string if datetime conversion failed
-            for idx in work[invalid_date_mask].index:
-                delivery_sig = work.loc[idx, delivery_sig_col]
-                if pd.notna(delivery_sig):
-                    # Try parsing as string date
-                    try:
-                        parsed_date = pd.to_datetime(str(delivery_sig), errors="coerce").date()
-                        if pd.notna(parsed_date):
-                            work.loc[idx, "__date"] = parsed_date
-                    except:
-                        pass
-            # For any remaining invalid dates, use today's date as fallback
-            # This ensures the waybill is still counted
-            work["__date"] = work["__date"].fillna(pd.Timestamp.today().date())
-
-        # Post-processing: Ensure ALL waybills from original data are included
-        # If any waybills were filtered out, restore them from the original data
-        # This handles ALL waybill formats: CNMYJ*, numeric-only, with hyphens, etc.
-
-        # Get all unique waybills from original data - convert to string for comparison
-        def normalize_waybill_for_comparison(wb):
-            """Normalize waybill for comparison - handles numeric and string formats."""
-            if pd.isna(wb):
-                return None
-            # Convert to string, handling numeric types correctly
-            if isinstance(wb, (int, float)):
-                if isinstance(wb, float) and wb.is_integer():
-                    return str(int(wb))  # 680009861506502.0 -> "680009861506502"
-                return str(wb)
-            return str(wb).strip()
-
-        original_waybills = filtered_df[waybill_col].dropna().unique()
-        current_waybills_set = set(work["__waybill"].dropna().astype(str).str.strip().unique())
-
-        # Find waybills that exist in original data but not in current work
-        missing_waybills_all = []
-        for orig_wb in original_waybills:
-            orig_wb_normalized = normalize_waybill_for_comparison(orig_wb)
-            if orig_wb_normalized and orig_wb_normalized.lower() not in ["nan", "none", ""]:
-                # Check if it's in current set (try both exact match and normalized)
-                if orig_wb_normalized not in current_waybills_set:
-                    missing_waybills_all.append(orig_wb_normalized)
-
-        if missing_waybills_all:
-            # Find records with these missing waybills in original data
-            # Use multiple matching strategies to catch all formats
-            missing_mask = pd.Series([False] * len(filtered_df), index=filtered_df.index)
-            for missing_wb in missing_waybills_all:
-                # Try exact match
-                mask1 = filtered_df[waybill_col].astype(str).str.strip() == missing_wb
-                # Try case-insensitive match
-                mask2 = filtered_df[waybill_col].astype(str).str.strip().str.upper() == missing_wb.upper()
-                # Try numeric comparison for numeric waybills
-                try:
-                    missing_wb_num = float(missing_wb)
-                    if missing_wb_num.is_integer():
-                        mask3 = filtered_df[waybill_col].astype(float) == missing_wb_num
-                    else:
-                        mask3 = pd.Series([False] * len(filtered_df), index=filtered_df.index)
-                except (ValueError, TypeError):
-                    mask3 = pd.Series([False] * len(filtered_df), index=filtered_df.index)
-
-                missing_mask = missing_mask | mask1 | mask2 | mask3
-
-            missing_records_all = filtered_df[missing_mask].copy()
-
-            # Do not add back waybills that are in the return sheet (keep Total Delivery Parcels excluding returns).
-            if not missing_records_all.empty and return_waybills:
-                norm_missing = missing_records_all[waybill_col].apply(normalize_waybill)
-                missing_records_all = missing_records_all.loc[~norm_missing.isin(return_waybills)].copy()
-
-            # Do not add back waybills that are in the pickup sheet (counted as pickup, not delivery).
-            if not missing_records_all.empty and pickup_waybills:
-                norm_missing = missing_records_all[waybill_col].apply(normalize_waybill)
-                missing_records_all = missing_records_all.loc[~norm_missing.isin(pickup_waybills)].copy()
-
-            if not missing_records_all.empty:
-                # Convert waybill - use direct string conversion to ensure it's never None
-                def force_waybill_to_string(x):
-                    """Force convert waybill to string - never return None for valid values."""
-                    if pd.isna(x):
-                        return None
-                    # Convert to string directly
-                    wb_str = str(x).strip()
-                    if wb_str == "" or wb_str.lower() in ["nan", "none"]:
-                        return None
-                    # Handle numeric types
-                    if isinstance(x, (int, float)):
-                        if isinstance(x, float) and x.is_integer():
-                            return str(int(x))
-                        return str(x)
-                    return wb_str
-
-                missing_records_all["__waybill"] = missing_records_all[waybill_col].apply(force_waybill_to_string)
-                missing_records_all["__waybill_original"] = missing_records_all[waybill_col].copy()
-                missing_records_all["__date"] = pd.to_datetime(
-                    missing_records_all[delivery_sig_col], errors="coerce"
-                ).dt.date
-                # Fill invalid dates
-                missing_records_all["__date"] = missing_records_all["__date"].fillna(
-                    pd.Timestamp.today().date()
-                )
-                # Only filter out records where waybill is still None after force conversion
-                missing_records_all = missing_records_all[missing_records_all["__waybill"].notna()]
-                # Add back to work dataframe
-                if not missing_records_all.empty:
-                    work = pd.concat([work, missing_records_all], ignore_index=True)
-                    # Update counts after restoration
-                    total_after_filter = len(work)
-                    filtered_out_count = total_before_filter - total_after_filter
-
-        # Store count after processing
-        total_after_filter = len(work)
-
-        if not dispatcher_id and fallback_dispatcher_id:
-            dispatcher_id = str(fallback_dispatcher_id).strip()
-        work = PayoutCalculator._append_bulky_delivery_records(
-            work, bulky_df, dispatcher_id or ""
-        )
-
-        # Remove duplicates - keep last entry per date+waybill combination
-        # This ensures each waybill is counted only once per day
-        work = work.sort_values(by=["__date", "__waybill", delivery_sig_col])
-
-        # SIMPLE: No deduplication needed - user confirmed waybills have no duplicates
-        # Just get all unique waybills that have data (not None)
-        all_unique_waybills = work[work["__waybill"].notna()]["__waybill"].unique().tolist()
+        sort_cols = ["__date", "__waybill"]
+        if delivery_sig_col in work.columns:
+            sort_cols.append(delivery_sig_col)
+        work = work.sort_values(by=sort_cols)
 
         per_day = (
-            work.groupby(["__date"], dropna=False)["__waybill"]
-            .nunique()
-            .reset_index()
-            .rename(columns={"__waybill": "daily_parcels"})
+            work.groupby(["__date"], dropna=False)
+            .size()
+            .reset_index(name="daily_parcels")
         )
 
         total_parcels = int(per_day["daily_parcels"].sum())
@@ -2187,17 +1833,8 @@ class PayoutCalculator:
                            'attendance': {'amount': 0.0, 'count': 0},
                            'total_amount': 0.0, 'total_count': 0}
 
-        # Extract dispatcher_id with flexible column name matching
-        dispatcher_id = None
-        if dispatcher_id_col and dispatcher_id_col in filtered_df.columns:
-            dispatcher_id = filtered_df[dispatcher_id_col].iloc[0] if len(filtered_df) > 0 else None
-        else:
-            # Fallback: try to find dispatcher ID column
-            dispatcher_id_col_fallback = find_column(filtered_df, ["Dispatcher ID", "dispatcher_id", "Dispatcher Id", "DISPATCHER ID"])
-            if dispatcher_id_col_fallback:
-                dispatcher_id = filtered_df[dispatcher_id_col_fallback].iloc[0] if len(filtered_df) > 0 else None
-
-        penalty_id = dispatcher_id or fallback_dispatcher_id
+        # Extract dispatcher_id for penalty lookup.
+        penalty_id = clean_penalty_dispatcher_id(dispatcher_id or fallback_dispatcher_id or "")
         if penalty_id:
             working_days = len(per_day)
             penalty_breakdown = PayoutCalculator.calculate_penalty(
@@ -3790,9 +3427,12 @@ def main():
                 )
             with summary_row1_col2:
                 st.metric(
-                    "Total Delivery Parcels",
+                    "Parcels Delivered",
                     f"{display_df['Total Parcel'].sum():,}",
-                    help="Dispatch and bulky parcels for tier base rate (excludes return and pickup AWBs)",
+                    help=(
+                        "Dispatch and bulky parcels for tier base rate "
+                        "(excludes return and pickup AWBs; overlap counted via Bulky only)."
+                    ),
                 )
             with summary_row1_col3:
                 st.metric(
@@ -3876,8 +3516,6 @@ def main():
                     "Payout": st.column_config.TextColumn("Payout")
                 }
             )
-
-
 
             # Display bonuses and penalties
             st.subheader("🎯 Incentives & Penalties")
