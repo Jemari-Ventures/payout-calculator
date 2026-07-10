@@ -32,6 +32,7 @@ from penalty_common import (
     find_amount_column,
     find_employee_id_column,
     find_penalty_dispatcher_column,
+    find_reward_employee_column,
     find_penalty_waybill_column,
     compute_pickup_commission_series,
     sum_pickup_commission,
@@ -309,15 +310,124 @@ def find_waybill_column(df: pd.DataFrame) -> Optional[str]:
 
 
 def find_pickup_dispatcher_column(df: pd.DataFrame) -> Optional[str]:
-    """Find pickup dispatcher ID column."""
+    """Find pickup dispatcher ID column; prefer pickup-specific headers."""
+    if df is None or df.empty:
+        return None
+    columns_by_lower = {str(c).strip().lower(): c for c in df.columns}
+    for name in (
+        "Pick Up Dispatcher ID",
+        "Pick Up Dispatcher Id",
+        "Pickup Dispatcher ID",
+        "Pickup Dispatcher Id",
+        "pickup_dispatcher_id",
+        "pick_up_dispatcher_id",
+    ):
+        if name.lower() in columns_by_lower:
+            return columns_by_lower[name.lower()]
     for col in df.columns:
-        c = str(col).strip()
-        c_lower = c.lower()
-        if c in ("Pick Up Dispatcher ID", "Pickup Dispatcher ID", "pickup_dispatcher_id", "Dispatcher ID"):
-            return col
+        c_lower = str(col).strip().lower()
         if "pickup" in c_lower and "dispatcher" in c_lower:
             return col
+    for name in ("Dispatcher ID", "dispatcher_id"):
+        if name.lower() in columns_by_lower:
+            return columns_by_lower[name.lower()]
     return None
+
+
+def pickup_dispatcher_columns_priority(df: pd.DataFrame) -> List[str]:
+    """Pickup dispatcher columns in priority order (pickup-specific first)."""
+    if df is None or df.empty:
+        return []
+    columns_by_lower = {str(c).strip().lower(): c for c in df.columns}
+    ordered: List[str] = []
+    for name in (
+        "Pick Up Dispatcher ID",
+        "Pick Up Dispatcher Id",
+        "Pickup Dispatcher ID",
+        "Pickup Dispatcher Id",
+        "pickup_dispatcher_id",
+        "pick_up_dispatcher_id",
+    ):
+        col = columns_by_lower.get(name.lower())
+        if col and col not in ordered:
+            ordered.append(col)
+    for col in df.columns:
+        c_lower = str(col).strip().lower()
+        if "pickup" in c_lower and "dispatcher" in c_lower and col not in ordered:
+            ordered.append(col)
+    for name in ("Dispatcher ID", "dispatcher_id"):
+        col = columns_by_lower.get(name.lower())
+        if col and col not in ordered:
+            ordered.append(col)
+    return ordered
+
+
+def pickup_dispatcher_key_series(df: pd.DataFrame) -> pd.Series:
+    """Normalized pickup dispatcher ID per row using priority columns."""
+    if df is None or df.empty:
+        return pd.Series(dtype=str)
+    cols = pickup_dispatcher_columns_priority(df)
+    if not cols:
+        return pd.Series("", index=df.index, dtype=str)
+
+    def row_key(row) -> str:
+        for col in cols:
+            key = normalize_dispatcher_id(row[col])
+            if key:
+                return key
+        return ""
+
+    return df.apply(row_key, axis=1)
+
+
+def pickup_dispatcher_id_series(df: pd.DataFrame) -> pd.Series:
+    """Raw pickup dispatcher ID per row using the same priority columns."""
+    if df is None or df.empty:
+        return pd.Series(dtype=str)
+    cols = pickup_dispatcher_columns_priority(df)
+    if not cols:
+        return pd.Series("", index=df.index, dtype=str)
+
+    def row_id(row) -> str:
+        for col in cols:
+            val = row[col]
+            if pd.notna(val) and str(val).strip():
+                return str(val).strip()
+        return ""
+
+    return df.apply(row_id, axis=1)
+
+
+def build_pickup_waybill_set(pickup_df: pd.DataFrame) -> set:
+    """All normalized waybills listed on the pickup sheet."""
+    if pickup_df is None or pickup_df.empty:
+        return set()
+    waybill_col = find_waybill_column(pickup_df)
+    if not waybill_col:
+        return set()
+    return {
+        wb
+        for wb in pickup_df[waybill_col].apply(normalize_waybill)
+        if wb
+    }
+
+
+def exclude_dispatch_rows_by_waybill_set(
+    dispatch_df: pd.DataFrame,
+    waybill_set: set,
+    dispatch_wb_col: Optional[str],
+) -> pd.DataFrame:
+    """Remove dispatch rows whose waybill appears on another sheet (e.g. pickup)."""
+    if (
+        dispatch_df is None
+        or dispatch_df.empty
+        or not waybill_set
+        or not dispatch_wb_col
+        or dispatch_wb_col not in dispatch_df.columns
+    ):
+        return dispatch_df
+    wbs = dispatch_df[dispatch_wb_col].apply(normalize_waybill)
+    return dispatch_df.loc[~wbs.isin(waybill_set)].copy()
 
 
 def is_return_sheet_dispatch_fallback(return_df: pd.DataFrame) -> bool:
@@ -2573,7 +2683,8 @@ class PayoutCalculator:
             return dispatcher_summary_df
 
         pickup_work = pickup_df.copy()
-        pickup_work['_dispatcher_key'] = pickup_work[pickup_dispatcher_col].apply(normalize_dispatcher_id)
+        pickup_work['_dispatcher_key'] = pickup_dispatcher_key_series(pickup_work)
+        pickup_work['_dispatcher_id'] = pickup_dispatcher_id_series(pickup_work)
         pickup_work = pickup_work[pickup_work['_dispatcher_key'] != '']
 
         pickup_work['_pickup_commission'] = compute_pickup_commission_series(
@@ -2583,7 +2694,7 @@ class PayoutCalculator:
         pickup_summary = pickup_work.groupby('_dispatcher_key').agg(
             pickup_parcels=(waybill_col, 'size'),
             pickup_payout=('_pickup_commission', 'sum'),
-            dispatcher_id=(pickup_dispatcher_col, 'first'),
+            dispatcher_id=('_dispatcher_id', 'first'),
         ).reset_index()
 
         dispatcher_summary_df = dispatcher_summary_df.copy()
@@ -2876,8 +2987,7 @@ class PayoutCalculator:
                     pass
             return s
 
-        # Exclude return/pickup waybills from dispatch for the same dispatcher
-        # so delivery counts only true deliveries (pickup/return are counted separately).
+        # Exclude return/bulky waybills from dispatch (pickup stays in delivery tier payout).
         dispatch_disp_col = find_dispatch_id_column(df)
         dispatch_wb_col = find_waybill_column(df)
 
@@ -2885,12 +2995,6 @@ class PayoutCalculator:
             return_disp_col = find_return_dispatcher_column(return_df)
             df = exclude_dispatch_rows_by_dispatcher_sheet(
                 df, return_df, return_disp_col, dispatch_disp_col, dispatch_wb_col
-            )
-
-        if pickup_df is not None and not pickup_df.empty:
-            pickup_disp_col = find_pickup_dispatcher_column(pickup_df)
-            df = exclude_dispatch_rows_by_dispatcher_sheet(
-                df, pickup_df, pickup_disp_col, dispatch_disp_col, dispatch_wb_col
             )
 
         if bulky_df is not None and not bulky_df.empty:
@@ -2954,19 +3058,37 @@ class PayoutCalculator:
                 )
 
         reward_map = {}
+        reward_summary = pd.DataFrame()
         if reward_df is not None and not reward_df.empty:
-            reward_disp_col = find_penalty_dispatcher_column(reward_df)
+            reward_disp_col = find_reward_employee_column(reward_df)
             reward_amount_col = find_amount_column(reward_df)
             if reward_disp_col and reward_amount_col:
                 reward_copy = reward_df.copy()
-                reward_copy['_dispatcher_id'] = reward_copy[reward_disp_col].apply(normalize_dispatcher_id)
-                reward_copy['_reward_amount'] = pd.to_numeric(reward_copy[reward_amount_col], errors='coerce').fillna(0.0)
-                reward_copy = reward_copy[reward_copy['_reward_amount'] > 0]
-                reward_map = (
-                    reward_copy.groupby('_dispatcher_id')['_reward_amount']
-                    .sum()
-                    .round(2)
-                    .to_dict()
+                reward_copy['_dispatcher_key'] = reward_copy[reward_disp_col].apply(normalize_dispatcher_id)
+                reward_copy['_dispatcher_id'] = reward_copy[reward_disp_col].astype(str).str.strip()
+                reward_copy['_reward_amount'] = pd.to_numeric(
+                    reward_copy[reward_amount_col], errors='coerce'
+                ).fillna(0.0)
+                reward_copy = reward_copy[
+                    (reward_copy['_dispatcher_key'] != '')
+                    & (reward_copy['_reward_amount'] > 0)
+                ]
+                if not reward_copy.empty:
+                    reward_map = (
+                        reward_copy.groupby('_dispatcher_key')['_reward_amount']
+                        .sum()
+                        .round(2)
+                        .to_dict()
+                    )
+                    reward_summary = reward_copy.groupby('_dispatcher_key').agg(
+                        reward=('_reward_amount', 'sum'),
+                        dispatcher_id=('_dispatcher_id', 'first'),
+                    ).reset_index()
+            elif reward_df is not None and not reward_df.empty:
+                st.warning(
+                    "⚠️ Could not load reward data: expected columns "
+                    f"employee_id (or dispatcher_id) and amount. "
+                    f"Found: {list(reward_df.columns)}"
                 )
 
         rental_map = {}
@@ -3044,7 +3166,7 @@ class PayoutCalculator:
             + grouped['tier2_parcels'] * tier_rates[1]
             + grouped['tier3_parcels'] * tier_rates[2]
             + grouped['tier4_parcels'] * tier_rates[3]
-        )
+        ).round(2)
 
         # Calculate avg_rate with division by zero protection
         grouped['avg_rate'] = grouped.apply(
@@ -3163,11 +3285,51 @@ class PayoutCalculator:
             lambda x: float(overpaid_map.get(normalize_dispatcher_id(str(x)), 0.0))
         )
 
-        # Calculate total payout: dispatch - penalty + pickup + return + reward - rental - benefit deductions
+        # Include reward-only dispatchers (no dispatch rows in period).
+        if not reward_summary.empty:
+            grouped['_dispatcher_key'] = grouped['dispatcher_id'].apply(normalize_dispatcher_id)
+            reward_only = reward_summary[
+                ~reward_summary['_dispatcher_key'].isin(grouped['_dispatcher_key'])
+            ]
+            if not reward_only.empty:
+                reward_only_rows = pd.DataFrame({
+                    'dispatcher_id': reward_only['dispatcher_id'].astype(str),
+                    '_dispatcher_key': reward_only['_dispatcher_key'],
+                    'dispatcher_name': 'Unknown',
+                    'parcel_count': 0,
+                    'pickup_parcels': 0,
+                    'pickup_payout': 0.0,
+                    'return_parcels': 0,
+                    'return_payout': 0.0,
+                    'bulky_parcels': 0,
+                    'bulky_payout': 0.0,
+                    'dispatch_payout': 0.0,
+                    'reward': reward_only['reward'].astype(float).round(2),
+                    'rental': 0.0,
+                    'penalty_amount': 0.0,
+                    'penalty_count': 0,
+                    'penalty_waybills': '',
+                    'total_weight': 0.0,
+                    'avg_weight': 0.0,
+                    'avg_rate': 0.0,
+                    'tier1_parcels': 0,
+                    'tier2_parcels': 0,
+                    'tier3_parcels': 0,
+                    'tier4_parcels': 0,
+                    'socso_deduction': 0.0,
+                    'overpaid_deduction': 0.0,
+                })
+                for col in grouped.columns:
+                    if col not in reward_only_rows.columns:
+                        reward_only_rows[col] = 0 if grouped[col].dtype != object else ''
+                reward_only_rows = reward_only_rows[grouped.columns]
+                grouped = pd.concat([grouped, reward_only_rows], ignore_index=True)
+            grouped = grouped.drop(columns=['_dispatcher_key'], errors='ignore')
+
+        # Total payout: delivery (incl. pickup) + return + bulky + reward - deductions
         grouped['total_payout'] = (
             grouped['dispatch_payout']
             - grouped['penalty_amount']
-            + grouped['pickup_payout']
             + grouped['return_payout']
             + grouped['bulky_payout']
             + grouped['reward']
@@ -3277,6 +3439,12 @@ class PayoutCalculator:
             display_df = display_df.drop(columns=["Penalty Parcels"])
 
         total_payout = numeric_df["Total Payout"].sum()
+        gross_earnings_check = (
+            numeric_df["Delivery Parcels Payout"].sum()
+            + (numeric_df["Return Parcels Payout"].sum() if "Return Parcels Payout" in numeric_df.columns else 0.0)
+            + (numeric_df["Bulky Parcels Payout"].sum() if "Bulky Parcels Payout" in numeric_df.columns else 0.0)
+            + (numeric_df["Reward"].sum() if "Reward" in numeric_df.columns else 0.0)
+        )
 
         with st.expander("📊 Processing Details", expanded=False):
             # Display any processing warnings
@@ -3322,19 +3490,18 @@ class PayoutCalculator:
         total_penalty = numeric_df["Penalty"].sum()
         total_socso = numeric_df["SOCSO"].sum() if "SOCSO" in numeric_df.columns else 0.0
         total_overpaid = numeric_df["Overpaid"].sum() if "Overpaid" in numeric_df.columns else 0.0
-
         st.info(f"""
         💰 **Payout Breakdown:**
-        - Delivery Parcels Payout: {currency_symbol} {total_dispatch_payout:,.2f}
-        + Pickup Parcels Payout: {currency_symbol} {total_pickup_payout:,.2f}
+        - Delivery + Pickup (incl. pickup): {currency_symbol} {total_dispatch_payout:,.2f}
         + Return Parcels Payout: {currency_symbol} {total_return_payout:,.2f}
         + Bulky Parcels Payout: {currency_symbol} {total_bulky_payout:,.2f}
         + Reward: {currency_symbol} {total_reward:,.2f}
+        = **Total Payout: {currency_symbol} {gross_earnings_check:,.2f}**
         - Penalties (excl. SOCSO/Overpaid): {currency_symbol} {total_penalty:,.2f}
         - Rental: {currency_symbol} {total_rental:,.2f}
         - SOCSO: {currency_symbol} {total_socso:,.2f}
         - Overpaid: {currency_symbol} {total_overpaid:,.2f}
-        **Total Payout: {currency_symbol} {total_payout:,.2f}**
+        = **Gross Payout (net): {currency_symbol} {total_payout:,.2f}**
         """)
 
         return display_df, numeric_df, total_payout
@@ -3662,15 +3829,21 @@ class InvoiceGenerator:
             # Keep summary math consistent with line items shown in invoice.
             total_penalty = sum(penalty_by_type.values())
             total_benefit_deduction = sum(benefit_deduction_by_type.values())
+            # Total Payout = earnings before deductions; Gross Payout = net after all deductions.
+            delivery_pickup_payout = total_dispatch_payout
             invoice_total_payout = (
-                total_dispatch_payout
-                + total_pickup_payout
+                delivery_pickup_payout
                 + total_return_payout
                 + total_bulky_payout
                 + total_reward
-                - total_rental
             )
-            gross_payout = invoice_total_payout - total_penalty - total_benefit_deduction
+            gross_payout = float(total_payout)
+            payout_subtext = (
+                f"Delivery + Pickup: {currency_symbol} {delivery_pickup_payout:,.2f} · "
+                f"Return: {currency_symbol} {total_return_payout:,.2f} · "
+                f"Bulky: {currency_symbol} {total_bulky_payout:,.2f} · "
+                f"Reward: {currency_symbol} {total_reward:,.2f}"
+            )
             top_3 = display_df.head(3)
 
             table_columns = ["Dispatcher ID", "Dispatcher Name", "Total AWB", "Parcels Delivered",
@@ -3748,7 +3921,8 @@ class InvoiceGenerator:
                   vertical-align: middle;
                 }}
                 .summary-row.payout-summary .chip {{
-                  flex: 0 1 280px;
+                  flex: 1 1 200px;
+                  max-width: 280px;
                 }}
                 .chip {{
                   border: 1px solid var(--border); border-radius: 12px;
@@ -3842,10 +4016,7 @@ class InvoiceGenerator:
                                 <div class="label">Total Payout</div>
                                 <div class="value">{currency_symbol} {invoice_total_payout:,.2f}</div>
                                 <div class="subtext">
-                                    Delivery: {currency_symbol} {total_dispatch_payout:,.2f} ·
-                                    Pickup: {currency_symbol} {total_pickup_payout:,.2f} ·
-                                    Return: {currency_symbol} {total_return_payout:,.2f} ·
-                                    Bulky: {currency_symbol} {total_bulky_payout:,.2f}
+                                    {payout_subtext}
                                 </div>
                             </div>
                             <div class="chip">
@@ -3873,6 +4044,10 @@ class InvoiceGenerator:
                                     Overpaid: -{currency_symbol} {benefit_deduction_by_type['overpaid']:,.2f}
                                 </div>
                             </div>
+                            <div class="chip">
+                                <div class="label">Rental</div>
+                                <div class="value">-{currency_symbol} {total_rental:,.2f}</div>
+                            </div>
                         </div>
                     </div>
 
@@ -3894,11 +4069,16 @@ class InvoiceGenerator:
                     <div style="margin-top:3rem">
                         <table style="width:100%; background:var(--surface); border-radius:8px; margin-top:2rem; border:1px solid var(--border)">
                             <tr><th style="background:var(--primary);color:white;text-align:left;">Summary</th><th style="background:var(--primary);color:white;text-align:right;">Amount</th></tr>
-                            <tr><td>Delivery Parcels Payout</td><td style="text-align:right;">{currency_symbol} {total_dispatch_payout:,.2f}</td></tr>
+                            <tr><td>Delivery + Pickup Payout</td><td style="text-align:right;">{currency_symbol} {delivery_pickup_payout:,.2f}</td></tr>
+                            <tr><td>Return Parcels Payout</td><td style="text-align:right;">{currency_symbol} {total_return_payout:,.2f}</td></tr>
+                            <tr><td>Bulky Parcels Payout</td><td style="text-align:right;">{currency_symbol} {total_bulky_payout:,.2f}</td></tr>
                             <tr><td>Total Reward</td><td style="text-align:right;">{currency_symbol} {total_reward:,.2f}</td></tr>
-                            <tr><td>Total Rental (deduction)</td><td style="text-align:right;">-{currency_symbol} {total_rental:,.2f}</td></tr>
                             <tr><td><strong>Total Payout</strong></td><td style="text-align:right;"><strong>{currency_symbol} {invoice_total_payout:,.2f}</strong></td></tr>
                             <tr><td>Total Penalty</td><td style="text-align:right;">-{currency_symbol} {total_penalty:,.2f}</td></tr>
+                            <tr><td>Total Rental (deduction)</td><td style="text-align:right;">-{currency_symbol} {total_rental:,.2f}</td></tr>
+                            <tr><td>SOCSO</td><td style="text-align:right;">-{currency_symbol} {benefit_deduction_by_type['socso']:,.2f}</td></tr>
+                            <tr><td>Overpaid</td><td style="text-align:right;">-{currency_symbol} {benefit_deduction_by_type['overpaid']:,.2f}</td></tr>
+                            <tr><td>Total Benefit Deductions</td><td style="text-align:right;">-{currency_symbol} {total_benefit_deduction:,.2f}</td></tr>
                             <tr><td><strong>Gross Payout</strong></td><td style="text-align:right;"><strong>{currency_symbol} {gross_payout:,.2f}</strong></td></tr>
                         </table>
                     </div>
@@ -4756,6 +4936,14 @@ def main():
             'overpaid': numeric_df["Overpaid"].sum() if "Overpaid" in numeric_df.columns else 0.0,
         }
 
+        # Delivery Parcels Payout includes pickup; pickup payout is not added again.
+        gross_earnings = (
+            total_dispatch_payout
+            + total_return_payout
+            + total_bulky_payout
+            + total_reward
+        )
+
         # Row 1: Dispatchers | Total AWB | Parcels Delivered | Pickup Parcels | Return Parcels
         row1_col1, row1_col2, row1_col3, row1_col4, row1_col5 = st.columns(5)
         with row1_col1:
@@ -4777,28 +4965,42 @@ def main():
         with row1_col5:
             st.metric("Return Parcels", f"{total_return_parcels:,}")
 
-        # Row 2: Total Payout | Delivery Parcels Payout | Pickup Parcels Payout | Return Parcels Payout | Reward
+        # Row 2: Gross earnings components (delivery incl. pickup + return + bulky + reward)
         row2_col1, row2_col2, row2_col3, row2_col4, row2_col5 = st.columns(5)
         with row2_col1:
-            st.metric("Total Payout", f"{currency} {total_payout:,.2f}")
+            st.metric(
+                "Delivery + Pickup Payout",
+                f"{currency} {total_dispatch_payout:,.2f}",
+                help="Dispatch tier payout (includes pickup parcels; pickup payout is not added separately).",
+            )
         with row2_col2:
-            st.metric("Delivery Parcels Payout", f"{currency} {total_dispatch_payout:,.2f}")
-        with row2_col3:
-            st.metric("Reward", f"{currency} {total_reward:,.2f}")
-        with row2_col4:
-            st.metric("Pickup Parcels Payout", f"{currency} {total_pickup_payout:,.2f}")
-        with row2_col5:
             st.metric("Return Parcels Payout", f"{currency} {total_return_payout:,.2f}")
+        with row2_col3:
+            st.metric("Bulky Parcels Payout", f"{currency} {total_bulky_payout:,.2f}")
+        with row2_col4:
+            st.metric("Reward", f"{currency} {total_reward:,.2f}")
+        with row2_col5:
+            st.metric(
+                "Total Payout",
+                f"{currency} {gross_earnings:,.2f}",
+                help="Delivery + Pickup + Return + Bulky + Reward (before penalties and deductions).",
+            )
 
-        row3_col1, = st.columns(1)
+        # Row 3: Gross payout (net) and deductions
+        row3_col1, row3_col2, row3_col3, row3_col4, row3_col5 = st.columns(5)
         with row3_col1:
-            st.metric("Rental (deduction)", f"-{currency} {total_rental:,.2f}")
-
-        st.markdown("#### 🏛️ Benefit Deductions")
-        benefit_col1, benefit_col2 = st.columns(2)
-        with benefit_col1:
+            st.metric(
+                "Gross Payout",
+                f"{currency} {total_payout:,.2f}",
+                help="Total Payout minus penalties, rental, SOCSO, and overpaid.",
+            )
+        with row3_col2:
+            st.metric("Total Penalty", f"-{currency} {total_penalty:,.2f}")
+        with row3_col3:
+            st.metric("Rental", f"-{currency} {total_rental:,.2f}")
+        with row3_col4:
             st.metric("SOCSO", f"-{currency} {benefit_deduction_by_type['socso']:,.2f}")
-        with benefit_col2:
+        with row3_col5:
             st.metric("Overpaid", f"-{currency} {benefit_deduction_by_type['overpaid']:,.2f}")
 
         # Penalty breakdown by type

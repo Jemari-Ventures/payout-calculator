@@ -44,6 +44,7 @@ from penalty_common import (
     find_pickup_commission_column,
     find_amount_column,
     find_reward_dispatcher_name_column,
+    find_reward_employee_column,
     sum_benefit_deduction_float,
     sum_dispatcher_amount_penalty_float,
 )
@@ -1427,11 +1428,11 @@ class PayoutCalculator:
         reward_df: pd.DataFrame,
         dispatcher_id: str,
     ) -> Tuple[float, int, pd.DataFrame]:
-        """Sum reward amount for dispatcher from Reward sheet (dispatcher_id + amount)."""
+        """Sum reward amount for dispatcher from Reward sheet (employee_id + amount)."""
         if reward_df is None or reward_df.empty or not dispatcher_id:
             return 0.0, 0, pd.DataFrame()
 
-        disp_id_col = find_penalty_dispatcher_column(reward_df)
+        disp_id_col = find_reward_employee_column(reward_df)
         amount_col = find_amount_column(reward_df)
         if disp_id_col is None or amount_col is None:
             return 0.0, 0, pd.DataFrame()
@@ -3103,7 +3104,7 @@ def main():
         dispatcher_mapping.setdefault(penalty_id, "")
 
     if reward_df is not None and not reward_df.empty:
-        reward_id_col = find_penalty_dispatcher_column(reward_df)
+        reward_id_col = find_reward_employee_column(reward_df)
         reward_name_col = find_reward_dispatcher_name_column(reward_df)
         if reward_id_col:
             reward_cols = [reward_id_col] + ([reward_name_col] if reward_name_col else [])

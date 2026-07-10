@@ -320,6 +320,11 @@ def find_reward_dispatcher_name_column(df: pd.DataFrame) -> Optional[str]:
     return find_column(df, ["dispatcher_name", "Dispatcher Name", "Dispatcher name"])
 
 
+def find_reward_employee_column(df: pd.DataFrame) -> Optional[str]:
+    """Resolve employee/dispatcher ID on Reward sheet (employee_id or dispatcher_id)."""
+    return find_employee_id_column(df) or find_penalty_dispatcher_column(df)
+
+
 def preprocess_dispatcher_amount_penalty_df(df: pd.DataFrame) -> pd.DataFrame:
     """Normalize hub/socso/overpaid sheets: Dispatcher ID + Amount."""
     df_processed = df.copy()
