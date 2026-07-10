@@ -20,7 +20,8 @@
       "no_outbound_scan": "No Outbound Scan",
       "hub": "Hub",
       "socso": "Socso",
-      "overpaid": "Overpaid"
+      "overpaid": "Overpaid",
+      "bulky": "Bulky"
     }
   },
   "database": {
@@ -109,6 +110,11 @@
   "forecast_days": 30,
   "qr_order_payout_per_order": 1.8,
   "return_payout_per_parcel": 0.5,
+  "bulky_rates": {
+    "under_50": 4.0,
+    "over_50": 5.0,
+    "weight_threshold": 50.0
+  },
   "fake_attempt_penalty_per_parcel": 2.0,
   "pending_parcel_penalty_per_parcel": 2.0,
   "no_outbound_scan_penalty_per_parcel": 3.0,

@@ -114,10 +114,16 @@ class Config:
                 "overpaid": "Ovepaid",
                 "pending_parcel": "Pending Parcel",
                 "parcel_lost": "Parcel lost",
-                "no_outbound_scan": "No Outbound Scan"
+                "no_outbound_scan": "No Outbound Scan",
+                "bulky": "Bulky"
             }
         },
         "database": {"table_name": "dispatch"},
+        "bulky_rates": {
+            "under_50": 4.00,
+            "over_50": 5.00,
+            "weight_threshold": 50.00
+        },
         "weight_tiers": [
             {"min": 0, "max": 5, "rate": 1.50},
             {"min": 5, "max": 10, "rate": 1.60},
@@ -188,6 +194,10 @@ class Config:
                         config["data_source"].setdefault("excel_sheets", {})["no_outbound_scan"] = "No Outbound Scan"
                     if "route_penalty_amount" not in config:
                         config["route_penalty_amount"] = cls.DEFAULT_CONFIG["route_penalty_amount"]
+                    if "bulky" not in config.get("data_source", {}).get("excel_sheets", {}):
+                        config["data_source"].setdefault("excel_sheets", {})["bulky"] = "Bulky"
+                    if "bulky_rates" not in config:
+                        config["bulky_rates"] = cls.DEFAULT_CONFIG["bulky_rates"]
                     cls._cache = config
                     return cls._cache
             except Exception as e:
@@ -1119,6 +1129,33 @@ class DataSource:
             return None
 
     @staticmethod
+    def load_bulky_data(config: dict, excel_source=None) -> Optional[pd.DataFrame]:
+        """Load bulky parcel delivery data from the Bulky sheet."""
+        data_source = config.get("data_source", {})
+        source_type = data_source.get("type", "postgres")
+
+        if source_type == "excel":
+            try:
+                sheet_name = DataSource._get_excel_sheet_name(config, "bulky", "Bulky")
+                gsheet_url = data_source.get("gsheet_url")
+                if not gsheet_url:
+                    return None
+                return DataSource.read_google_sheet(gsheet_url, sheet_name=sheet_name)
+            except Exception as exc:
+                st.warning(f"Could not load bulky data from Excel sheet '{sheet_name}': {exc}")
+                return None
+
+        engine = DataSource.get_postgres_engine()
+        if not engine:
+            return None
+
+        try:
+            return DataSource.read_postgres_table(engine, "bulky")
+        except Exception as exc:
+            st.warning(f"Could not load bulky data from PostgreSQL table 'bulky': {exc}")
+            return None
+
+    @staticmethod
     def load_attendance_data(config: dict, excel_source=None) -> Optional[pd.DataFrame]:
         """Load attendance data from attendance table or Excel sheet."""
         data_source = config.get("data_source", {})
@@ -1297,6 +1334,22 @@ class PayoutCalculator:
         # Tier 1: 0kg < x < 5.01kg (0.01 to 5.0)
         # Note: 5.0 falls into tier 1, not tier 2
         return sorted_tiers[0]['rate']
+
+    @staticmethod
+    def get_bulky_rate_by_weight(weight: float, bulky_config: Optional[dict] = None) -> float:
+        """Get per-parcel bulky delivery rate based on weight.
+
+        - weight <= 50 kg → RM4
+        - weight > 50 kg (50.01+) → RM5
+        """
+        if bulky_config is None:
+            bulky_config = Config.load().get("bulky_rates", Config.DEFAULT_CONFIG["bulky_rates"])
+
+        w = 0.0 if pd.isna(weight) else float(weight)
+        threshold = float(bulky_config.get("weight_threshold", 50.0))
+        if w <= threshold:
+            return float(bulky_config.get("under_50", 4.0))
+        return float(bulky_config.get("over_50", 5.0))
 
     @staticmethod
     def _find_pending_parcel_awb_column(df: pd.DataFrame) -> Optional[str]:
@@ -2673,11 +2726,121 @@ class PayoutCalculator:
         return dispatcher_summary_df
 
     @staticmethod
+    def calculate_bulky_payout(
+        bulky_df: pd.DataFrame,
+        dispatcher_summary_df: pd.DataFrame,
+        bulky_config: Optional[dict] = None,
+    ) -> pd.DataFrame:
+        """Calculate bulky parcel payout per dispatcher using weight-based flat rates."""
+        if bulky_df is None or bulky_df.empty:
+            dispatcher_summary_df['bulky_parcels'] = 0
+            dispatcher_summary_df['bulky_payout'] = 0.0
+            return dispatcher_summary_df
+
+        if bulky_config is None:
+            bulky_config = Config.load().get("bulky_rates", Config.DEFAULT_CONFIG["bulky_rates"])
+
+        bulky_dispatcher_col = find_dispatch_id_column(bulky_df)
+        if not bulky_dispatcher_col:
+            bulky_dispatcher_col = PayoutCalculator._find_dispatcher_id_column(bulky_df)
+
+        waybill_col = find_waybill_column(bulky_df)
+        weight_col = find_column(bulky_df, "weight")
+        if not weight_col:
+            for col in bulky_df.columns:
+                if str(col).strip().lower() in ("billing weight", "weight", "billing_weight", "weight_kg"):
+                    weight_col = col
+                    break
+
+        if not bulky_dispatcher_col or not waybill_col or not weight_col:
+            st.warning("⚠️ Bulky sheet is missing dispatcher, waybill, or weight column")
+            dispatcher_summary_df['bulky_parcels'] = 0
+            dispatcher_summary_df['bulky_payout'] = 0.0
+            return dispatcher_summary_df
+
+        bulky_work = bulky_df.copy()
+        bulky_work['_dispatcher_key'] = bulky_work[bulky_dispatcher_col].apply(normalize_dispatcher_id)
+        bulky_work = bulky_work[bulky_work['_dispatcher_key'] != ""]
+        bulky_work['_weight'] = normalize_weight(bulky_work[weight_col])
+        bulky_work['_bulky_commission'] = bulky_work['_weight'].apply(
+            lambda w: PayoutCalculator.get_bulky_rate_by_weight(w, bulky_config)
+        )
+
+        bulky_summary = bulky_work.groupby('_dispatcher_key').agg(
+            bulky_parcels=(waybill_col, 'size'),
+            bulky_payout=('_bulky_commission', 'sum'),
+            dispatcher_id=(bulky_dispatcher_col, 'first'),
+        ).reset_index()
+
+        dispatcher_summary_df = dispatcher_summary_df.copy()
+        dispatcher_summary_df['_dispatcher_key'] = dispatcher_summary_df['dispatcher_id'].apply(
+            normalize_dispatcher_id
+        )
+        dispatcher_summary_df = dispatcher_summary_df.drop(
+            columns=['bulky_parcels', 'bulky_payout'], errors='ignore'
+        )
+        dispatcher_summary_df = dispatcher_summary_df.merge(
+            bulky_summary[['_dispatcher_key', 'bulky_parcels', 'bulky_payout']],
+            on='_dispatcher_key',
+            how='left',
+        )
+
+        bulky_only = bulky_summary[
+            ~bulky_summary['_dispatcher_key'].isin(dispatcher_summary_df['_dispatcher_key'])
+        ]
+        if not bulky_only.empty:
+            bulky_only_rows = pd.DataFrame({
+                'dispatcher_id': bulky_only['dispatcher_id'].astype(str),
+                '_dispatcher_key': bulky_only['_dispatcher_key'],
+                'dispatcher_name': 'Unknown',
+                'parcel_count': 0,
+                'bulky_parcels': bulky_only['bulky_parcels'].astype(int),
+                'bulky_payout': bulky_only['bulky_payout'].astype(float),
+                'pickup_parcels': 0,
+                'pickup_payout': 0.0,
+                'return_parcels': 0,
+                'return_payout': 0.0,
+                'dispatch_payout': 0.0,
+                'total_payout': 0.0,
+                'penalty_amount': 0.0,
+                'penalty_count': 0,
+                'penalty_waybills': '',
+                'reward': 0.0,
+                'rental': 0.0,
+                'total_weight': 0.0,
+                'avg_weight': 0.0,
+                'avg_rate': 0.0,
+                'tier1_parcels': 0,
+                'tier2_parcels': 0,
+                'tier3_parcels': 0,
+                'tier4_parcels': 0,
+            })
+            for col in dispatcher_summary_df.columns:
+                if col not in bulky_only_rows.columns:
+                    bulky_only_rows[col] = 0 if dispatcher_summary_df[col].dtype != object else ''
+            bulky_only_rows = bulky_only_rows[dispatcher_summary_df.columns]
+            dispatcher_summary_df = pd.concat(
+                [dispatcher_summary_df, bulky_only_rows], ignore_index=True
+            )
+
+        dispatcher_summary_df['bulky_parcels'] = (
+            pd.to_numeric(dispatcher_summary_df['bulky_parcels'], errors='coerce').fillna(0).astype(int)
+        )
+        dispatcher_summary_df['bulky_payout'] = (
+            pd.to_numeric(dispatcher_summary_df['bulky_payout'], errors='coerce').fillna(0.0).round(2)
+        )
+        dispatcher_summary_df = dispatcher_summary_df.drop(columns=['_dispatcher_key'], errors='ignore')
+
+        return dispatcher_summary_df
+
+    @staticmethod
     def calculate_payout(df: pd.DataFrame, currency_symbol: str, penalty_data: Optional[Dict[str, pd.DataFrame]] = None,
                         pickup_df: Optional[pd.DataFrame] = None,
                         pickup_payout_per_parcel: float = 1.50,
                         return_df: Optional[pd.DataFrame] = None,
                         return_payout_per_parcel: float = 1.50,
+                        bulky_df: Optional[pd.DataFrame] = None,
+                        bulky_config: Optional[dict] = None,
                         reward_df: Optional[pd.DataFrame] = None,
                         rental_df: Optional[pd.DataFrame] = None,
                         attendance_df: Optional[pd.DataFrame] = None,
@@ -2728,6 +2891,14 @@ class PayoutCalculator:
             pickup_disp_col = find_pickup_dispatcher_column(pickup_df)
             df = exclude_dispatch_rows_by_dispatcher_sheet(
                 df, pickup_df, pickup_disp_col, dispatch_disp_col, dispatch_wb_col
+            )
+
+        if bulky_df is not None and not bulky_df.empty:
+            bulky_disp_col = find_dispatch_id_column(bulky_df)
+            if bulky_disp_col is None:
+                bulky_disp_col = PayoutCalculator._find_dispatcher_id_column(bulky_df)
+            df = exclude_dispatch_rows_by_dispatcher_sheet(
+                df, bulky_df, bulky_disp_col, dispatch_disp_col, dispatch_wb_col
             )
 
         # Prepare data (now on delivery-only rows)
@@ -2967,6 +3138,9 @@ class PayoutCalculator:
         # Calculate return payout
         grouped = PayoutCalculator.calculate_return_payout(return_df, grouped, return_payout_per_parcel)
 
+        # Calculate bulky payout
+        grouped = PayoutCalculator.calculate_bulky_payout(bulky_df, grouped, bulky_config)
+
         # Benefit deductions (after pickup-only rows are added so all dispatchers are covered).
         grouped['socso_deduction'] = grouped['dispatcher_id'].apply(
             lambda x: float(socso_map.get(normalize_dispatcher_id(str(x)), 0.0))
@@ -2981,18 +3155,23 @@ class PayoutCalculator:
             - grouped['penalty_amount']
             + grouped['pickup_payout']
             + grouped['return_payout']
+            + grouped['bulky_payout']
             + grouped['reward']
             - grouped['rental']
             - grouped['socso_deduction']
             - grouped['overpaid_deduction']
         )
 
-        # Total AWB = delivery parcels + pickup parcels + return parcels per dispatcher.
+        # Total AWB = delivery parcels + pickup parcels + return parcels + bulky parcels per dispatcher.
         grouped['pickup_parcels'] = pd.to_numeric(grouped['pickup_parcels'], errors='coerce').fillna(0).astype(int)
         grouped['return_parcels'] = pd.to_numeric(grouped['return_parcels'], errors='coerce').fillna(0).astype(int)
+        grouped['bulky_parcels'] = pd.to_numeric(grouped['bulky_parcels'], errors='coerce').fillna(0).astype(int)
         grouped['parcel_count'] = pd.to_numeric(grouped['parcel_count'], errors='coerce').fillna(0).astype(int)
         grouped['total_awb'] = (
-            grouped['parcel_count'] + grouped['pickup_parcels'] + grouped['return_parcels']
+            grouped['parcel_count']
+            + grouped['pickup_parcels']
+            + grouped['return_parcels']
+            + grouped['bulky_parcels']
         )
 
         # Create display and numeric dataframes
@@ -3026,6 +3205,8 @@ class PayoutCalculator:
             "pickup_payout": "Pickup Parcels Payout",
             "return_parcels": "Return Parcels",
             "return_payout": "Return Parcels Payout",
+            "bulky_parcels": "Bulky Parcels",
+            "bulky_payout": "Bulky Parcels Payout",
             "reward": "Reward",
             "rental": "Rental",
             "tier1_parcels": "Parcels 0-5kg",
@@ -3078,6 +3259,8 @@ class PayoutCalculator:
         display_df["Pickup Parcels Payout"] = display_df["Pickup Parcels Payout"].apply(lambda x: f"{currency_symbol}{x:,.2f}")
         if "Return Parcels Payout" in display_df.columns:
             display_df["Return Parcels Payout"] = display_df["Return Parcels Payout"].apply(lambda x: f"{currency_symbol}{x:,.2f}")
+        if "Bulky Parcels Payout" in display_df.columns:
+            display_df["Bulky Parcels Payout"] = display_df["Bulky Parcels Payout"].apply(lambda x: f"{currency_symbol}{x:,.2f}")
         if "Reward" in display_df.columns:
             display_df["Reward"] = display_df["Reward"].apply(lambda x: f"{currency_symbol}{x:,.2f}")
         if "Rental" in display_df.columns:
@@ -3131,6 +3314,7 @@ class PayoutCalculator:
         total_dispatch_payout = numeric_df["Delivery Parcels Payout"].sum()
         total_pickup_payout = numeric_df["Pickup Parcels Payout"].sum()
         total_return_payout = numeric_df["Return Parcels Payout"].sum() if "Return Parcels Payout" in numeric_df.columns else 0.0
+        total_bulky_payout = numeric_df["Bulky Parcels Payout"].sum() if "Bulky Parcels Payout" in numeric_df.columns else 0.0
         total_reward = numeric_df["Reward"].sum() if "Reward" in numeric_df.columns else 0.0
         total_rental = numeric_df["Rental"].sum() if "Rental" in numeric_df.columns else 0.0
         total_penalty = numeric_df["Penalty"].sum()
@@ -3142,6 +3326,7 @@ class PayoutCalculator:
         - Delivery Parcels Payout: {currency_symbol} {total_dispatch_payout:,.2f}
         + Pickup Parcels Payout: {currency_symbol} {total_pickup_payout:,.2f}
         + Return Parcels Payout: {currency_symbol} {total_return_payout:,.2f}
+        + Bulky Parcels Payout: {currency_symbol} {total_bulky_payout:,.2f}
         + Reward: {currency_symbol} {total_reward:,.2f}
         - Penalties (excl. SOCSO/Overpaid): {currency_symbol} {total_penalty:,.2f}
         - Rental: {currency_symbol} {total_rental:,.2f}
@@ -3445,12 +3630,14 @@ class InvoiceGenerator:
             total_delivery_parcels = int(numeric_df["Parcels Delivered"].sum()) if "Parcels Delivered" in numeric_df.columns else 0
             total_pickup_parcels = int(numeric_df["Pickup Parcels"].sum()) if "Pickup Parcels" in numeric_df.columns else 0
             total_return_parcels = int(numeric_df["Return Parcels"].sum()) if "Return Parcels" in numeric_df.columns else 0
-            total_awb = total_delivery_parcels + total_pickup_parcels + total_return_parcels
+            total_bulky_parcels = int(numeric_df["Bulky Parcels"].sum()) if "Bulky Parcels" in numeric_df.columns else 0
+            total_awb = total_delivery_parcels + total_pickup_parcels + total_return_parcels + total_bulky_parcels
             total_dispatchers = len(numeric_df)
             total_weight = numeric_df["Total Weight (kg)"].sum()
             total_dispatch_payout = numeric_df["Delivery Parcels Payout"].sum() if "Delivery Parcels Payout" in numeric_df.columns else 0.0
             total_pickup_payout = numeric_df["Pickup Parcels Payout"].sum() if "Pickup Parcels Payout" in numeric_df.columns else 0.0
             total_return_payout = numeric_df["Return Parcels Payout"].sum() if "Return Parcels Payout" in numeric_df.columns else 0.0
+            total_bulky_payout = numeric_df["Bulky Parcels Payout"].sum() if "Bulky Parcels Payout" in numeric_df.columns else 0.0
             total_reward = numeric_df["Reward"].sum() if "Reward" in numeric_df.columns else 0.0
             total_rental = numeric_df["Rental"].sum() if "Rental" in numeric_df.columns else 0.0
             penalty_by_type = {
@@ -3477,6 +3664,7 @@ class InvoiceGenerator:
                 total_dispatch_payout
                 + total_pickup_payout
                 + total_return_payout
+                + total_bulky_payout
                 + total_reward
                 - total_rental
             )
@@ -3486,6 +3674,7 @@ class InvoiceGenerator:
             table_columns = ["Dispatcher ID", "Dispatcher Name", "Total AWB", "Parcels Delivered",
                            "Delivery Parcels Payout", "Pickup Parcels", "Pickup Parcels Payout",
                            "Return Parcels", "Return Parcels Payout",
+                           "Bulky Parcels", "Bulky Parcels Payout",
                            "Reward", "Rental", "Penalty", "Total Payout"]
 
             html = f"""
@@ -3653,7 +3842,8 @@ class InvoiceGenerator:
                                 <div class="subtext">
                                     Delivery: {currency_symbol} {total_dispatch_payout:,.2f} ·
                                     Pickup: {currency_symbol} {total_pickup_payout:,.2f} ·
-                                    Return: {currency_symbol} {total_return_payout:,.2f}
+                                    Return: {currency_symbol} {total_return_payout:,.2f} ·
+                                    Bulky: {currency_symbol} {total_bulky_payout:,.2f}
                                 </div>
                             </div>
                             <div class="chip">
@@ -3712,7 +3902,7 @@ class InvoiceGenerator:
                     </div>
                     <div class="note">
                         Generated on {datetime.now().strftime('%Y-%m-%d at %H:%M')} • JMR Management Dashboard v2.2<br>
-                        <em>Payout calculated using tier-based weight system + pickup parcel count</em>
+                        <em>Payout calculated using tier-based weight system + pickup, return, and bulky parcel payouts</em>
                     </div>
                 </div>
             </body>
@@ -3948,6 +4138,10 @@ def main():
     **↩️ Return Parcels Payout:**
     - RM{return_payout_per_parcel:.2f} per parcel
 
+    **📦 Bulky Parcels Payout:**
+    - ≤50 kg: RM{config.get("bulky_rates", {}).get("under_50", 4.0):.2f} per parcel
+    - >50 kg: RM{config.get("bulky_rates", {}).get("over_50", 5.0):.2f} per parcel
+
     **🚫 Fake Attempt Penalty:**
     - RM{fake_attempt_penalty_per_parcel:.2f} per parcel
 
@@ -4091,6 +4285,7 @@ def main():
     penalty_data = DataSource.load_penalty_data(config, excel_source)
     pickup_df = DataSource.load_pickup_data(config, excel_source)
     return_df = DataSource.load_return_data(config, excel_source)
+    bulky_df = DataSource.load_bulky_data(config, excel_source)
     reward_df = DataSource.load_reward_data(config, excel_source)
     rental_df = DataSource.load_rental_data(config, excel_source)
     attendance_df = DataSource.load_attendance_data(config, excel_source)
@@ -4408,6 +4603,36 @@ def main():
                     else:
                         st.warning("⚠️ Return table has no 'created_at' column; returns are not filtered by date range.")
 
+                # Filter bulky data by selected date range
+                if bulky_df is not None and not bulky_df.empty:
+                    bulky_date_col = None
+                    for candidate in ("Delivery Signature", "delivery_signature", "Created At", "created_at"):
+                        if candidate in bulky_df.columns:
+                            bulky_date_col = candidate
+                            break
+                    if bulky_date_col is None:
+                        for col in bulky_df.columns:
+                            col_lower = str(col).lower()
+                            if "delivery" in col_lower and "signature" in col_lower:
+                                bulky_date_col = col
+                                break
+                            if col_lower in ("created_at", "created at", "date"):
+                                bulky_date_col = col
+                                break
+
+                    if bulky_date_col is not None:
+                        bulky_df[bulky_date_col] = pd.to_datetime(bulky_df[bulky_date_col], errors="coerce")
+                        initial_bulky_count = len(bulky_df)
+                        bulky_df = bulky_df[
+                            (normalize_series_for_date_compare(bulky_df[bulky_date_col]) >= start_ts) &
+                            (normalize_series_for_date_compare(bulky_df[bulky_date_col]) <= end_ts)
+                        ]
+                        filtered_bulky_count = len(bulky_df)
+                        if initial_bulky_count != filtered_bulky_count:
+                            st.info(f"📦 Filtered bulky data using '{bulky_date_col}': {initial_bulky_count:,} → {filtered_bulky_count:,} records")
+                    else:
+                        st.warning("⚠️ Bulky table has no date column; bulky parcels are not filtered by date range.")
+
                 # Filter attendance data by selected date range
                 if attendance_df is not None and not attendance_df.empty:
                     attendance_date_col = None
@@ -4451,6 +4676,8 @@ def main():
     display_df, numeric_df, total_payout = PayoutCalculator.calculate_payout(
         df, currency, penalty_data, pickup_df, pickup_payout_per_parcel,
         return_df, return_payout_per_parcel,
+        bulky_df=bulky_df,
+        bulky_config=config.get("bulky_rates"),
         reward_df=reward_df,
         rental_df=rental_df,
         attendance_df=attendance_df,
@@ -4497,9 +4724,11 @@ def main():
         total_delivery_parcels = int(numeric_df["Parcels Delivered"].sum()) if "Parcels Delivered" in numeric_df.columns else 0
         total_pickup_parcels = int(numeric_df["Pickup Parcels"].sum()) if "Pickup Parcels" in numeric_df.columns else 0
         total_return_parcels = int(numeric_df["Return Parcels"].sum()) if "Return Parcels" in numeric_df.columns else 0
-        total_awb = total_delivery_parcels + total_pickup_parcels + total_return_parcels
+        total_bulky_parcels = int(numeric_df["Bulky Parcels"].sum()) if "Bulky Parcels" in numeric_df.columns else 0
+        total_awb = total_delivery_parcels + total_pickup_parcels + total_return_parcels + total_bulky_parcels
         total_pickup_payout = numeric_df["Pickup Parcels Payout"].sum() if "Pickup Parcels Payout" in numeric_df.columns else 0.0
         total_return_payout = numeric_df["Return Parcels Payout"].sum() if "Return Parcels Payout" in numeric_df.columns else 0.0
+        total_bulky_payout = numeric_df["Bulky Parcels Payout"].sum() if "Bulky Parcels Payout" in numeric_df.columns else 0.0
         total_dispatch_payout = numeric_df["Delivery Parcels Payout"].sum() if "Delivery Parcels Payout" in numeric_df.columns else 0.0
         total_reward = numeric_df["Reward"].sum() if "Reward" in numeric_df.columns else 0.0
         total_rental = numeric_df["Rental"].sum() if "Rental" in numeric_df.columns else 0.0
@@ -4629,19 +4858,21 @@ def main():
                 parcels_delivered = int(row.get('Parcels Delivered', 0))
                 pickup_parcels = int(row.get('Pickup Parcels', 0))
                 return_parcels = int(row.get('Return Parcels', 0))
+                bulky_parcels = int(row.get('Bulky Parcels', 0))
                 delivery_payout = float(row.get('Delivery Parcels Payout', 0.0))
                 pickup_payout = float(row.get('Pickup Parcels Payout', 0.0))
                 return_payout = float(row.get('Return Parcels Payout', 0.0))
+                bulky_payout = float(row.get('Bulky Parcels Payout', 0.0))
                 reward_amount = float(row.get('Reward', 0.0))
 
                 st.markdown(f"""
                 <div style="background: white; padding: 12px; border-radius: 8px; border: 1px solid #e2e8f0; margin: 8px 0; min-height: 90px; height: 90px; display: flex; flex-direction: column; justify-content: space-between;">
                     <div style="font-weight: 600; color: {ColorScheme.PRIMARY}; margin-bottom: 8px; font-size: 0.95rem;">{row['Dispatcher Name']}</div>
                     <div style="color: #64748b; font-size: 0.85rem; margin-bottom: 4px; line-height: 1.4;">
-                        <strong>Parcels:</strong> {parcels_delivered} | <strong>Pickup Parcels:</strong> {pickup_parcels} | <strong>Return Parcels:</strong> {return_parcels}
+                        <strong>Parcels:</strong> {parcels_delivered} | <strong>Pickup Parcels:</strong> {pickup_parcels} | <strong>Return Parcels:</strong> {return_parcels} | <strong>Bulky Parcels:</strong> {bulky_parcels}
                     </div>
                     <div style="color: #64748b; font-size: 0.85rem; line-height: 1.4;">
-                        <strong>Parcel Payout:</strong> {currency}{delivery_payout:,.2f} | <strong>Pickup Payout:</strong> {currency}{pickup_payout:,.2f} | <strong>Return Payout:</strong> {currency}{return_payout:,.2f} | <strong>Reward:</strong> {currency}{reward_amount:,.2f}
+                        <strong>Parcel Payout:</strong> {currency}{delivery_payout:,.2f} | <strong>Pickup Payout:</strong> {currency}{pickup_payout:,.2f} | <strong>Return Payout:</strong> {currency}{return_payout:,.2f} | <strong>Bulky Payout:</strong> {currency}{bulky_payout:,.2f} | <strong>Reward:</strong> {currency}{reward_amount:,.2f}
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
@@ -4723,10 +4954,12 @@ def main():
                 "Parcels 30+kg",
                 "Return Parcels",
                 "Pickup Parcels",
+                "Bulky Parcels",
                 "Parcels Delivered",
                 "Total AWB",
                 "Return Parcels Payout",
                 "Pickup Parcels Payout",
+                "Bulky Parcels Payout",
                 "Delivery Parcels Payout",
                 "Reward",
                 "Rental",

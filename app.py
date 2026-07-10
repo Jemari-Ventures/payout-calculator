@@ -165,6 +165,7 @@ class Config:
                         "hub": "hub",
                         "socso": "Socso",
                         "overpaid": "Ovepaid",
+                        "bulky": "Bulky",
                     }.items():
                         excel_sheets.setdefault(key, default)
                     config.setdefault("fake_attempt_penalty_per_parcel", 2.0)
@@ -174,6 +175,12 @@ class Config:
                     config.setdefault("pickup_payout_per_parcel", 1.0)
                     config.setdefault("qr_order_payout_per_order", 1.8)
                     config.setdefault("return_payout_per_parcel", 0.5)
+                    config.setdefault("bulky_rates", {
+                        "under_50": 4.0,
+                        "over_50": 5.0,
+                        "weight_threshold": 50.0,
+                    })
+                    excel_sheets.setdefault("bulky", "Bulky")
                     return config
             except Exception as e:
                 st.error(f"Error loading config: {e}")
@@ -768,6 +775,24 @@ class DataSource:
         return DataSource._load_optional_sheet(config, "return", "Return")
 
     @staticmethod
+    def load_bulky_data(config: dict) -> Optional[pd.DataFrame]:
+        """Load bulky parcel data directly from the Bulky sheet (same as management.py)."""
+        data_source = config["data_source"]
+        gsheet_url = data_source.get("gsheet_url")
+        if not gsheet_url:
+            return None
+        sheet_name = DataSource._get_excel_sheet_name(config, "bulky", "Bulky")
+        try:
+            bulky_df = DataSource.read_google_sheet(gsheet_url, sheet_name=sheet_name)
+        except Exception as exc:
+            st.warning(f"Could not load bulky data from sheet '{sheet_name}': {exc}")
+            return None
+
+        if bulky_df is None or bulky_df.empty:
+            return bulky_df
+        return bulky_df
+
+    @staticmethod
     def load_attendance_data(config: dict) -> Optional[pd.DataFrame]:
         """Load attendance penalty rows from the tab named in config (data_source.excel_sheets.attendance)."""
         data_source = config["data_source"]
@@ -1006,6 +1031,87 @@ class PayoutCalculator:
     ) -> int:
         """Total AWB = delivery parcels + pickup parcels + return parcels."""
         return int(delivery_parcels) + int(pickup_parcels) + int(return_parcels)
+
+    @staticmethod
+    def map_tier_rate(daily_parcels: float, tiers_config: List) -> Tuple[str, float]:
+        """Map daily parcel count to tier name and per-parcel rate."""
+        tiers = []
+        for tier in tiers_config or []:
+            tmin = tier.get("Min Parcels")
+            tmax = tier.get("Max Parcels")
+            trate = tier.get("Rate (RM)")
+            tname = tier.get("Tier")
+            if pd.notna(trate):
+                tiers.append((tmin, tmax, trate, tname))
+        tiers.sort(key=lambda t: (t[0] or 0), reverse=True)
+        for tmin, tmax, trate, tname in tiers:
+            lower_ok = True if pd.isna(tmin) else daily_parcels >= tmin
+            upper_ok = True if pd.isna(tmax) else daily_parcels <= tmax
+            if lower_ok and upper_ok:
+                return str(tname), float(trate)
+        return "Unmatched", 0.0
+
+    @staticmethod
+    def _append_bulky_delivery_records(
+        work: pd.DataFrame,
+        bulky_df: Optional[pd.DataFrame],
+        dispatcher_id: str,
+    ) -> pd.DataFrame:
+        """Add bulky-sheet parcels to delivery work when they are not already counted."""
+        if work is None:
+            work = pd.DataFrame()
+        if bulky_df is None or bulky_df.empty or not dispatcher_id:
+            return work
+
+        bulky_disp_col = find_dispatch_id_column(bulky_df)
+        if bulky_disp_col is None:
+            bulky_disp_col = find_column(bulky_df, ["Dispatcher ID", "dispatcher_id", "Dispatcher Id"])
+        bulky_wb_col = find_waybill_column(bulky_df)
+        bulky_date_col = find_column(
+            bulky_df,
+            ["Delivery Signature", "delivery_signature", "delivery_sig", "Delivery Signature Date"],
+        )
+        if not bulky_disp_col or not bulky_wb_col or not bulky_date_col:
+            return work
+
+        matched = filter_rows_for_penalty_dispatcher(bulky_df, bulky_disp_col, dispatcher_id)
+        if matched.empty:
+            return work
+
+        def normalize_waybill(wb):
+            if wb is None or (isinstance(wb, float) and pd.isna(wb)):
+                return None
+            if isinstance(wb, (int, float)):
+                if isinstance(wb, float) and wb.is_integer():
+                    return str(int(wb))
+                return str(wb)
+            text = str(wb).strip()
+            return text if text and text.lower() not in ("nan", "none", "null") else None
+
+        existing = set()
+        if not work.empty and "__waybill" in work.columns:
+            existing = {
+                w for w in work["__waybill"].dropna().astype(str).str.strip()
+                if w and w.lower() not in ("nan", "none", "null")
+            }
+
+        new_rows = []
+        for _, row in matched.iterrows():
+            wb = normalize_waybill(row[bulky_wb_col])
+            if not wb or wb in existing:
+                continue
+            day = pd.to_datetime(row[bulky_date_col], errors="coerce")
+            day = day.date() if pd.notna(day) else pd.Timestamp.today().date()
+            new_rows.append({
+                "__date": day,
+                "__waybill": wb,
+                "__waybill_original": row[bulky_wb_col],
+            })
+            existing.add(wb)
+
+        if not new_rows:
+            return work
+        return pd.concat([work, pd.DataFrame(new_rows)], ignore_index=True)
 
     @staticmethod
     def calculate_gross_payout(
@@ -1606,23 +1712,27 @@ class PayoutCalculator:
                               route_penalty_dispatcher_count: int = 0,
                               route_penalty_pool_total: float = 0.0,
                               pickup_df: Optional[pd.DataFrame] = None,
+                              bulky_df: Optional[pd.DataFrame] = None,
                               designated_driver_config: Optional[dict] = None,
                               fallback_dispatcher_id: Optional[str] = None) -> Tuple:
-        """Calculate tiered base delivery payout from dispatch sheet rows only.
+        """Calculate tiered base delivery payout from dispatch and bulky sheet rows.
 
         Dispatch AWBs that also appear on this dispatcher's Return or Pickup sheet are
-        excluded from tier counting. Pickup and return are paid separately at flat rates.
+        excluded from tier counting. Bulky parcels are counted as normal delivery.
         """
-        tiers = []
-        for tier in tiers_config:
-            tmin = tier.get("Min Parcels")
-            tmax = tier.get("Max Parcels")
-            trate = tier.get("Rate (RM)")
-            tname = tier.get("Tier")
-            if pd.notna(trate):
-                tiers.append((tmin, tmax, trate, tname))
-
-        tiers.sort(key=lambda t: (t[0] or 0), reverse=True)
+        if filtered_df is None or filtered_df.empty:
+            if bulky_df is not None and not bulky_df.empty and fallback_dispatcher_id:
+                bulky_disp_col = find_dispatch_id_column(bulky_df)
+                if bulky_disp_col is None:
+                    bulky_disp_col = find_column(
+                        bulky_df, ["Dispatcher ID", "dispatcher_id", "Dispatcher Id"]
+                    )
+                if bulky_disp_col:
+                    bulky_subset = filter_rows_for_penalty_dispatcher(
+                        bulky_df, bulky_disp_col, fallback_dispatcher_id
+                    )
+                    if not bulky_subset.empty:
+                        filtered_df = bulky_subset.copy()
 
         if filtered_df is None or filtered_df.empty:
             penalty_id = clean_penalty_dispatcher_id(fallback_dispatcher_id or "")
@@ -1672,19 +1782,14 @@ class PayoutCalculator:
             )
 
         def map_rate(daily_parcels: float) -> Tuple[str, float]:
-            for tmin, tmax, trate, tname in tiers:
-                lower_ok = True if pd.isna(tmin) else daily_parcels >= tmin
-                upper_ok = True if pd.isna(tmax) else daily_parcels <= tmax
-                if lower_ok and upper_ok:
-                    return str(tname), float(trate)
-            return "Unmatched", 0.0
+            return PayoutCalculator.map_tier_rate(daily_parcels, tiers_config)
 
         work = filtered_df.copy()
 
         # Find column names with flexible matching
         delivery_sig_col = find_column(work, ["Delivery Signature", "delivery_signature", "Delivery Signature", "delivery_sig"])
-        waybill_col = find_column(work, ["Waybill Number", "waybill_number", "Waybill", "waybill"])
-        dispatcher_id_col = find_column(work, ["Dispatcher ID", "dispatcher_id", "Dispatcher Id", "DISPATCHER ID"])
+        waybill_col = find_waybill_column(work)
+        dispatcher_id_col = find_dispatch_id_column(work)
 
         if delivery_sig_col is None or waybill_col is None:
             raise ValueError("Required columns (Delivery Signature and Waybill Number) not found in data")
@@ -2004,6 +2109,12 @@ class PayoutCalculator:
         # Store count after processing
         total_after_filter = len(work)
 
+        if not dispatcher_id and fallback_dispatcher_id:
+            dispatcher_id = str(fallback_dispatcher_id).strip()
+        work = PayoutCalculator._append_bulky_delivery_records(
+            work, bulky_df, dispatcher_id or ""
+        )
+
         # Remove duplicates - keep last entry per date+waybill combination
         # This ensures each waybill is counted only once per day
         work = work.sort_values(by=["__date", "__waybill", delivery_sig_col])
@@ -2157,6 +2268,7 @@ class PayoutCalculator:
         route_penalty_dispatcher_count: int = 0,
         route_penalty_pool_total: float = 0.0,
         pickup_df: Optional[pd.DataFrame] = None,
+        bulky_df: Optional[pd.DataFrame] = None,
         special_rates_config: Optional[List] = None,
         fallback_dispatcher_id: Optional[str] = None,
     ) -> Tuple:
@@ -2191,6 +2303,7 @@ class PayoutCalculator:
             route_penalty_dispatcher_count=route_penalty_dispatcher_count,
             route_penalty_pool_total=route_penalty_pool_total,
             pickup_df=pickup_df,
+            bulky_df=bulky_df,
             designated_driver_config=designated_driver_config,
             fallback_dispatcher_id=fallback_dispatcher_id,
         )
@@ -3193,7 +3306,7 @@ def main():
 
     # Find required columns with flexible matching
     dispatcher_id_col = find_column(df, ["Dispatcher ID", "dispatcher_id", "Dispatcher Id", "DISPATCHER ID"])
-    waybill_col = find_column(df, ["Waybill Number", "waybill_number", "Waybill", "waybill"])
+    waybill_col = find_waybill_column(df)
     delivery_sig_col = find_column(df, ["Delivery Signature", "delivery_signature", "Delivery Signature", "delivery_sig"])
 
     missing_columns = []
@@ -3267,6 +3380,7 @@ def main():
     pickup_df = DataSource.load_pickup_data(config)
     reward_df = DataSource.load_reward_data(config)
     return_df = DataSource.load_return_data(config)
+    bulky_df = DataSource.load_bulky_data(config)
     attendance_df = DataSource.load_attendance_data(config)
     duitnow_df = DataSource.load_duitnow_penalty_data(config)
     ldr_df = DataSource.load_ldr_penalty_data(config)
@@ -3286,6 +3400,10 @@ def main():
     return_df = filter_sheet_by_date_range(
         return_df, start_date, end_date, ["Delivery Signature", "delivery_signature"]
     )
+    bulky_df = filter_sheet_by_date_range(
+        bulky_df, start_date, end_date, ["Delivery Signature", "delivery_signature"]
+    )
+
     penalty_filtered = filter_penalty_data_by_date(
         {
             "duitnow": duitnow_df,
@@ -3361,6 +3479,22 @@ def main():
                     reward_name = clean_dispatcher_name(row[reward_name_col])
                 dispatcher_mapping.setdefault(reward_id, reward_name or dispatcher_mapping.get(reward_id, ""))
 
+    if bulky_df is not None and not bulky_df.empty:
+        bulky_id_col = find_dispatch_id_column(bulky_df)
+        bulky_name_col = find_column(
+            bulky_df, ["Dispatcher Name", "dispatcher_name", "Rider Name", "rider_name", "Name", "name"]
+        )
+        if bulky_id_col:
+            bulky_cols = [bulky_id_col] + ([bulky_name_col] if bulky_name_col else [])
+            for _, row in bulky_df[bulky_cols].dropna(subset=[bulky_id_col]).iterrows():
+                bulky_id = clean_penalty_dispatcher_id(row[bulky_id_col])
+                if not bulky_id:
+                    continue
+                bulky_name = ""
+                if bulky_name_col:
+                    bulky_name = clean_dispatcher_name(row[bulky_name_col])
+                dispatcher_mapping.setdefault(bulky_id, bulky_name or dispatcher_mapping.get(bulky_id, ""))
+
     dispatcher_options = []
     for dispatcher_id, dispatcher_name in dispatcher_mapping.items():
         display_name = f"{dispatcher_id} - {dispatcher_name}" if dispatcher_name else dispatcher_id
@@ -3432,6 +3566,7 @@ def main():
         "No Outbound Scan": no_outbound_scan_df,
         "Parcel Lost": parcel_lost_df,
         "Return": return_df,
+        "Bulky": bulky_df,
         "Reward": reward_df,
         "Attendance": attendance_df,
     }
@@ -3550,6 +3685,7 @@ def main():
                 route_penalty_dispatcher_count=route_penalty_dispatcher_count,
                 route_penalty_pool_total=route_penalty_total,
                 pickup_df=pickup_df,
+                bulky_df=bulky_df,
                 special_rates_config=config.get("special_rates", []),
                 fallback_dispatcher_id=selected_dispatcher_id,
             )
@@ -3640,37 +3776,71 @@ def main():
                 pickup_parcels,
                 return_count,
             )
-            row1_col1, row1_col2, row1_col3 = st.columns(3)
-            with row1_col1:
+
+            summary_row1_col1, summary_row1_col2, summary_row1_col3 = st.columns(3)
+            with summary_row1_col1:
                 st.metric(
                     "Total AWB",
                     f"{total_awb:,}",
                     help=(
                         "Total parcels across Delivery, Pickup, and Return for this dispatcher "
-                        f"({total_delivery_parcels:,} delivery + {pickup_parcels:,} pickup + {return_count:,} return)."
-                    )
+                        f"({total_delivery_parcels:,} delivery + {pickup_parcels:,} pickup + "
+                        f"{return_count:,} return)."
+                    ),
                 )
-            with row1_col2:
+            with summary_row1_col2:
                 st.metric(
                     "Total Delivery Parcels",
                     f"{display_df['Total Parcel'].sum():,}",
-                    help="Dispatch parcels for tier base rate (excludes return and pickup AWBs; flat rates apply separately)"
+                    help="Dispatch and bulky parcels for tier base rate (excludes return and pickup AWBs)",
                 )
-            with row1_col3:
+            with summary_row1_col3:
                 st.metric(
                     "Working Days",
                     f"{len(display_df)}",
-                    help="Number of days worked"
+                    help="Number of days worked",
                 )
 
-            row2_col1, row2_col2, row2_col3, row2_col4 = st.columns(4)
-            with row2_col1:
+            payout_row1_col1, payout_row1_col2, payout_row1_col3 = st.columns(3)
+            with payout_row1_col1:
+                if pickup_parcels > 0:
+                    st.metric(
+                        "Pickup Payout",
+                        f"{config['currency_symbol']}{pickup_payout:,.2f}",
+                        delta=f"{pickup_parcels} parcels",
+                        delta_color="normal",
+                    )
+                else:
+                    st.metric(
+                        "Pickup Payout",
+                        f"{config['currency_symbol']}0.00",
+                        delta="No pickups",
+                        delta_color="off",
+                    )
+            with payout_row1_col2:
+                if return_count > 0:
+                    st.metric(
+                        "Return Payout",
+                        f"{config['currency_symbol']}{return_payout:,.2f}",
+                        delta=f"{return_count} parcels",
+                        delta_color="normal",
+                    )
+                else:
+                    st.metric(
+                        "Return Payout",
+                        f"{config['currency_symbol']}0.00",
+                        delta="No returns",
+                        delta_color="off",
+                    )
+            with payout_row1_col3:
                 st.metric(
                     "Base Delivery Payout",
                     f"{config['currency_symbol']}{base_delivery_payout:,.2f}",
-                    help="Total base payout from daily deliveries"
+                    help="Total base payout from daily deliveries",
                 )
-            with row2_col2:
+
+            payout_row2_col1, payout_row2_col2, payout_row2_col3 = st.columns(3)
+            with payout_row2_col1:
                 st.metric(
                     "Gross Payout",
                     f"{config['currency_symbol']}{gross_total_payout:,.2f}",
@@ -3679,13 +3849,13 @@ def main():
                         "+ KPI bonus + Attendance bonus − Total penalty − SOCSO − Overpaid."
                     ),
                 )
-            with row2_col3:
+            with payout_row2_col2:
                 st.metric(
                     "Advance Payout",
                     f"{config['currency_symbol']}{advance_payout:,.2f}",
                     help=f"{advance_percentage:g}% of base delivery payout",
                 )
-            with row2_col4:
+            with payout_row2_col3:
                 st.metric(
                     "Final Payout",
                     f"{config['currency_symbol']}{final_payout:,.2f}",
@@ -3712,7 +3882,7 @@ def main():
             # Display bonuses and penalties
             st.subheader("🎯 Incentives & Penalties")
 
-            col1, col2, col3, col4, col5 = st.columns(5)
+            col1, col2, col3, col4 = st.columns(4)
 
             with col1:
                 st.metric(
@@ -3731,61 +3901,35 @@ def main():
                 )
 
             with col3:
-                if pickup_parcels > 0:
+                if reward_payout > 0:
                     st.metric(
-                        "Pickup Payout",
-                        f"{config['currency_symbol']}{pickup_payout:,.2f}",
-                        delta=f"{pickup_parcels} parcels",
-                        delta_color="normal"
+                        "Reward",
+                        f"{config['currency_symbol']}{reward_payout:,.2f}",
+                        delta=f"{reward_count} record(s)",
+                        delta_color="normal",
                     )
                 else:
                     st.metric(
-                        "Pickup Payout",
+                        "Reward",
                         f"{config['currency_symbol']}0.00",
-                        delta="No pickups",
-                        delta_color="off"
+                        delta="No rewards",
+                        delta_color="off",
                     )
 
             with col4:
-                if return_count > 0:
-                    st.metric(
-                        "Return Payout",
-                        f"{config['currency_symbol']}{return_payout:,.2f}",
-                        delta=f"{return_count} parcels",
-                        delta_color="normal"
-                    )
-                else:
-                    st.metric(
-                        "Return Payout",
-                        f"{config['currency_symbol']}0.00",
-                        delta="No returns",
-                        delta_color="off"
-                    )
-
-            with col5:
                 if penalty_breakdown['total_amount'] > 0:
                     st.metric(
                         "Total Penalty",
                         f"-{config['currency_symbol']}{penalty_breakdown['total_amount']:,.2f}",
                         delta=f"{penalty_breakdown['total_count']} records",
-                        delta_color="inverse"
+                        delta_color="inverse",
                     )
                 else:
                     st.metric(
                         "Total Penalty",
                         f"{config['currency_symbol']}0.00",
                         delta="No penalties",
-                        delta_color="off"
-                    )
-
-            if reward_payout > 0:
-                reward_metric_col, _ = st.columns([1, 5])
-                with reward_metric_col:
-                    st.metric(
-                        "Reward",
-                        f"{config['currency_symbol']}{reward_payout:,.2f}",
-                        delta=f"{reward_count} record(s)",
-                        delta_color="normal",
+                        delta_color="off",
                     )
 
             # Display pickup details if available
