@@ -266,22 +266,26 @@ def sum_pickup_commission(df: pd.DataFrame, *, fallback_rate: float = 1.0) -> fl
 
 
 def find_penalty_dispatcher_column(df: pd.DataFrame) -> Optional[str]:
+    """Resolve dispatcher_id column on penalty sheets (DuitNow, LDR, COD, etc.)."""
     col = find_column(
         df,
         [
-            "Dispatcher ID",
             "dispatcher_id",
+            "Dispatcher ID",
             "Dispatcher Id",
             "DISPATCHER ID",
-            "Operator | Last",
-            "Operator|Last",
+            "DispatcherID",
         ],
     )
     if col is not None:
         return col
     for c in df.columns:
+        cl = str(c).strip().lower().replace(" ", "_")
+        if cl in ("dispatcher_id", "dispatcherid"):
+            return c
+    for c in df.columns:
         cl = str(c).strip().lower()
-        if ("operator" in cl and "last" in cl) or ("dispatcher" in cl and "id" in cl):
+        if "dispatcher" in cl and "id" in cl:
             return c
     return None
 
@@ -620,12 +624,7 @@ def collect_dispatcher_ids_from_penalty_sheets(
     for key, df in penalty_sheets.items():
         if df is None or df.empty:
             continue
-        if key == "ldr":
-            col = find_employee_id_column(df)
-        elif key == "duitnow":
-            col = find_rider_column(df)
-        else:
-            col = find_penalty_dispatcher_column(df)
+        col = find_penalty_dispatcher_column(df)
         if col is None:
             continue
         for value in df[col].dropna():
@@ -645,6 +644,22 @@ def filter_rows_for_penalty_dispatcher(
         return pd.DataFrame()
     keys = df[dispatcher_col].apply(clean_penalty_dispatcher_id)
     return df[keys == target]
+
+
+def filter_penalty_sheet_for_dispatcher(
+    df: pd.DataFrame,
+    dispatcher_id: str,
+) -> pd.DataFrame:
+    """Return penalty rows for one dispatcher via dispatcher_id column."""
+    target = clean_penalty_dispatcher_id(dispatcher_id)
+    if not target or df is None or df.empty:
+        return pd.DataFrame()
+    if "_dispatcher_id_normalized" in df.columns:
+        return df[df["_dispatcher_id_normalized"] == target].copy()
+    col = find_penalty_dispatcher_column(df)
+    if col is None:
+        return pd.DataFrame()
+    return filter_rows_for_penalty_dispatcher(df, col, dispatcher_id)
 
 
 def find_bulky_date_column(df: pd.DataFrame) -> Optional[str]:

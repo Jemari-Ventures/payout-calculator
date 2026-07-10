@@ -26,10 +26,8 @@ from penalty_common import (
     filter_penalty_data_by_date,
     filter_penalty_sheet_by_date,
     find_column,
-    find_employee_id_column,
     find_penalty_dispatcher_column,
     find_penalty_waybill_column,
-    find_rider_column,
     format_waybills_display,
     penalty_cell_to_float,
     route_penalty_dispatcher_key,
@@ -37,6 +35,7 @@ from penalty_common import (
     normalize_waybill,
     waybill_column_read_dtypes,
     filter_rows_for_penalty_dispatcher,
+    filter_penalty_sheet_for_dispatcher,
     filter_bulky_for_dispatcher,
     find_bulky_date_column,
     find_penalty_amount_column,
@@ -310,22 +309,60 @@ def find_waybill_column(df: pd.DataFrame) -> Optional[str]:
 
 
 def find_pickup_dispatcher_column(df: pd.DataFrame) -> Optional[str]:
-    """Find pickup dispatcher ID column."""
-    col = find_column(
-        df,
-        [
-            "Pick Up Dispatcher ID", "Pick Up Dispatcher Id", "Pickup Dispatcher ID",
-            "pickup_dispatcher_id", "pickup_dispatcher", "Pickup Dispatcher",
-            "dispatcher_id", "Dispatcher ID",
-        ],
-    )
-    if col is not None:
-        return col
-    for c in df.columns:
-        cl = str(c).lower().strip()
-        if "pickup" in cl and "dispatcher" in cl:
-            return c
+    """Find pickup dispatcher ID column; prefer pickup-specific headers."""
+    if df is None or df.empty:
+        return None
+    columns_by_lower = {str(c).strip().lower(): c for c in df.columns}
+    for name in (
+        "Pick Up Dispatcher ID",
+        "Pick Up Dispatcher Id",
+        "Pickup Dispatcher ID",
+        "Pickup Dispatcher Id",
+        "pickup_dispatcher_id",
+        "pick_up_dispatcher_id",
+    ):
+        if name.lower() in columns_by_lower:
+            return columns_by_lower[name.lower()]
+    for col in df.columns:
+        c_lower = str(col).strip().lower()
+        if "pickup" in c_lower and "dispatcher" in c_lower:
+            return col
+    for name in ("Dispatcher ID", "dispatcher_id"):
+        if name.lower() in columns_by_lower:
+            return columns_by_lower[name.lower()]
     return None
+
+
+def build_pickup_waybill_set(pickup_df: pd.DataFrame) -> set:
+    """All normalized waybills listed on the pickup sheet."""
+    if pickup_df is None or pickup_df.empty:
+        return set()
+    waybill_col = find_waybill_column(pickup_df)
+    if not waybill_col:
+        return set()
+    return {
+        wb
+        for wb in pickup_df[waybill_col].apply(normalize_waybill)
+        if wb
+    }
+
+
+def exclude_dispatch_rows_by_waybill_set(
+    dispatch_df: pd.DataFrame,
+    waybill_set: set,
+    dispatch_wb_col: Optional[str],
+) -> pd.DataFrame:
+    """Remove dispatch rows whose waybill appears on the pickup sheet."""
+    if (
+        dispatch_df is None
+        or dispatch_df.empty
+        or not waybill_set
+        or not dispatch_wb_col
+        or dispatch_wb_col not in dispatch_df.columns
+    ):
+        return dispatch_df
+    wbs = dispatch_df[dispatch_wb_col].apply(normalize_waybill)
+    return dispatch_df.loc[~wbs.isin(waybill_set)].copy()
 
 
 def is_return_sheet_dispatch_fallback(return_df: pd.DataFrame) -> bool:
@@ -1091,73 +1128,50 @@ class PayoutCalculator:
         # Normalize dispatcher_id for comparison
         dispatcher_id_normalized = clean_penalty_dispatcher_id(dispatcher_id)
 
-        # 1. Process DuitNow penalty — rider match + Achieve = FAIL only
+        # 1. Process DuitNow penalty — dispatcher_id match + Achieve = FAIL only
         if duitnow_df is not None and not duitnow_df.empty:
-            rider_col = find_rider_column(duitnow_df)
-            if rider_col is not None:
-                duitnow_rows = filter_rows_for_penalty_dispatcher(duitnow_df, rider_col, dispatcher_id)
-                achieve_col = find_column(duitnow_df, ["Achieve", "achieve", "ACHIEVE"])
-                if achieve_col is not None and not duitnow_rows.empty:
-                    duitnow_rows = duitnow_rows[
-                        duitnow_rows[achieve_col].astype(str).str.strip().str.upper() == "FAIL"
-                    ]
-                if not duitnow_rows.empty:
-                    penalty_col = find_penalty_amount_column(duitnow_df)
-                    if penalty_col is not None:
-                        penalty_values = duitnow_rows[penalty_col].apply(penalty_cell_to_float)
-                        penalty_amount = penalty_values.sum()
-                        penalty_breakdown['duitnow']['amount'] = round(float(penalty_amount), 2)
-                        if penalty_breakdown['duitnow']['amount'] > 0:
-                            penalty_breakdown['duitnow']['count'] = 1
+            duitnow_rows = filter_penalty_sheet_for_dispatcher(duitnow_df, dispatcher_id)
+            achieve_col = find_column(duitnow_df, ["Achieve", "achieve", "ACHIEVE"])
+            if achieve_col is not None and not duitnow_rows.empty:
+                duitnow_rows = duitnow_rows[
+                    duitnow_rows[achieve_col].astype(str).str.strip().str.upper() == "FAIL"
+                ]
+            if not duitnow_rows.empty:
+                penalty_col = find_penalty_amount_column(duitnow_df)
+                if penalty_col is not None:
+                    penalty_values = duitnow_rows[penalty_col].apply(penalty_cell_to_float)
+                    penalty_amount = penalty_values.sum()
+                    penalty_breakdown['duitnow']['amount'] = round(float(penalty_amount), 2)
+                    if penalty_breakdown['duitnow']['amount'] > 0:
+                        penalty_breakdown['duitnow']['count'] = 1
 
         # 2. Process LD&R penalty
         if ldr_df is not None and not ldr_df.empty:
-            emp_id_col = find_employee_id_column(ldr_df)
-            if emp_id_col is not None:
-                ldr_rows = filter_rows_for_penalty_dispatcher(ldr_df, emp_id_col, dispatcher_id)
-                if not ldr_rows.empty:
-                    amount_col = find_column(ldr_df, ["Amount", "amount", "AMOUNT"])
-                    if amount_col is not None:
-                        penalty_values = ldr_rows[amount_col].apply(penalty_cell_to_float)
-                        penalty_breakdown['ldr']['amount'] = round(float(penalty_values.sum()), 2)
-                        penalty_breakdown['ldr']['count'] = len(ldr_rows)
-                        awb_col = find_penalty_waybill_column(ldr_df)
-                        if awb_col is not None:
-                            penalty_breakdown['ldr']['waybills'] = extract_waybill_list(ldr_rows[awb_col])
+            ldr_rows = filter_penalty_sheet_for_dispatcher(ldr_df, dispatcher_id)
+            if not ldr_rows.empty:
+                amount_col = find_column(ldr_df, ["Amount", "amount", "AMOUNT"])
+                if amount_col is not None:
+                    penalty_values = ldr_rows[amount_col].apply(penalty_cell_to_float)
+                    penalty_breakdown['ldr']['amount'] = round(float(penalty_values.sum()), 2)
+                    penalty_breakdown['ldr']['count'] = len(ldr_rows)
+                    awb_col = find_penalty_waybill_column(ldr_df)
+                    if awb_col is not None:
+                        penalty_breakdown['ldr']['waybills'] = extract_waybill_list(ldr_rows[awb_col])
 
         # 3. Process Fake attempt penalty (Sheet5)
         if fake_df is not None and not fake_df.empty:
-            disp_id_col = None
-            # Try multiple patterns for dispatcher ID column
-            for col in fake_df.columns:
-                col_normalized = str(col).upper().strip().replace(" ", "")
-                if col_normalized == "DISPATCHERID" or ("DISPATCHER" in col_normalized and "ID" in col_normalized):
-                    disp_id_col = col
-                    break
+            fake_rows = filter_penalty_sheet_for_dispatcher(fake_df, dispatcher_id)
 
-            # If not found, try case-insensitive partial match with spaces
-            if disp_id_col is None:
-                for col in fake_df.columns:
-                    col_upper = str(col).upper().strip()
-                    if "DISPATCHER" in col_upper and "ID" in col_upper:
-                        disp_id_col = col
-                        break
+            if not fake_rows.empty:
+                penalty_amount = len(fake_rows) * float(fake_attempt_penalty_per_parcel)
+                penalty_breakdown['fake_attempt']['amount'] = round(float(penalty_amount), 2)
+                penalty_breakdown['fake_attempt']['count'] = len(fake_rows)
 
-            if disp_id_col is not None:
-                fake_copy = fake_df.copy()
-                fake_copy["_fake_disp_key"] = fake_copy[disp_id_col].apply(clean_penalty_dispatcher_id)
-                fake_rows = fake_copy[fake_copy["_fake_disp_key"] == dispatcher_id_normalized]
-
-                if not fake_rows.empty:
-                    penalty_amount = len(fake_rows) * float(fake_attempt_penalty_per_parcel)
-                    penalty_breakdown['fake_attempt']['amount'] = round(float(penalty_amount), 2)
-                    penalty_breakdown['fake_attempt']['count'] = len(fake_rows)
-
-                    waybill_col = find_penalty_waybill_column(fake_df)
-                    if waybill_col is not None and waybill_col in fake_rows.columns:
-                        penalty_breakdown['fake_attempt']['waybills'] = extract_waybill_list(
-                            fake_rows[waybill_col]
-                        )
+                waybill_col = find_penalty_waybill_column(fake_df)
+                if waybill_col is not None and waybill_col in fake_rows.columns:
+                    penalty_breakdown['fake_attempt']['waybills'] = extract_waybill_list(
+                        fake_rows[waybill_col]
+                    )
 
         # 3b. Process No Outbound Scan penalty (RM3 per unique AWB — not sum of PENALTY column)
         if no_outbound_scan_df is not None and not no_outbound_scan_df.empty:
@@ -1257,20 +1271,18 @@ class PayoutCalculator:
             penalty_breakdown['route']['count'] = int(route_penalty_dispatcher_count) if route_penalty_dispatcher_count else 0
             penalty_breakdown['route']['pool_total'] = round(float(route_penalty_pool_total), 2)
 
-        # 9. Process Attendance penalty (Attendance sheet) - direct penalty column sum by employee_id
+        # 9. Process Attendance penalty (Attendance sheet) - direct penalty column sum by dispatcher_id
         if attendance_df is not None and not attendance_df.empty:
-            emp_id_col = find_employee_id_column(attendance_df) or find_penalty_dispatcher_column(attendance_df)
-            if emp_id_col:
-                attendance_rows = filter_rows_for_penalty_dispatcher(attendance_df, emp_id_col, dispatcher_id)
+            attendance_rows = filter_penalty_sheet_for_dispatcher(attendance_df, dispatcher_id)
 
-                if not attendance_rows.empty:
-                    penalty_col = find_column(attendance_rows, ["Penalty", "penalty", "ATTENDANCE PENALTY", "attendance_penalty", "attendance penalty"])
-                    if penalty_col:
-                        penalty_values = attendance_rows[penalty_col].apply(
-                            lambda x: PayoutCalculator._convert_to_float(x)
-                        )
-                        penalty_breakdown['attendance']['amount'] = round(float(penalty_values.sum()), 2)
-                        penalty_breakdown['attendance']['count'] = int((penalty_values > 0).sum())
+            if not attendance_rows.empty:
+                penalty_col = find_column(attendance_rows, ["Penalty", "penalty", "ATTENDANCE PENALTY", "attendance_penalty", "attendance penalty"])
+                if penalty_col:
+                    penalty_values = attendance_rows[penalty_col].apply(
+                        lambda x: PayoutCalculator._convert_to_float(x)
+                    )
+                    penalty_breakdown['attendance']['amount'] = round(float(penalty_values.sum()), 2)
+                    penalty_breakdown['attendance']['count'] = int((penalty_values > 0).sum())
 
         # Calculate totals (round to 2 decimal places to avoid floating-point precision issues)
         penalty_breakdown['total_amount'] = round(
@@ -1682,13 +1694,9 @@ class PayoutCalculator:
                 )
 
             if pickup_df is not None and not pickup_df.empty:
-                pickup_disp_col = find_pickup_dispatcher_column(pickup_df)
-                work = exclude_dispatch_rows_by_dispatcher_sheet(
-                    work,
-                    pickup_df,
-                    pickup_disp_col,
-                    dispatcher_id_col,
-                    waybill_col,
+                pickup_waybills = build_pickup_waybill_set(pickup_df)
+                work = exclude_dispatch_rows_by_waybill_set(
+                    work, pickup_waybills, waybill_col
                 )
 
             if bulky_df is not None and not bulky_df.empty:
@@ -2094,7 +2102,7 @@ class InvoiceGenerator:
         )
 
         gross_tooltip = (
-            "Base delivery + Pickup + Return + Reward "
+            "Base delivery + Commission Delivery + Return + Reward "
             "+ KPI bonus + Attendance bonus − Total penalty − SOCSO − Overpaid."
         )
         advance_tooltip = (
@@ -2590,7 +2598,7 @@ class InvoiceGenerator:
 
         html_content += f"""
                 <div class="payout-row">
-                    <span>Pickup Payout ({pickup_parcels} parcel(s)):</span>
+                    <span>Commission Delivery ({pickup_parcels} parcel(s)):</span>
                     <span>+ {currency_symbol} {pickup_payout:,.2f}</span>
                 </div>
                 <div class="payout-row">
@@ -3446,14 +3454,14 @@ def main():
             with payout_row1_col1:
                 if pickup_parcels > 0:
                     st.metric(
-                        "Pickup Payout",
+                        "Commission Delivery",
                         f"{config['currency_symbol']}{pickup_payout:,.2f}",
                         delta=f"{pickup_parcels} parcels",
                         delta_color="normal",
                     )
                 else:
                     st.metric(
-                        "Pickup Payout",
+                        "Commission Delivery",
                         f"{config['currency_symbol']}0.00",
                         delta="No pickups",
                         delta_color="off",
@@ -3486,7 +3494,7 @@ def main():
                     "Gross Payout",
                     f"{config['currency_symbol']}{gross_total_payout:,.2f}",
                     help=(
-                        "Base delivery + Pickup + Return + Reward "
+                        "Base delivery + Commission Delivery + Return + Reward "
                         "+ KPI bonus + Attendance bonus − Total penalty − SOCSO − Overpaid."
                     ),
                 )
@@ -3967,7 +3975,7 @@ Return Parcels: {return_count:,}
 
 PAYOUT BREAKDOWN
 ----------------
-{base_delivery_lines}Pickup Payout: +{config['currency_symbol']}{pickup_payout:,.2f}
+{base_delivery_lines}Commission Delivery: +{config['currency_symbol']}{pickup_payout:,.2f}
 Return Payout: +{config['currency_symbol']}{return_payout:,.2f}
 Reward: +{config['currency_symbol']}{reward_payout:,.2f}
 KPI Bonus: +{config['currency_symbol']}{kpi_bonus:,.2f}

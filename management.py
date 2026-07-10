@@ -30,14 +30,13 @@ from penalty_common import (
     extract_waybill_list,
     filter_dispatcher_amount_records,
     find_amount_column,
-    find_employee_id_column,
     find_penalty_dispatcher_column,
     find_reward_employee_column,
     find_penalty_waybill_column,
     compute_pickup_commission_series,
     sum_pickup_commission,
-    find_rider_column,
     find_achieve_column,
+    filter_penalty_sheet_for_dispatcher,
     penalty_cell_to_float,
     preprocess_dispatcher_amount_penalty_df,
     build_dispatcher_amount_deduction_map,
@@ -1624,13 +1623,13 @@ class PayoutCalculator:
 
             df_processed = df.copy()
 
-            # Pre-process DuitNow penalty data
+            # Pre-process DuitNow penalty data (dispatcher_id column)
             if penalty_type == 'duitnow':
-                rider_col = find_rider_column(df)
+                dispatcher_id_col = find_penalty_dispatcher_column(df)
                 penalty_col = next((col for col in df.columns if col.lower() == 'penalty'), None)
                 achieve_col = find_achieve_column(df)
 
-                if rider_col and penalty_col:
+                if dispatcher_id_col and penalty_col:
                     if 'penalty_numeric' not in df_processed.columns:
                         df_processed['penalty_numeric'] = df_processed[penalty_col].apply(penalty_cell_to_decimal)
                     df_processed = df_processed[df_processed['penalty_numeric'] > 0].copy()
@@ -1638,12 +1637,14 @@ class PayoutCalculator:
                         df_processed = df_processed[
                             df_processed[achieve_col].astype(str).str.strip().str.upper() == "FAIL"
                         ]
-                    df_processed['_rider_normalized'] = df_processed[rider_col].apply(clean_penalty_dispatcher_id)
+                    df_processed['_dispatcher_id_normalized'] = df_processed[dispatcher_id_col].apply(
+                        clean_penalty_dispatcher_id
+                    )
 
             elif penalty_type == 'ldr':
-                employee_id_col = find_employee_id_column(df)
-                if employee_id_col:
-                    df_processed['_employee_id_normalized'] = df_processed[employee_id_col].apply(
+                dispatcher_id_col = find_penalty_dispatcher_column(df)
+                if dispatcher_id_col:
+                    df_processed['_dispatcher_id_normalized'] = df_processed[dispatcher_id_col].apply(
                         clean_penalty_dispatcher_id
                     )
                 ldr_penalty_col = next((col for col in df.columns if col.lower() in ['penalty', 'amount']), None)
@@ -1801,21 +1802,11 @@ class PayoutCalculator:
         waybill_numbers = []
         dispatcher_id_clean = clean_penalty_dispatcher_id(dispatcher_id)
 
-        # 1. DuitNow Penalty: rider column = dispatcher_id, penalty amount from penalty column (only positive amounts)
+        # 1. DuitNow Penalty: dispatcher_id column, penalty amount from penalty column (only positive amounts)
         if 'duitnow' in penalty_data:
             duitnow_df = penalty_data['duitnow']
             if not duitnow_df.empty:
-                # Use pre-processed data if available
-                if '_rider_normalized' in duitnow_df.columns:
-                    duitnow_records = duitnow_df[duitnow_df['_rider_normalized'] == dispatcher_id_clean]
-                else:
-                    # Fallback to original logic if not pre-processed
-                    rider_col = find_rider_column(duitnow_df)
-                    if rider_col:
-                        rider_series = duitnow_df[rider_col].apply(clean_penalty_dispatcher_id)
-                        duitnow_records = duitnow_df[rider_series == dispatcher_id_clean]
-                    else:
-                        duitnow_records = pd.DataFrame()
+                duitnow_records = filter_penalty_sheet_for_dispatcher(duitnow_df, dispatcher_id_clean)
 
                 if not duitnow_records.empty and 'penalty_numeric' in duitnow_records.columns:
                     # Round each penalty value first, then sum (matching SQL: SUM((FLOOR((penalty * 100) + 0.5) / 100)))
@@ -1828,21 +1819,11 @@ class PayoutCalculator:
                     total_penalty += float(duitnow_penalty_rounded)  # Convert to float only at the end
                     total_count += len(duitnow_records)
 
-        # 2. LDR Penalty: employee_id column = dispatcher_id, penalty from penalty/amount column
+        # 2. LDR Penalty: dispatcher_id column, penalty from penalty/amount column
         if 'ldr' in penalty_data:
             ldr_df = penalty_data['ldr']
             if not ldr_df.empty:
-                # Use pre-processed data if available
-                if '_employee_id_normalized' in ldr_df.columns:
-                    ldr_records = ldr_df[ldr_df['_employee_id_normalized'] == dispatcher_id_clean]
-                else:
-                    # Fallback to original logic
-                    employee_id_col = find_employee_id_column(ldr_df)
-                    if employee_id_col:
-                        employee_series = ldr_df[employee_id_col].apply(clean_penalty_dispatcher_id)
-                        ldr_records = ldr_df[employee_series == dispatcher_id_clean]
-                    else:
-                        ldr_records = pd.DataFrame()
+                ldr_records = filter_penalty_sheet_for_dispatcher(ldr_df, dispatcher_id_clean)
 
                 if not ldr_records.empty:
                     waybill_col = next((col for col in ldr_df.columns if col.lower() in ['ticket_no', 'no_awb', 'waybill_number']), None)
@@ -2139,21 +2120,11 @@ class PayoutCalculator:
 
         dispatcher_id_clean = clean_penalty_dispatcher_id(dispatcher_id)
 
-        # 1. DuitNow Penalty: rider column = dispatcher_id, penalty amount from penalty column (only positive amounts)
+        # 1. DuitNow Penalty: dispatcher_id column, penalty amount from penalty column (only positive amounts)
         if 'duitnow' in penalty_data:
             duitnow_df = penalty_data['duitnow']
             if not duitnow_df.empty:
-                # Use pre-processed data if available
-                if '_rider_normalized' in duitnow_df.columns:
-                    duitnow_records = duitnow_df[duitnow_df['_rider_normalized'] == dispatcher_id_clean]
-                else:
-                    # Fallback to original logic if not pre-processed
-                    rider_col = find_rider_column(duitnow_df)
-                    if rider_col:
-                        rider_series = duitnow_df[rider_col].apply(clean_penalty_dispatcher_id)
-                        duitnow_records = duitnow_df[rider_series == dispatcher_id_clean]
-                    else:
-                        duitnow_records = pd.DataFrame()
+                duitnow_records = filter_penalty_sheet_for_dispatcher(duitnow_df, dispatcher_id_clean)
 
                 if not duitnow_records.empty and 'penalty_numeric' in duitnow_records.columns:
                     # Round each penalty value first, then sum (matching SQL: SUM((FLOOR((penalty * 100) + 0.5) / 100)))
@@ -2166,21 +2137,11 @@ class PayoutCalculator:
                         sum(rounded_penalties).quantize(Decimal('0.01'), rounding='ROUND_HALF_UP')
                     )
 
-        # 2. LDR Penalty: employee_id column = dispatcher_id, penalty from penalty/amount column
+        # 2. LDR Penalty: dispatcher_id column, penalty from penalty/amount column
         if 'ldr' in penalty_data:
             ldr_df = penalty_data['ldr']
             if not ldr_df.empty:
-                # Use pre-processed data if available
-                if '_employee_id_normalized' in ldr_df.columns:
-                    ldr_records = ldr_df[ldr_df['_employee_id_normalized'] == dispatcher_id_clean]
-                else:
-                    # Fallback to original logic
-                    employee_id_col = find_employee_id_column(ldr_df)
-                    if employee_id_col:
-                        employee_series = ldr_df[employee_id_col].apply(clean_penalty_dispatcher_id)
-                        ldr_records = ldr_df[employee_series == dispatcher_id_clean]
-                    else:
-                        ldr_records = pd.DataFrame()
+                ldr_records = filter_penalty_sheet_for_dispatcher(ldr_df, dispatcher_id_clean)
 
                 if not ldr_records.empty:
                     if 'penalty_numeric' in ldr_records.columns:
@@ -2987,7 +2948,7 @@ class PayoutCalculator:
                     pass
             return s
 
-        # Exclude return/bulky waybills from dispatch (pickup stays in delivery tier payout).
+        # Exclude return/bulky/pickup waybills from dispatch tier payout (counted separately).
         dispatch_disp_col = find_dispatch_id_column(df)
         dispatch_wb_col = find_waybill_column(df)
 
@@ -2996,6 +2957,10 @@ class PayoutCalculator:
             df = exclude_dispatch_rows_by_dispatcher_sheet(
                 df, return_df, return_disp_col, dispatch_disp_col, dispatch_wb_col
             )
+
+        if pickup_df is not None and not pickup_df.empty:
+            pickup_waybills = build_pickup_waybill_set(pickup_df)
+            df = exclude_dispatch_rows_by_waybill_set(df, pickup_waybills, dispatch_wb_col)
 
         if bulky_df is not None and not bulky_df.empty:
             bulky_disp_col = find_dispatch_id_column(bulky_df)
@@ -3326,13 +3291,14 @@ class PayoutCalculator:
                 grouped = pd.concat([grouped, reward_only_rows], ignore_index=True)
             grouped = grouped.drop(columns=['_dispatcher_key'], errors='ignore')
 
-        # Total payout: delivery (incl. pickup) + return + bulky + reward - deductions
+        # Total Payout (gross/net) = earnings − penalties − rental − benefit deductions
         grouped['total_payout'] = (
             grouped['dispatch_payout']
-            - grouped['penalty_amount']
+            + grouped['pickup_payout']
             + grouped['return_payout']
             + grouped['bulky_payout']
             + grouped['reward']
+            - grouped['penalty_amount']
             - grouped['rental']
             - grouped['socso_deduction']
             - grouped['overpaid_deduction']
@@ -3349,7 +3315,7 @@ class PayoutCalculator:
             "avg_rate": "Avg Rate per Parcel",
             "dispatch_payout": "Delivery Parcels Payout",
             "total_payout": "Total Payout",
-            "penalty_amount": "Penalty",
+            "penalty_amount": "Total Penalty",
             "penalty_count": "Penalty Parcels",
             "penalty_waybills": "Penalty Waybills",
             "duitnow_penalty": "DuitNow Penalty",
@@ -3366,7 +3332,7 @@ class PayoutCalculator:
             "route_penalty": "Route Penalty",
             "attendance_penalty": "Attendance Penalty",
             "pickup_parcels": "Pickup Parcels",
-            "pickup_payout": "Pickup Parcels Payout",
+            "pickup_payout": "Pickup Payout",
             "return_parcels": "Return Parcels",
             "return_payout": "Return Parcels Payout",
             "bulky_parcels": "Bulky Parcels",
@@ -3385,7 +3351,7 @@ class PayoutCalculator:
         display_df["Avg Rate per Parcel"] = display_df["Avg Rate per Parcel"].apply(lambda x: f"{currency_symbol}{x:.2f}")
         display_df["Delivery Parcels Payout"] = display_df["Delivery Parcels Payout"].apply(lambda x: f"{currency_symbol}{x:,.2f}")
         display_df["Total Payout"] = display_df["Total Payout"].apply(lambda x: f"{currency_symbol}{x:,.2f}")
-        display_df["Penalty"] = display_df["Penalty"].apply(lambda x: f"-{currency_symbol}{x:,.2f}" if x > 0 else f"{currency_symbol}0.00")
+        display_df["Total Penalty"] = display_df["Total Penalty"].apply(lambda x: f"-{currency_symbol}{x:,.2f}" if x > 0 else f"{currency_symbol}0.00")
         if "DuitNow Penalty" in display_df.columns:
             display_df["DuitNow Penalty"] = display_df["DuitNow Penalty"].apply(lambda x: f"-{currency_symbol}{x:,.2f}" if x > 0 else f"{currency_symbol}0.00")
         if "LDR Penalty" in display_df.columns:
@@ -3420,7 +3386,7 @@ class PayoutCalculator:
             )
         if "Attendance Penalty" in display_df.columns:
             display_df["Attendance Penalty"] = display_df["Attendance Penalty"].apply(lambda x: f"-{currency_symbol}{x:,.2f}" if x > 0 else f"{currency_symbol}0.00")
-        display_df["Pickup Parcels Payout"] = display_df["Pickup Parcels Payout"].apply(lambda x: f"{currency_symbol}{x:,.2f}")
+        display_df["Pickup Payout"] = display_df["Pickup Payout"].apply(lambda x: f"{currency_symbol}{x:,.2f}")
         if "Return Parcels Payout" in display_df.columns:
             display_df["Return Parcels Payout"] = display_df["Return Parcels Payout"].apply(lambda x: f"{currency_symbol}{x:,.2f}")
         if "Bulky Parcels Payout" in display_df.columns:
@@ -3441,6 +3407,7 @@ class PayoutCalculator:
         total_payout = numeric_df["Total Payout"].sum()
         gross_earnings_check = (
             numeric_df["Delivery Parcels Payout"].sum()
+            + (numeric_df["Pickup Payout"].sum() if "Pickup Payout" in numeric_df.columns else 0.0)
             + (numeric_df["Return Parcels Payout"].sum() if "Return Parcels Payout" in numeric_df.columns else 0.0)
             + (numeric_df["Bulky Parcels Payout"].sum() if "Bulky Parcels Payout" in numeric_df.columns else 0.0)
             + (numeric_df["Reward"].sum() if "Reward" in numeric_df.columns else 0.0)
@@ -3482,26 +3449,28 @@ class PayoutCalculator:
 
         # Calculate breakdown for info message
         total_dispatch_payout = numeric_df["Delivery Parcels Payout"].sum()
-        total_pickup_payout = numeric_df["Pickup Parcels Payout"].sum()
+        total_pickup_payout = numeric_df["Pickup Payout"].sum() if "Pickup Payout" in numeric_df.columns else 0.0
         total_return_payout = numeric_df["Return Parcels Payout"].sum() if "Return Parcels Payout" in numeric_df.columns else 0.0
         total_bulky_payout = numeric_df["Bulky Parcels Payout"].sum() if "Bulky Parcels Payout" in numeric_df.columns else 0.0
         total_reward = numeric_df["Reward"].sum() if "Reward" in numeric_df.columns else 0.0
         total_rental = numeric_df["Rental"].sum() if "Rental" in numeric_df.columns else 0.0
-        total_penalty = numeric_df["Penalty"].sum()
+        total_penalty = numeric_df["Total Penalty"].sum()
         total_socso = numeric_df["SOCSO"].sum() if "SOCSO" in numeric_df.columns else 0.0
         total_overpaid = numeric_df["Overpaid"].sum() if "Overpaid" in numeric_df.columns else 0.0
         st.info(f"""
         💰 **Payout Breakdown:**
-        - Delivery + Pickup (incl. pickup): {currency_symbol} {total_dispatch_payout:,.2f}
+        - Delivery Parcels Payout: {currency_symbol} {total_dispatch_payout:,.2f}
+        + Pickup Payout: {currency_symbol} {total_pickup_payout:,.2f}
         + Return Parcels Payout: {currency_symbol} {total_return_payout:,.2f}
         + Bulky Parcels Payout: {currency_symbol} {total_bulky_payout:,.2f}
         + Reward: {currency_symbol} {total_reward:,.2f}
-        = **Total Payout: {currency_symbol} {gross_earnings_check:,.2f}**
-        - Penalties (excl. SOCSO/Overpaid): {currency_symbol} {total_penalty:,.2f}
+        = **Gross Earnings: {currency_symbol} {gross_earnings_check:,.2f}**
+        - Penalties: {currency_symbol} {total_penalty:,.2f}
         - Rental: {currency_symbol} {total_rental:,.2f}
         - SOCSO: {currency_symbol} {total_socso:,.2f}
         - Overpaid: {currency_symbol} {total_overpaid:,.2f}
-        = **Gross Payout (net): {currency_symbol} {total_payout:,.2f}**
+        = **Total Deduction: {currency_symbol} {total_penalty + total_rental + total_socso + total_overpaid:,.2f}**
+        = **Total Payout: {currency_symbol} {total_payout:,.2f}**
         """)
 
         return display_df, numeric_df, total_payout
@@ -3804,7 +3773,7 @@ class InvoiceGenerator:
             total_dispatchers = len(numeric_df)
             total_weight = numeric_df["Total Weight (kg)"].sum()
             total_dispatch_payout = numeric_df["Delivery Parcels Payout"].sum() if "Delivery Parcels Payout" in numeric_df.columns else 0.0
-            total_pickup_payout = numeric_df["Pickup Parcels Payout"].sum() if "Pickup Parcels Payout" in numeric_df.columns else 0.0
+            total_pickup_payout = numeric_df["Pickup Payout"].sum() if "Pickup Payout" in numeric_df.columns else 0.0
             total_return_payout = numeric_df["Return Parcels Payout"].sum() if "Return Parcels Payout" in numeric_df.columns else 0.0
             total_bulky_payout = numeric_df["Bulky Parcels Payout"].sum() if "Bulky Parcels Payout" in numeric_df.columns else 0.0
             total_reward = numeric_df["Reward"].sum() if "Reward" in numeric_df.columns else 0.0
@@ -3829,28 +3798,35 @@ class InvoiceGenerator:
             # Keep summary math consistent with line items shown in invoice.
             total_penalty = sum(penalty_by_type.values())
             total_benefit_deduction = sum(benefit_deduction_by_type.values())
-            # Total Payout = earnings before deductions; Gross Payout = net after all deductions.
-            delivery_pickup_payout = total_dispatch_payout
+            total_deduction = total_penalty + total_rental + total_benefit_deduction
+            # Total Payout chip = net; Gross Payout chip = earnings breakdown.
             invoice_total_payout = (
-                delivery_pickup_payout
+                total_dispatch_payout
+                + total_pickup_payout
                 + total_return_payout
                 + total_bulky_payout
                 + total_reward
             )
             gross_payout = float(total_payout)
-            payout_subtext = (
-                f"Delivery + Pickup: {currency_symbol} {delivery_pickup_payout:,.2f} · "
+            gross_payout_subtext = (
+                f"Delivery: {currency_symbol} {total_dispatch_payout:,.2f} · "
+                f"Pickup Payout: {currency_symbol} {total_pickup_payout:,.2f} · "
                 f"Return: {currency_symbol} {total_return_payout:,.2f} · "
                 f"Bulky: {currency_symbol} {total_bulky_payout:,.2f} · "
                 f"Reward: {currency_symbol} {total_reward:,.2f}"
             )
+            total_deduction_subtext = (
+                f"Penalty: -{currency_symbol} {total_penalty:,.2f} · "
+                f"Rental: -{currency_symbol} {total_rental:,.2f} · "
+                f"SOCSO: -{currency_symbol} {benefit_deduction_by_type['socso']:,.2f} · "
+                f"Overpaid: -{currency_symbol} {benefit_deduction_by_type['overpaid']:,.2f}"
+            )
             top_3 = display_df.head(3)
 
-            table_columns = ["Dispatcher ID", "Dispatcher Name", "Total AWB", "Parcels Delivered",
-                           "Delivery Parcels Payout", "Pickup Parcels", "Pickup Parcels Payout",
-                           "Return Parcels", "Return Parcels Payout",
-                           "Bulky Parcels", "Bulky Parcels Payout",
-                           "Reward", "Rental", "Penalty", "Total Payout"]
+            table_columns = ["Dispatcher ID", "Dispatcher Name",
+                           "Delivery Parcels Payout", "Pickup Payout",
+                           "Return Parcels Payout", "Bulky Parcels Payout",
+                           "Reward", "Rental", "Total Penalty", "SOCSO", "Total Payout"]
 
             html = f"""
             <html>
@@ -3920,9 +3896,15 @@ class InvoiceGenerator:
                   cursor: help;
                   vertical-align: middle;
                 }}
+                .summary-row.payout-summary {{
+                  justify-content: flex-start;
+                  flex-wrap: nowrap;
+                  align-items: stretch;
+                }}
                 .summary-row.payout-summary .chip {{
-                  flex: 1 1 200px;
-                  max-width: 280px;
+                  flex: 1 1 0;
+                  min-width: 0;
+                  max-width: none;
                 }}
                 .chip {{
                   border: 1px solid var(--border); border-radius: 12px;
@@ -3981,7 +3963,7 @@ class InvoiceGenerator:
                             <div class="idline">Period: {(datetime.now().replace(day=1) - pd.Timedelta(days=1)).strftime('%B %Y')}</div>
                         </div>
                         <div class="total-badge">
-                            <div class="label">Gross Payout</div>
+                            <div class="label">Total Payout</div>
                             <div class="value">{currency_symbol} {gross_payout:,.2f}</div>
                         </div>
                     </div>
@@ -4014,10 +3996,16 @@ class InvoiceGenerator:
                         <div class="summary-row payout-summary">
                             <div class="chip">
                                 <div class="label">Total Payout</div>
-                                <div class="value">{currency_symbol} {invoice_total_payout:,.2f}</div>
+                                <div class="value">{currency_symbol} {gross_payout:,.2f}</div>
                                 <div class="subtext">
-                                    {payout_subtext}
+                                    Gross Payout − Total Deduction<br>
+                                    {currency_symbol} {invoice_total_payout:,.2f} − {currency_symbol} {total_deduction:,.2f}
                                 </div>
+                            </div>
+                            <div class="chip">
+                                <div class="label">Gross Payout</div>
+                                <div class="value">{currency_symbol} {invoice_total_payout:,.2f}</div>
+                                <div class="subtext">{gross_payout_subtext}</div>
                             </div>
                             <div class="chip">
                                 <div class="label">Total Penalty</div>
@@ -4037,16 +4025,9 @@ class InvoiceGenerator:
                                 </div>
                             </div>
                             <div class="chip">
-                                <div class="label">Benefit Deductions</div>
-                                <div class="value">-{currency_symbol} {total_benefit_deduction:,.2f}</div>
-                                <div class="subtext">
-                                    SOCSO: -{currency_symbol} {benefit_deduction_by_type['socso']:,.2f} ·
-                                    Overpaid: -{currency_symbol} {benefit_deduction_by_type['overpaid']:,.2f}
-                                </div>
-                            </div>
-                            <div class="chip">
-                                <div class="label">Rental</div>
-                                <div class="value">-{currency_symbol} {total_rental:,.2f}</div>
+                                <div class="label">Total Deduction</div>
+                                <div class="value">-{currency_symbol} {total_deduction:,.2f}</div>
+                                <div class="subtext">{total_deduction_subtext}</div>
                             </div>
                         </div>
                     </div>
@@ -4069,17 +4050,18 @@ class InvoiceGenerator:
                     <div style="margin-top:3rem">
                         <table style="width:100%; background:var(--surface); border-radius:8px; margin-top:2rem; border:1px solid var(--border)">
                             <tr><th style="background:var(--primary);color:white;text-align:left;">Summary</th><th style="background:var(--primary);color:white;text-align:right;">Amount</th></tr>
-                            <tr><td>Delivery + Pickup Payout</td><td style="text-align:right;">{currency_symbol} {delivery_pickup_payout:,.2f}</td></tr>
+                            <tr><td>Delivery Parcels Payout</td><td style="text-align:right;">{currency_symbol} {total_dispatch_payout:,.2f}</td></tr>
+                            <tr><td>Pickup Payout</td><td style="text-align:right;">{currency_symbol} {total_pickup_payout:,.2f}</td></tr>
                             <tr><td>Return Parcels Payout</td><td style="text-align:right;">{currency_symbol} {total_return_payout:,.2f}</td></tr>
                             <tr><td>Bulky Parcels Payout</td><td style="text-align:right;">{currency_symbol} {total_bulky_payout:,.2f}</td></tr>
                             <tr><td>Total Reward</td><td style="text-align:right;">{currency_symbol} {total_reward:,.2f}</td></tr>
-                            <tr><td><strong>Total Payout</strong></td><td style="text-align:right;"><strong>{currency_symbol} {invoice_total_payout:,.2f}</strong></td></tr>
+                            <tr><td><strong>Gross Payout</strong></td><td style="text-align:right;"><strong>{currency_symbol} {invoice_total_payout:,.2f}</strong></td></tr>
                             <tr><td>Total Penalty</td><td style="text-align:right;">-{currency_symbol} {total_penalty:,.2f}</td></tr>
                             <tr><td>Total Rental (deduction)</td><td style="text-align:right;">-{currency_symbol} {total_rental:,.2f}</td></tr>
                             <tr><td>SOCSO</td><td style="text-align:right;">-{currency_symbol} {benefit_deduction_by_type['socso']:,.2f}</td></tr>
                             <tr><td>Overpaid</td><td style="text-align:right;">-{currency_symbol} {benefit_deduction_by_type['overpaid']:,.2f}</td></tr>
-                            <tr><td>Total Benefit Deductions</td><td style="text-align:right;">-{currency_symbol} {total_benefit_deduction:,.2f}</td></tr>
-                            <tr><td><strong>Gross Payout</strong></td><td style="text-align:right;"><strong>{currency_symbol} {gross_payout:,.2f}</strong></td></tr>
+                            <tr><td><strong>Total Deduction</strong></td><td style="text-align:right;"><strong>-{currency_symbol} {total_deduction:,.2f}</strong></td></tr>
+                            <tr><td><strong>Total Payout</strong></td><td style="text-align:right;"><strong>{currency_symbol} {gross_payout:,.2f}</strong></td></tr>
                         </table>
                     </div>
                     <div class="note">
@@ -4309,7 +4291,7 @@ def main():
     - 10-30kg: RM2.70
     - 30kg+: RM4.00
 
-    **📦 Pickup Parcels Payout:**
+    **📦 Pickup Payout:**
     - **JTD QR:** RM1.80
     - **EASYPARCEL:** RM1.00 (≤10 kg) / RM3.00 (>10 kg)
     - **TT-RETURN, LAZADA-RETURN, SHEIN-RETURN, CAINIAO-RETURN, APP-ANDROID, APP-IOS, APP-HORMONY, WEBSITE, WHATSAPP, WECHAT:** RM1.00
@@ -4908,14 +4890,14 @@ def main():
         total_return_parcels = int(numeric_df["Return Parcels"].sum()) if "Return Parcels" in numeric_df.columns else 0
         total_bulky_parcels = int(numeric_df["Bulky Parcels"].sum()) if "Bulky Parcels" in numeric_df.columns else 0
         total_awb = total_delivery_parcels + total_pickup_parcels
-        total_pickup_payout = numeric_df["Pickup Parcels Payout"].sum() if "Pickup Parcels Payout" in numeric_df.columns else 0.0
+        total_pickup_payout = numeric_df["Pickup Payout"].sum() if "Pickup Payout" in numeric_df.columns else 0.0
         total_return_payout = numeric_df["Return Parcels Payout"].sum() if "Return Parcels Payout" in numeric_df.columns else 0.0
         total_bulky_payout = numeric_df["Bulky Parcels Payout"].sum() if "Bulky Parcels Payout" in numeric_df.columns else 0.0
         total_dispatch_payout = numeric_df["Delivery Parcels Payout"].sum() if "Delivery Parcels Payout" in numeric_df.columns else 0.0
         total_reward = numeric_df["Reward"].sum() if "Reward" in numeric_df.columns else 0.0
         total_rental = numeric_df["Rental"].sum() if "Rental" in numeric_df.columns else 0.0
 
-        total_penalty = numeric_df["Penalty"].sum() if "Penalty" in numeric_df.columns else 0.0
+        total_penalty = numeric_df["Total Penalty"].sum() if "Total Penalty" in numeric_df.columns else 0.0
 
         # Calculate penalty breakdown by type
         penalty_by_type = {
@@ -4935,10 +4917,16 @@ def main():
             'socso': numeric_df["SOCSO"].sum() if "SOCSO" in numeric_df.columns else 0.0,
             'overpaid': numeric_df["Overpaid"].sum() if "Overpaid" in numeric_df.columns else 0.0,
         }
+        total_deduction = (
+            total_penalty
+            + total_rental
+            + benefit_deduction_by_type['socso']
+            + benefit_deduction_by_type['overpaid']
+        )
 
-        # Delivery Parcels Payout includes pickup; pickup payout is not added again.
         gross_earnings = (
             total_dispatch_payout
+            + total_pickup_payout
             + total_return_payout
             + total_bulky_payout
             + total_reward
@@ -4965,34 +4953,40 @@ def main():
         with row1_col5:
             st.metric("Return Parcels", f"{total_return_parcels:,}")
 
-        # Row 2: Gross earnings components (delivery incl. pickup + return + bulky + reward)
-        row2_col1, row2_col2, row2_col3, row2_col4, row2_col5 = st.columns(5)
+        # Row 2: Earnings components (delivery + commission delivery + return + bulky + reward)
+        row2_col1, row2_col2, row2_col3, row2_col4, row2_col5, row2_col6 = st.columns(6)
         with row2_col1:
             st.metric(
-                "Delivery + Pickup Payout",
+                "Delivery Parcels Payout",
                 f"{currency} {total_dispatch_payout:,.2f}",
-                help="Dispatch tier payout (includes pickup parcels; pickup payout is not added separately).",
+                help="Weight-tier payout from Dispatch sheet (pickup waybills excluded).",
             )
         with row2_col2:
-            st.metric("Return Parcels Payout", f"{currency} {total_return_payout:,.2f}")
-        with row2_col3:
-            st.metric("Bulky Parcels Payout", f"{currency} {total_bulky_payout:,.2f}")
-        with row2_col4:
-            st.metric("Reward", f"{currency} {total_reward:,.2f}")
-        with row2_col5:
             st.metric(
-                "Total Payout",
+                "Pickup Payout",
+                f"{currency} {total_pickup_payout:,.2f}",
+                help="Pickup commission from Pickup sheet.",
+            )
+        with row2_col3:
+            st.metric("Return Parcels Payout", f"{currency} {total_return_payout:,.2f}")
+        with row2_col4:
+            st.metric("Bulky Parcels Payout", f"{currency} {total_bulky_payout:,.2f}")
+        with row2_col5:
+            st.metric("Reward", f"{currency} {total_reward:,.2f}")
+        with row2_col6:
+            st.metric(
+                "Gross Earnings",
                 f"{currency} {gross_earnings:,.2f}",
-                help="Delivery + Pickup + Return + Bulky + Reward (before penalties and deductions).",
+                help="Delivery + Pickup Payout + Return + Bulky + Reward.",
             )
 
-        # Row 3: Gross payout (net) and deductions
+        # Row 3: Total Payout (net) and deductions
         row3_col1, row3_col2, row3_col3, row3_col4, row3_col5 = st.columns(5)
         with row3_col1:
             st.metric(
-                "Gross Payout",
+                "Total Payout",
                 f"{currency} {total_payout:,.2f}",
-                help="Total Payout minus penalties, rental, SOCSO, and overpaid.",
+                help="Gross payout minus total deduction (penalty + rental + SOCSO + overpaid).",
             )
         with row3_col2:
             st.metric("Total Penalty", f"-{currency} {total_penalty:,.2f}")
@@ -5001,7 +4995,8 @@ def main():
         with row3_col4:
             st.metric("SOCSO", f"-{currency} {benefit_deduction_by_type['socso']:,.2f}")
         with row3_col5:
-            st.metric("Overpaid", f"-{currency} {benefit_deduction_by_type['overpaid']:,.2f}")
+            st.metric("Total Deduction", f"-{currency} {total_deduction:,.2f}",
+                      help="Total Penalty + Rental + SOCSO + Overpaid.")
 
         # Penalty breakdown by type
         st.markdown("#### ⚠️ Penalty Breakdown by Type")
@@ -5065,7 +5060,7 @@ def main():
                 return_parcels = int(row.get('Return Parcels', 0))
                 bulky_parcels = int(row.get('Bulky Parcels', 0))
                 delivery_payout = float(row.get('Delivery Parcels Payout', 0.0))
-                pickup_payout = float(row.get('Pickup Parcels Payout', 0.0))
+                pickup_payout_row = float(row.get('Pickup Payout', 0.0))
                 return_payout = float(row.get('Return Parcels Payout', 0.0))
                 bulky_payout = float(row.get('Bulky Parcels Payout', 0.0))
                 reward_amount = float(row.get('Reward', 0.0))
@@ -5077,7 +5072,7 @@ def main():
                         <strong>Parcels:</strong> {parcels_delivered} | <strong>Pickup Parcels:</strong> {pickup_parcels} | <strong>Return Parcels:</strong> {return_parcels} | <strong>Bulky Parcels:</strong> {bulky_parcels}
                     </div>
                     <div style="color: #64748b; font-size: 0.85rem; line-height: 1.4;">
-                        <strong>Parcel Payout:</strong> {currency}{delivery_payout:,.2f} | <strong>Pickup Payout:</strong> {currency}{pickup_payout:,.2f} | <strong>Return Payout:</strong> {currency}{return_payout:,.2f} | <strong>Bulky Payout:</strong> {currency}{bulky_payout:,.2f} | <strong>Reward:</strong> {currency}{reward_amount:,.2f}
+                        <strong>Delivery:</strong> {currency}{delivery_payout:,.2f} | <strong>Pickup Payout:</strong> {currency}{pickup_payout_row:,.2f} | <strong>Return:</strong> {currency}{return_payout:,.2f} | <strong>Bulky:</strong> {currency}{bulky_payout:,.2f} | <strong>Reward:</strong> {currency}{reward_amount:,.2f}
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
@@ -5085,11 +5080,11 @@ def main():
         with top_col2:
             st.markdown("##### ⚠️ Top Penalties")
             # Filter dispatchers with penalties and sort by penalty amount descending, take top 5
-            penalty_df = numeric_df[numeric_df['Penalty'] > 0].copy() if 'Penalty' in numeric_df.columns else pd.DataFrame()
+            penalty_df = numeric_df[numeric_df['Total Penalty'] > 0].copy() if 'Total Penalty' in numeric_df.columns else pd.DataFrame()
             if not penalty_df.empty:
-                top_penalties = penalty_df.sort_values('Penalty', ascending=False).head(5)
+                top_penalties = penalty_df.sort_values('Total Penalty', ascending=False).head(5)
                 for _, row in top_penalties.iterrows():
-                    penalty_amount = row.get('Penalty', 0.0)
+                    penalty_amount = row.get('Total Penalty', 0.0)
                     penalty_count = row.get('Penalty Parcels', 0) if 'Penalty Parcels' in row else 0
                     # Get penalty breakdown if available
                     duitnow_penalty = row.get('DuitNow Penalty', 0.0) if 'DuitNow Penalty' in row else 0.0
@@ -5163,7 +5158,7 @@ def main():
                 "Parcels Delivered",
                 "Total AWB",
                 "Return Parcels Payout",
-                "Pickup Parcels Payout",
+                "Pickup Payout",
                 "Bulky Parcels Payout",
                 "Delivery Parcels Payout",
                 "Reward",
@@ -5185,7 +5180,7 @@ def main():
                 "Avg Weight (kg)",
                 "Avg Rate per Parcel",
                 "Total Payout",
-                "Penalty",
+                "Total Penalty",
             ]
 
             # Filter to only include columns that exist in display_df
@@ -5279,7 +5274,7 @@ def main():
                 for _, row in penalty_dispatchers.iterrows():
                     dispatcher_id = row['Dispatcher ID']
                     dispatcher_name = row['Dispatcher Name']
-                    penalty_amount = row.get('Penalty', 0.0)
+                    penalty_amount = row.get('Total Penalty', 0.0)
                     # Check if we have waybills stored (they might be in the grouped dataframe before renaming)
                     waybills_str = ''
                     if 'Penalty Waybills' in numeric_df.columns:
