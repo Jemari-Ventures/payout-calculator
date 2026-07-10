@@ -138,7 +138,10 @@ class Config:
         "fake_attempt_penalty_per_parcel": 2.00,
         "pending_parcel_penalty_per_parcel": 2.00,
         "no_outbound_scan_penalty_per_parcel": 3.00,
-        "route_penalty_amount": 1000.0
+        "route_penalty_amount": 0.0,
+        "route_penalty_app_enabled": False,
+        "route_penalty_management_enabled": False,
+        "attendance_penalty_management_enabled": False
     }
 
     _cache = None
@@ -193,7 +196,13 @@ class Config:
                     if "no_outbound_scan" not in config.get("data_source", {}).get("excel_sheets", {}):
                         config["data_source"].setdefault("excel_sheets", {})["no_outbound_scan"] = "No Outbound Scan"
                     if "route_penalty_amount" not in config:
-                        config["route_penalty_amount"] = cls.DEFAULT_CONFIG["route_penalty_amount"]
+                        config["route_penalty_amount"] = 0.0
+                    if "route_penalty_management_enabled" not in config:
+                        config["route_penalty_management_enabled"] = False
+                    if "route_penalty_app_enabled" not in config:
+                        config["route_penalty_app_enabled"] = False
+                    if "attendance_penalty_management_enabled" not in config:
+                        config["attendance_penalty_management_enabled"] = False
                     if "bulky" not in config.get("data_source", {}).get("excel_sheets", {}):
                         config["data_source"].setdefault("excel_sheets", {})["bulky"] = "Bulky"
                     if "bulky_rates" not in config:
@@ -869,7 +878,7 @@ class DataSource:
                 }
             elif table_name == 'attendance' or table_name.endswith('attendance'):
                 column_mapping = {
-                    'employee_id': 'Employee ID',
+                    'dispatcher_id': 'Dispatcher ID',
                     'employee_name': 'Employee name',
                     'attendance_record_date': 'Attendance Record Date'
                 }
@@ -3005,18 +3014,21 @@ class PayoutCalculator:
 
         df_unique = df_clean.copy()
 
-        # Attendance penalty map per dispatcher (sum of attendance penalty column)
+        # Attendance penalty map per dispatcher (management only when enabled in config)
         attendance_penalty_map = {}
-        if attendance_df is not None and not attendance_df.empty:
-            emp_id_col = next((col for col in attendance_df.columns if str(col).strip().lower() in ['employee id', 'employee_id', 'employee id.']), None)
+        _attendance_penalty_enabled = bool(
+            Config.load().get("attendance_penalty_management_enabled", False)
+        )
+        if _attendance_penalty_enabled and attendance_df is not None and not attendance_df.empty:
+            dispatcher_id_col = find_penalty_dispatcher_column(attendance_df)
             penalty_col = next((col for col in attendance_df.columns if str(col).strip().lower() in ['penalty', 'attendance_penalty', 'attendance penalty']), None)
-            if emp_id_col and penalty_col:
+            if dispatcher_id_col and penalty_col:
                 attendance_copy = attendance_df.copy()
-                attendance_copy['_emp_id'] = attendance_copy[emp_id_col].apply(normalize_dispatcher_id)
+                attendance_copy['_dispatcher_key'] = attendance_copy[dispatcher_id_col].apply(normalize_dispatcher_id)
                 attendance_copy['_penalty_amount'] = pd.to_numeric(attendance_copy[penalty_col], errors='coerce').fillna(0.0)
                 attendance_copy = attendance_copy[attendance_copy['_penalty_amount'] > 0]
                 attendance_penalty_map = (
-                    attendance_copy.groupby('_emp_id')['_penalty_amount']
+                    attendance_copy.groupby('_dispatcher_key')['_penalty_amount']
                     .sum()
                     .round(2)
                     .to_dict()
@@ -3155,15 +3167,16 @@ class PayoutCalculator:
         grouped['route_penalty'] = 0.0
         grouped['attendance_penalty'] = 0.0
 
+        # Route penalty in management only when enabled in config.
         _payout_cfg = Config.load()
-        _route_default = float(Config.DEFAULT_CONFIG.get("route_penalty_amount", 1000.0))
-        _route_pool = float(_payout_cfg.get("route_penalty_amount", _route_default) or 0.0)
         _route_split = {}
-        if grouped is not None and not grouped.empty and _route_pool > 0:
-            _route_keys = [
-                route_penalty_dispatcher_key(x) for x in grouped["dispatcher_id"].unique().tolist()
-            ]
-            _route_split = split_route_penalty_pool(_route_pool, _route_keys)
+        if bool(_payout_cfg.get("route_penalty_management_enabled", False)):
+            _route_pool = float(_payout_cfg.get("route_penalty_amount", 0.0) or 0.0)
+            if grouped is not None and not grouped.empty and _route_pool > 0:
+                _route_keys = [
+                    route_penalty_dispatcher_key(x) for x in grouped["dispatcher_id"].unique().tolist()
+                ]
+                _route_split = split_route_penalty_pool(_route_pool, _route_keys)
 
         # Use apply instead of iterrows for better performance
         def calculate_penalties(row):
@@ -3421,7 +3434,7 @@ class PayoutCalculator:
 
             st.info(f"Weight totals – Raw: {raw_weight:,.2f} kg")
             st.success(f"✅ Processed {len(df_unique)} parcels from {len(grouped)} dispatchers")
-            if attendance_df is not None:
+            if attendance_df is not None and config.get("attendance_penalty_management_enabled", False):
                 total_att_rows = len(attendance_df)
                 dispatch_ids = {normalize_dispatcher_id(x) for x in grouped['dispatcher_id'].tolist()}
                 matched_dispatchers = len(set(attendance_penalty_map.keys()) & dispatch_ids)
@@ -4257,15 +4270,39 @@ def main():
         config["no_outbound_scan_penalty_per_parcel"] = no_outbound_scan_penalty_per_parcel
         Config.save(config)
 
+    attendance_penalty_management_enabled = st.sidebar.checkbox(
+        "Apply attendance penalties (management)",
+        value=bool(config.get("attendance_penalty_management_enabled", False)),
+        help="When off, attendance penalties are excluded from batch payout (app.py still applies them).",
+    )
+    if attendance_penalty_management_enabled != bool(
+        config.get("attendance_penalty_management_enabled", False)
+    ):
+        config["attendance_penalty_management_enabled"] = attendance_penalty_management_enabled
+        Config.save(config)
+
+    st.sidebar.markdown("---")
+    route_penalty_management_enabled = st.sidebar.checkbox(
+        "Apply route penalty (management)",
+        value=bool(config.get("route_penalty_management_enabled", False)),
+        help="When off, route penalty is excluded from batch payout (app.py has its own toggle).",
+    )
+    if route_penalty_management_enabled != bool(
+        config.get("route_penalty_management_enabled", False)
+    ):
+        config["route_penalty_management_enabled"] = route_penalty_management_enabled
+        Config.save(config)
+
     route_penalty_amount = st.sidebar.number_input(
-        "Route penalty (total pool)",
+        "Route penalty amount (total pool)",
         min_value=0.0,
         max_value=1_000_000.0,
-        value=float(config.get("route_penalty_amount", 1000.0)),
+        value=float(config.get("route_penalty_amount", 0.0)),
         step=50.0,
-        help="Total route penalty split equally across all dispatchers in the payout batch (same as app.py).",
+        disabled=not route_penalty_management_enabled,
+        help="Total route penalty split equally across dispatchers in the batch.",
     )
-    if route_penalty_amount != float(config.get("route_penalty_amount", 1000.0)):
+    if route_penalty_amount != float(config.get("route_penalty_amount", 0.0)):
         config["route_penalty_amount"] = float(route_penalty_amount)
         Config.save(config)
 
@@ -4329,9 +4366,6 @@ def main():
 
     **📦 Parcel Lost Penalty:**
     - Sum of **COD** column (Parcel lost sheet)
-
-    **🛣️ Route Penalty:**
-    - RM{route_penalty_amount:,.2f} total ÷ number of dispatchers in batch (each pays equal share)
 
     **📈 Forecast Period:**
     - {forecast_days} days
@@ -4452,7 +4486,10 @@ def main():
     bulky_df = DataSource.load_bulky_data(config, excel_source)
     reward_df = DataSource.load_reward_data(config, excel_source)
     rental_df = DataSource.load_rental_data(config, excel_source)
-    attendance_df = DataSource.load_attendance_data(config, excel_source)
+    if config.get("attendance_penalty_management_enabled", False):
+        attendance_df = DataSource.load_attendance_data(config, excel_source)
+    else:
+        attendance_df = None
 
     # Filter all data by selected date range if a date column is selected
     if selected_date_col != "-- None --" and start_date is not None and end_date is not None:
@@ -4797,8 +4834,12 @@ def main():
                     else:
                         st.warning("⚠️ Bulky table has no date column; bulky parcels are not filtered by date range.")
 
-                # Filter attendance data by selected date range
-                if attendance_df is not None and not attendance_df.empty:
+                # Filter attendance data by selected date range (management attendance penalties only)
+                if (
+                    config.get("attendance_penalty_management_enabled", False)
+                    and attendance_df is not None
+                    and not attendance_df.empty
+                ):
                     attendance_date_col = None
                     # Prefer explicit attendance date, fallback to created_at when unavailable
                     for col in attendance_df.columns:

@@ -175,6 +175,9 @@ class Config:
                     config.setdefault("pending_parcel_penalty_per_parcel", 2.0)
                     config.setdefault("no_outbound_scan_penalty_per_parcel", 3.0)
                     config.setdefault("route_penalty_amount", 0.0)
+                    config.setdefault("route_penalty_app_enabled", False)
+                    config.setdefault("route_penalty_management_enabled", False)
+                    config.setdefault("attendance_penalty_management_enabled", False)
                     config.setdefault("pickup_payout_per_parcel", 1.0)
                     config.setdefault("qr_order_payout_per_order", 1.8)
                     config.setdefault("return_payout_per_parcel", 0.5)
@@ -3005,6 +3008,30 @@ def main():
     if start_date > end_date:
         start_date, end_date = end_date, start_date
 
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("🛣️ Route Penalty")
+    route_penalty_app_enabled = st.sidebar.checkbox(
+        "Apply route penalty",
+        value=bool(config.get("route_penalty_app_enabled", False)),
+        help="Total pool split equally across dispatchers in the selected period.",
+    )
+    if route_penalty_app_enabled != bool(config.get("route_penalty_app_enabled", False)):
+        config["route_penalty_app_enabled"] = route_penalty_app_enabled
+        Config.save(config)
+
+    route_penalty_amount_input = st.sidebar.number_input(
+        "Route penalty amount (total pool)",
+        min_value=0.0,
+        max_value=1_000_000.0,
+        value=float(config.get("route_penalty_amount", 0.0)),
+        step=50.0,
+        disabled=not route_penalty_app_enabled,
+        help="Each dispatcher's share = total ÷ number of dispatchers in period.",
+    )
+    if route_penalty_amount_input != float(config.get("route_penalty_amount", 0.0)):
+        config["route_penalty_amount"] = float(route_penalty_amount_input)
+        Config.save(config)
+
     df["__delivery_date"] = pd.to_datetime(df[delivery_sig_col], errors="coerce").dt.date
     df = df[
         (df["__delivery_date"] >= start_date) & (df["__delivery_date"] <= end_date)
@@ -3186,7 +3213,11 @@ def main():
             f"in the selected period. Showing penalties and other earnings only."
         )
 
-    route_penalty_total = float(config.get("route_penalty_amount", 0.0))
+    route_penalty_total = (
+        float(config.get("route_penalty_amount", 0.0))
+        if config.get("route_penalty_app_enabled", False)
+        else 0.0
+    )
     if not df.empty and dispatcher_id_col:
         route_id_list = df[dispatcher_id_col].dropna().astype(str).str.strip().unique().tolist()
     else:
