@@ -2105,7 +2105,7 @@ class InvoiceGenerator:
         )
 
         gross_tooltip = (
-            "Base delivery + Commission Delivery + Return + Reward "
+            "Base delivery + Pickup Payout + Return + Reward "
             "+ KPI bonus + Attendance bonus − Total penalty − SOCSO − Overpaid."
         )
         advance_tooltip = (
@@ -2601,7 +2601,7 @@ class InvoiceGenerator:
 
         html_content += f"""
                 <div class="payout-row">
-                    <span>Commission Delivery ({pickup_parcels} parcel(s)):</span>
+                    <span>Pickup Payout ({pickup_parcels} parcel(s)):</span>
                     <span>+ {currency_symbol} {pickup_payout:,.2f}</span>
                 </div>
                 <div class="payout-row">
@@ -3485,14 +3485,14 @@ def main():
             with payout_row1_col1:
                 if pickup_parcels > 0:
                     st.metric(
-                        "Commission Delivery",
+                        "Pickup Payout",
                         f"{config['currency_symbol']}{pickup_payout:,.2f}",
                         delta=f"{pickup_parcels} parcels",
                         delta_color="normal",
                     )
                 else:
                     st.metric(
-                        "Commission Delivery",
+                        "Pickup Payout",
                         f"{config['currency_symbol']}0.00",
                         delta="No pickups",
                         delta_color="off",
@@ -3525,7 +3525,7 @@ def main():
                     "Gross Payout",
                     f"{config['currency_symbol']}{gross_total_payout:,.2f}",
                     help=(
-                        "Base delivery + Commission Delivery + Return + Reward "
+                        "Base delivery + Pickup Payout + Return + Reward "
                         "+ KPI bonus + Attendance bonus − Total penalty − SOCSO − Overpaid."
                     ),
                 )
@@ -4006,7 +4006,7 @@ Return Parcels: {return_count:,}
 
 PAYOUT BREAKDOWN
 ----------------
-{base_delivery_lines}Commission Delivery: +{config['currency_symbol']}{pickup_payout:,.2f}
+{base_delivery_lines}Pickup Payout: +{config['currency_symbol']}{pickup_payout:,.2f}
 Return Payout: +{config['currency_symbol']}{return_payout:,.2f}
 Reward: +{config['currency_symbol']}{reward_payout:,.2f}
 KPI Bonus: +{config['currency_symbol']}{kpi_bonus:,.2f}
