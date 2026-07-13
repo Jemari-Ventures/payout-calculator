@@ -6,11 +6,17 @@ import pandas as pd
 
 # Centralized column mappings
 COLUMN_MAPPINGS = {
-    'waybill': ['Waybill Number', 'Waybill', 'waybill_number', 'waybill'],
-    'date': ['Delivery Signature', 'Delivery Date', 'Date', 'signature_date', 'delivery_date'],
-    'dispatcher_id': ['Dispatcher ID', 'Dispatcher Id', 'dispatcher_id'],
-    'dispatcher_name': ['Dispatcher Name', 'Dispatcher', 'dispatcher_name', 'Name', 'Rider Name'],
-    'weight': ['Billing Weight', 'Weight', 'weight', 'billing_weight']
+    'waybill': ['waybill_number', 'Waybill Number', 'Waybill', 'waybill'],
+    'date': [
+        'delivery_signature', 'Delivery Signature',
+        'date_pick_up', 'Date Pick Up',
+        'Delivery Date', 'Date', 'signature_date', 'delivery_date',
+    ],
+    'dispatcher_id': ['dispatcher_id', 'Dispatcher ID', 'Dispatcher Id'],
+    'dispatcher_name': ['dispatcher_name', 'Dispatcher Name', 'Dispatcher', 'Name', 'Rider Name'],
+    'weight': ['billing_weight', 'Billing Weight', 'Weight', 'weight', 'weight_kg'],
+    'pickup_dispatcher_id': ['pickup_dispatcher_id', 'Pickup Dispatcher ID', 'Pick Up Dispatcher ID'],
+    'order_source': ['order_source', 'Order Source', 'order source'],
 }
 
 DISPATCHER_PREFIXES = ['JMR', 'ECP', 'AF', 'PEN', 'KUL', 'JHR']

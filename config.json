@@ -8,20 +8,23 @@
     "excel_sheets": {
       "dispatch": "Dispatch",
       "pickup": "Pickup",
+      "bulky": "Bulky",
+      "return": "Return",
       "duitnow": "DuitNow",
       "ldr": "LDR",
-      "fake_attempt": "Fake Attempt",
       "cod": "COD",
-      "qr_order": "QR Order",
-      "return": "Return",
-      "attendance": "Attendance",
-      "reward": "Reward",
-      "pending_parcel": "Pending Parcel",
-      "no_outbound_scan": "No Outbound Scan",
+      "binding": "Binding",
       "hub": "Hub",
+      "pending_parcel": "Pending Parcel",
+      "parcel_lost": "Parcel Lost",
+      "reward": "Reward",
+      "attendance": "Attendance",
       "socso": "Socso",
+      "rental": "Rental",
+      "fake_attempt": "Fake Attempt",
+      "no_outbound_scan": "No Outbound Scan",
       "overpaid": "Overpaid",
-      "bulky": "Bulky"
+      "qr_order": "QR Order"
     }
   },
   "database": {

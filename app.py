@@ -39,6 +39,9 @@ from penalty_common import (
     filter_bulky_for_dispatcher,
     find_bulky_date_column,
     find_penalty_amount_column,
+    find_cod_penalty_value_column,
+    find_ldr_penalty_value_column,
+    filter_duitnow_penalty_rows,
     compute_pickup_commission_series,
     find_pickup_commission_column,
     find_amount_column,
@@ -46,6 +49,13 @@ from penalty_common import (
     find_reward_employee_column,
     sum_benefit_deduction_float,
     sum_dispatcher_amount_penalty_float,
+)
+from sheet_schema import sheet_col
+from app_runtime import (
+    build_dispatcher_mapping,
+    iso_date,
+    payout_config_fingerprint,
+    trim_sheet_columns,
 )
 from streamlit_compat import render_html, stretch_width_kwargs
 
@@ -166,9 +176,10 @@ class Config:
                         "pending_parcel": "Pending Parcel",
                         "no_outbound_scan": "No Outbound Scan",
                         "parcel_lost": "Parcel lost",
-                        "hub": "hub",
+                        "hub": "Hub",
                         "socso": "Socso",
-                        "overpaid": "Ovepaid",
+                        "overpaid": "Overpaid",
+                        "rental": "Rental",
                         "bulky": "Bulky",
                     }.items():
                         excel_sheets.setdefault(key, default)
@@ -299,7 +310,7 @@ def find_waybill_column(df: pd.DataFrame) -> Optional[str]:
     col = find_column(
         df,
         [
-            "Waybill Number", "waybill_number", "Waybill", "waybill",
+            "waybill_number", "Waybill Number", "Waybill", "waybill",
             "Waybill No", "AWB", "No. AWB", "AWB No.", "awb_no",
         ],
     )
@@ -559,11 +570,17 @@ class DataSource:
                 low_memory=False,
             )
             df.columns = clean_columns
-
             return df
         except Exception as exc:
             st.error(f"Failed to fetch Google Sheet: {exc}")
             raise
+
+    @staticmethod
+    @st.cache_data(ttl=300, show_spinner=False)
+    def load_dispatch_calendar(gsheet_url: str, dispatch_sheet_name: str) -> pd.DataFrame:
+        """Load a trimmed Dispatch sheet for the date-range picker (minimal memory)."""
+        df = DataSource.read_google_sheet(gsheet_url, sheet_name=dispatch_sheet_name)
+        return trim_sheet_columns(df, "dispatch")
 
     @staticmethod
     def _normalize_compare_value(value):
@@ -702,7 +719,7 @@ class DataSource:
 
     @staticmethod
     def load_overpaid_deduction_data(config: dict) -> Optional[pd.DataFrame]:
-        return DataSource._load_optional_sheet(config, "overpaid", "Ovepaid")
+        return DataSource._load_optional_sheet(config, "overpaid", "Overpaid")
 
     @staticmethod
     def load_pending_parcel_penalty_data(config: dict) -> Optional[pd.DataFrame]:
@@ -714,7 +731,38 @@ class DataSource:
 
     @staticmethod
     def load_parcel_lost_penalty_data(config: dict) -> Optional[pd.DataFrame]:
-        return DataSource._load_optional_sheet(config, "parcel_lost", "Parcel lost")
+        return DataSource._load_optional_sheet(config, "parcel_lost", "Parcel Lost")
+
+    @staticmethod
+    @st.cache_data(ttl=300, show_spinner=False)
+    def load_workbook_bundle(gsheet_url: str, sheets_json: str) -> Dict[str, pd.DataFrame]:
+        """Load all configured workbook tabs in one cached call."""
+        sheet_map: Dict[str, str] = json.loads(sheets_json)
+        dispatch_sheet = sheet_map.get("dispatch", "Dispatch")
+        bundle: Dict[str, pd.DataFrame] = {}
+        for key, sheet_name in sheet_map.items():
+            if key == "dispatch":
+                bundle[key] = trim_sheet_columns(
+                    DataSource.read_google_sheet(gsheet_url, sheet_name=sheet_name),
+                    "dispatch",
+                )
+                continue
+            raw = DataSource._read_optional_sheet_without_dispatch_fallback(
+                gsheet_url,
+                sheet_name=sheet_name,
+                dispatch_sheet_name=dispatch_sheet,
+            )
+            bundle[key] = trim_sheet_columns(raw, key)
+        return bundle
+
+    @staticmethod
+    def load_workbook_from_config(config: dict) -> Dict[str, pd.DataFrame]:
+        data_source = config.get("data_source", {})
+        gsheet_url = data_source.get("gsheet_url")
+        if data_source.get("type") != "gsheet" or not gsheet_url:
+            return {}
+        sheet_map = data_source.get("excel_sheets", {})
+        return DataSource.load_workbook_bundle(gsheet_url, json.dumps(sheet_map, sort_keys=True))
 
     @staticmethod
     def load_reward_data(config: dict) -> Optional[pd.DataFrame]:
@@ -1132,14 +1180,10 @@ class PayoutCalculator:
         # Normalize dispatcher_id for comparison
         dispatcher_id_normalized = clean_penalty_dispatcher_id(dispatcher_id)
 
-        # 1. Process DuitNow penalty — dispatcher_id match + Achieve = FAIL only
+        # 1. Process DuitNow penalty — sum penalty column (legacy: Achieve=FAIL when column exists)
         if duitnow_df is not None and not duitnow_df.empty:
             duitnow_rows = filter_penalty_sheet_for_dispatcher(duitnow_df, dispatcher_id)
-            achieve_col = find_column(duitnow_df, ["Achieve", "achieve", "ACHIEVE"])
-            if achieve_col is not None and not duitnow_rows.empty:
-                duitnow_rows = duitnow_rows[
-                    duitnow_rows[achieve_col].astype(str).str.strip().str.upper() == "FAIL"
-                ]
+            duitnow_rows = filter_duitnow_penalty_rows(duitnow_rows)
             if not duitnow_rows.empty:
                 penalty_col = find_penalty_amount_column(duitnow_df)
                 if penalty_col is not None:
@@ -1153,7 +1197,7 @@ class PayoutCalculator:
         if ldr_df is not None and not ldr_df.empty:
             ldr_rows = filter_penalty_sheet_for_dispatcher(ldr_df, dispatcher_id)
             if not ldr_rows.empty:
-                amount_col = find_column(ldr_df, ["Amount", "amount", "AMOUNT"])
+                amount_col = find_ldr_penalty_value_column(ldr_df)
                 if amount_col is not None:
                     penalty_values = ldr_rows[amount_col].apply(penalty_cell_to_float)
                     penalty_breakdown['ldr']['amount'] = round(float(penalty_values.sum()), 2)
@@ -1205,7 +1249,7 @@ class PayoutCalculator:
             if dispatcher_id_col is not None:
                 cod_rows = filter_rows_for_penalty_dispatcher(cod_df, dispatcher_id_col, dispatcher_id)
                 if not cod_rows.empty:
-                    penalty_col = find_penalty_amount_column(cod_df)
+                    penalty_col = find_cod_penalty_value_column(cod_df)
                     if penalty_col is not None:
                         penalty_values = cod_rows[penalty_col].apply(penalty_cell_to_float)
                         penalty_breakdown['cod']['amount'] = round(float(penalty_values.sum()), 2)
@@ -1230,14 +1274,14 @@ class PayoutCalculator:
             penalty_breakdown["hub"]["amount"] = amount
             penalty_breakdown["hub"]["count"] = count
 
-        # 6. Pending Parcel penalty (sum Amount column by dispatcher)
+        # 6. Pending Parcel penalty (sum penalty column by dispatcher)
         if pending_parcel_df is not None and not pending_parcel_df.empty:
             pp_disp_col = find_penalty_dispatcher_column(pending_parcel_df)
             if pp_disp_col is not None:
                 pp_rows = filter_rows_for_penalty_dispatcher(pending_parcel_df, pp_disp_col, dispatcher_id)
                 if not pp_rows.empty:
                     awb_col = find_penalty_waybill_column(pending_parcel_df)
-                    amount_col = find_column(pending_parcel_df, ["Amount", "amount", "AMOUNT"])
+                    amount_col = find_penalty_amount_column(pending_parcel_df) or find_amount_column(pending_parcel_df)
                     if awb_col is not None:
                         waybills = extract_waybill_list(pp_rows[awb_col])
                         parcel_count = len(waybills) if waybills else len(pp_rows)
@@ -2910,6 +2954,347 @@ def add_footer():
     </div>
     """, unsafe_allow_html=True)
 
+
+def _df_or_empty(value: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """Avoid `df or pd.DataFrame()` — non-empty DataFrames are ambiguous in boolean context."""
+    return value if value is not None else pd.DataFrame()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def prepare_period_workbook(
+    gsheet_url: str,
+    sheets_json: str,
+    start_iso: str,
+    end_iso: str,
+) -> Dict[str, pd.DataFrame]:
+    """Load, trim, and date-filter all workbook tabs once per period."""
+    from datetime import date as date_type
+
+    start_date = date_type.fromisoformat(start_iso)
+    end_date = date_type.fromisoformat(end_iso)
+    bundle = DataSource.load_workbook_bundle(gsheet_url, sheets_json)
+
+    period: Dict[str, pd.DataFrame] = {}
+    dispatch = bundle.get("dispatch", pd.DataFrame())
+    if dispatch is not None and not dispatch.empty:
+        delivery_sig_col = find_column(
+            dispatch, ["delivery_signature"]
+        )
+        if delivery_sig_col:
+            dispatch = dispatch.copy()
+            dispatch["__delivery_date"] = pd.to_datetime(dispatch[delivery_sig_col], errors="coerce").dt.date
+            dispatch = dispatch[
+                (dispatch["__delivery_date"] >= start_date) & (dispatch["__delivery_date"] <= end_date)
+            ]
+            dispatch = dispatch.drop(columns=["__delivery_date"], errors="ignore")
+    period["dispatch"] = dispatch if dispatch is not None else pd.DataFrame()
+
+    period["pickup"] = _df_or_empty(
+        filter_sheet_by_date_range(bundle.get("pickup"), start_date, end_date, ["date_pick_up"])
+    )
+    period["return"] = _df_or_empty(
+        filter_sheet_by_date_range(bundle.get("return"), start_date, end_date, ["delivery_signature"])
+    )
+    period["bulky"] = _df_or_empty(
+        filter_sheet_by_date_range(bundle.get("bulky"), start_date, end_date, ["delivery_signature"])
+    )
+    period["reward"] = _df_or_empty(bundle.get("reward"))
+    period["attendance"] = _df_or_empty(bundle.get("attendance"))
+
+    penalty_filtered = filter_penalty_data_by_date(
+        {
+            "duitnow": bundle.get("duitnow"),
+            "ldr": bundle.get("ldr"),
+            "fake_attempt": bundle.get("fake_attempt"),
+            "cod": bundle.get("cod"),
+            "binding": bundle.get("binding"),
+            "hub": bundle.get("hub"),
+            "socso": bundle.get("socso"),
+            "overpaid": bundle.get("overpaid"),
+            "pending_parcel": bundle.get("pending_parcel"),
+            "no_outbound_scan": bundle.get("no_outbound_scan"),
+            "parcel_lost": bundle.get("parcel_lost"),
+        },
+        start_date,
+        end_date,
+    )
+    for key, df in penalty_filtered.items():
+        period[key] = df
+    for key in (
+        "duitnow", "ldr", "fake_attempt", "cod", "binding", "hub",
+        "socso", "overpaid", "pending_parcel", "no_outbound_scan", "parcel_lost",
+    ):
+        period.setdefault(key, pd.DataFrame())
+    return period
+
+
+@st.cache_data(ttl=300, show_spinner="Calculating payout...")
+def compute_dispatcher_payout(
+    dispatcher_id: str,
+    start_iso: str,
+    end_iso: str,
+    gsheet_url: str,
+    sheets_json: str,
+    config_fp: str,
+    route_penalty_per_dispatcher: float,
+    route_penalty_dispatcher_count: int,
+    route_penalty_pool_total: float,
+) -> Dict:
+    """Run the full payout pipeline once per dispatcher + period (cached)."""
+    config = json.loads(config_fp)
+    period = prepare_period_workbook(gsheet_url, sheets_json, start_iso, end_iso)
+
+    dispatch_df = period.get("dispatch", pd.DataFrame())
+    dispatcher_id_col = (
+        find_column(dispatch_df, ["dispatcher_id", "Dispatcher ID", "Dispatcher Id"])
+        if dispatch_df is not None and not dispatch_df.empty
+        else None
+    )
+    if dispatch_df is not None and not dispatch_df.empty and dispatcher_id_col:
+        mask = dispatch_df[dispatcher_id_col].apply(clean_penalty_dispatcher_id) == dispatcher_id
+        dispatcher_df = dispatch_df.loc[mask].copy()
+    else:
+        dispatcher_df = pd.DataFrame()
+
+    pickup_df = period.get("pickup", pd.DataFrame())
+    return_df = period.get("return", pd.DataFrame())
+    bulky_df = period.get("bulky", pd.DataFrame())
+    reward_df = period.get("reward", pd.DataFrame())
+    attendance_df = period.get("attendance", pd.DataFrame())
+    duitnow_df = period.get("duitnow", pd.DataFrame())
+    ldr_df = period.get("ldr", pd.DataFrame())
+    fake_attempt_df = period.get("fake_attempt", pd.DataFrame())
+    cod_df = period.get("cod", pd.DataFrame())
+    binding_df = period.get("binding", pd.DataFrame())
+    hub_df = period.get("hub", pd.DataFrame())
+    socso_df = period.get("socso", pd.DataFrame())
+    overpaid_df = period.get("overpaid", pd.DataFrame())
+    pending_parcel_df = period.get("pending_parcel", pd.DataFrame())
+    no_outbound_scan_df = period.get("no_outbound_scan", pd.DataFrame())
+    parcel_lost_df = period.get("parcel_lost", pd.DataFrame())
+
+    payout_kwargs = dict(
+        filtered_df=dispatcher_df,
+        attendance_config=config.get("attendance_incentive", {}),
+        currency_symbol=config.get("currency_symbol", "RM"),
+        duitnow_df=duitnow_df,
+        ldr_df=ldr_df,
+        fake_df=fake_attempt_df,
+        cod_df=cod_df,
+        binding_df=binding_df,
+        hub_df=hub_df,
+        pending_parcel_df=pending_parcel_df,
+        no_outbound_scan_df=no_outbound_scan_df,
+        parcel_lost_df=parcel_lost_df,
+        attendance_df=attendance_df,
+        fake_attempt_penalty_per_parcel=config.get("fake_attempt_penalty_per_parcel", 2.0),
+        pending_parcel_penalty_per_parcel=config.get("pending_parcel_penalty_per_parcel", 2.0),
+        no_outbound_scan_penalty_per_parcel=config.get("no_outbound_scan_penalty_per_parcel", 3.0),
+        return_df=return_df,
+        route_penalty_per_dispatcher=route_penalty_per_dispatcher,
+        route_penalty_dispatcher_count=route_penalty_dispatcher_count,
+        route_penalty_pool_total=route_penalty_pool_total,
+        pickup_df=pickup_df,
+        bulky_df=bulky_df,
+        special_rates_config=config.get("special_rates", []),
+        fallback_dispatcher_id=dispatcher_id,
+    )
+
+    is_designated_driver = PayoutCalculator.is_designated_driver(dispatcher_id, config)
+    designated_driver_config = config.get("designated_driver", {})
+
+    if is_designated_driver:
+        (
+            display_df, base_delivery_payout, gross_delivery_payout, kpi_bonus, kpi_description,
+            attendance_bonus, attendance_desc, qualified_days,
+            per_day_df, penalty_breakdown,
+        ) = PayoutCalculator.calculate_designated_driver(
+            designated_driver_config=designated_driver_config,
+            **payout_kwargs,
+        )
+    else:
+        (
+            display_df, base_delivery_payout, gross_delivery_payout, kpi_bonus, kpi_description,
+            attendance_bonus, attendance_desc, qualified_days,
+            per_day_df, penalty_breakdown,
+        ) = PayoutCalculator.calculate_tiered_daily(
+            tiers_config=config.get("tiers", []),
+            kpi_config=config.get("kpi_incentives", []),
+            **payout_kwargs,
+        )
+
+    designated_driver_breakdown = None
+    if is_designated_driver:
+        total_delivery_parcels = (
+            int(display_df["Total Parcel"].sum()) if "Total Parcel" in display_df.columns else 0
+        )
+        designated_driver_breakdown = PayoutCalculator.build_designated_driver_breakdown(
+            per_day_df,
+            designated_driver_config,
+            total_delivery_parcels,
+            base_delivery_payout,
+        )
+
+    pickup_parcels, pickup_payout, pickup_filtered_df = PayoutCalculator.calculate_pickup(
+        pickup_df,
+        dispatcher_id,
+        rate=float(config.get("pickup_payout_per_parcel", 1.0)),
+    )
+    return_count, return_payout, return_filtered_df = PayoutCalculator.calculate_return(
+        return_df,
+        dispatcher_id,
+        rate=float(config.get("return_payout_per_parcel", 0.5)),
+    )
+    reward_payout, reward_count, reward_filtered_df = PayoutCalculator.calculate_reward(
+        reward_df,
+        dispatcher_id,
+    )
+    socso_deduction, socso_deduction_count = PayoutCalculator.calculate_benefit_deduction(
+        dispatcher_id,
+        socso_df,
+    )
+    overpaid_deduction, overpaid_deduction_count = PayoutCalculator.calculate_benefit_deduction(
+        dispatcher_id,
+        overpaid_df,
+    )
+
+    advance_config = config.get("advance_payout", {"enabled": False, "percentage": 0.0})
+    advance_enabled = bool(advance_config.get("enabled", False))
+    advance_percentage = float(advance_config.get("percentage", 0.0))
+
+    gross_total_payout = PayoutCalculator.calculate_gross_payout(
+        base_delivery_payout,
+        pickup_payout,
+        return_payout,
+        reward_payout,
+        kpi_bonus,
+        attendance_bonus,
+        penalty_breakdown["total_amount"],
+        socso_deduction,
+        overpaid_deduction,
+    )
+    advance_payout = PayoutCalculator.calculate_advance_payout(
+        base_delivery_payout,
+        advance_percentage,
+        advance_enabled,
+    )
+    final_payout = PayoutCalculator.calculate_final_payout(gross_total_payout, advance_payout)
+
+    total_delivery_parcels = (
+        int(display_df["Total Parcel"].sum()) if "Total Parcel" in display_df.columns else 0
+    )
+    total_awb = PayoutCalculator.count_total_awb(total_delivery_parcels, pickup_parcels, return_count)
+
+    return {
+        "display_df": display_df,
+        "per_day_df": per_day_df,
+        "penalty_breakdown": penalty_breakdown,
+        "base_delivery_payout": base_delivery_payout,
+        "gross_delivery_payout": gross_delivery_payout,
+        "gross_total_payout": gross_total_payout,
+        "final_payout": final_payout,
+        "advance_payout": advance_payout,
+        "advance_enabled": advance_enabled,
+        "advance_percentage": advance_percentage,
+        "kpi_bonus": kpi_bonus,
+        "kpi_description": kpi_description,
+        "attendance_bonus": attendance_bonus,
+        "attendance_desc": attendance_desc,
+        "qualified_days": qualified_days,
+        "pickup_parcels": pickup_parcels,
+        "pickup_payout": pickup_payout,
+        "pickup_filtered_df": pickup_filtered_df,
+        "return_count": return_count,
+        "return_payout": return_payout,
+        "return_filtered_df": return_filtered_df,
+        "reward_payout": reward_payout,
+        "reward_count": reward_count,
+        "reward_filtered_df": reward_filtered_df,
+        "socso_deduction": socso_deduction,
+        "socso_deduction_count": socso_deduction_count,
+        "overpaid_deduction": overpaid_deduction,
+        "overpaid_deduction_count": overpaid_deduction_count,
+        "designated_driver_breakdown": designated_driver_breakdown,
+        "is_designated_driver": is_designated_driver,
+        "total_awb": total_awb,
+        "total_delivery_parcels": total_delivery_parcels,
+        "dispatcher_df_empty": dispatcher_df.empty,
+    }
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def build_cached_invoice_html(
+    display_df_csv: str,
+    base_payout: float,
+    gross_payout: float,
+    kpi_bonus: float,
+    attendance_bonus: float,
+    advance_payout: float,
+    advance_payout_desc: str,
+    penalty_breakdown_json: str,
+    socso_deduction: float,
+    socso_deduction_count: int,
+    overpaid_deduction: float,
+    overpaid_deduction_count: int,
+    reward_payout: float,
+    reward_count: int,
+    name: str,
+    dpid: str,
+    currency_symbol: str,
+    pickup_payout: float,
+    pickup_parcels: int,
+    return_payout: float,
+    return_count: int,
+    kpi_description: str,
+    attendance_description: str,
+    total_awb: int,
+    pickup_rate: float,
+    return_rate: float,
+    advance_percentage: float,
+    advance_enabled: bool,
+    designated_driver_breakdown_json: str,
+) -> str:
+    """Cache rendered invoice HTML (expensive on large periods)."""
+    display_df = pd.read_csv(io.StringIO(display_df_csv))
+    penalty_breakdown = json.loads(penalty_breakdown_json)
+    designated_driver_breakdown = (
+        json.loads(designated_driver_breakdown_json)
+        if designated_driver_breakdown_json
+        else None
+    )
+    return InvoiceGenerator.build_invoice_html(
+        df_disp=display_df,
+        base_payout=base_payout,
+        gross_payout=gross_payout,
+        kpi_bonus=kpi_bonus,
+        attendance_bonus=attendance_bonus,
+        advance_payout=advance_payout,
+        advance_payout_desc=advance_payout_desc,
+        penalty_breakdown=penalty_breakdown,
+        socso_deduction=socso_deduction,
+        socso_deduction_count=socso_deduction_count,
+        overpaid_deduction=overpaid_deduction,
+        overpaid_deduction_count=overpaid_deduction_count,
+        reward_payout=reward_payout,
+        reward_count=reward_count,
+        name=name,
+        dpid=dpid,
+        currency_symbol=currency_symbol,
+        pickup_payout=pickup_payout,
+        pickup_parcels=pickup_parcels,
+        return_payout=return_payout,
+        return_count=return_count,
+        kpi_description=kpi_description,
+        attendance_description=attendance_description,
+        total_awb=total_awb,
+        designated_driver_breakdown=designated_driver_breakdown,
+        pickup_rate=pickup_rate,
+        return_rate=return_rate,
+        advance_percentage=advance_percentage,
+        advance_enabled=advance_enabled,
+    )
+
+
 # =============================================================================
 # MAIN APPLICATION
 # =============================================================================
@@ -2938,50 +3323,45 @@ def main():
     config = Config.load()
     config["data_source"]["type"] = "gsheet"
 
-    with st.spinner("Loading data from Google Sheets..."):
-        df = DataSource.load_data(config)
-
-    if df is None:
-        st.error("❌ Failed to load data from Google Sheets.")
-        st.info("Please check the configuration file or ensure the Google Sheet is accessible.")
+    gsheet_url = config.get("data_source", {}).get("gsheet_url", "")
+    if not gsheet_url:
+        st.error("Google Sheet URL is not configured in config.json.")
         add_footer()
         return
 
-    if df.empty:
-        st.warning("No data found in the Google Sheet.")
+    sheets_json = json.dumps(config.get("data_source", {}).get("excel_sheets", {}), sort_keys=True)
+    dispatch_sheet = config.get("data_source", {}).get("excel_sheets", {}).get("dispatch", "Dispatch")
+
+    with st.spinner("Loading dispatch calendar..."):
+        calendar_df = DataSource.load_dispatch_calendar(gsheet_url, dispatch_sheet)
+
+    if calendar_df is None or calendar_df.empty:
+        st.warning("No data found in the Dispatch sheet.")
         add_footer()
         return
 
-    df = df.rename(columns={c: str(c).strip() for c in df.columns})
+    calendar_df = calendar_df.rename(columns={c: str(c).strip() for c in calendar_df.columns})
 
-    # Find required columns with flexible matching
-    dispatcher_id_col = find_column(df, ["Dispatcher ID", "dispatcher_id", "Dispatcher Id", "DISPATCHER ID"])
-    waybill_col = find_waybill_column(df)
-    delivery_sig_col = find_column(df, ["Delivery Signature", "delivery_signature", "Delivery Signature", "delivery_sig"])
+    dispatcher_id_col = sheet_col(calendar_df, "dispatcher_id") or "dispatcher_id"
+    waybill_col = sheet_col(calendar_df, "waybill_number") or "waybill_number"
+    delivery_sig_col = sheet_col(calendar_df, "delivery_signature") or "delivery_signature"
 
     missing_columns = []
-    if dispatcher_id_col is None:
-        missing_columns.append("Dispatcher ID")
-    if waybill_col is None:
-        missing_columns.append("Waybill Number")
-    if delivery_sig_col is None:
-        missing_columns.append("Delivery Signature")
+    if "dispatcher_id" not in calendar_df.columns:
+        missing_columns.append("dispatcher_id")
+    if "waybill_number" not in calendar_df.columns:
+        missing_columns.append("waybill_number")
+    if "delivery_signature" not in calendar_df.columns:
+        missing_columns.append("delivery_signature")
 
     if missing_columns:
         st.error(f"Missing required columns: {', '.join(missing_columns)}")
-        st.info(f"Available columns: {', '.join(df.columns.tolist())}")
+        st.info(f"Available columns: {', '.join(calendar_df.columns.tolist())}")
         add_footer()
         return
 
-    # Store column names for later use
-    df.attrs['dispatcher_id_col'] = dispatcher_id_col
-    df.attrs['waybill_col'] = waybill_col
-    df.attrs['delivery_sig_col'] = delivery_sig_col
-
-    # Convert Delivery Signature to datetime
-    df[delivery_sig_col] = pd.to_datetime(df[delivery_sig_col], errors="coerce")
-
-    valid_dates = df[delivery_sig_col].dropna()
+    calendar_df[delivery_sig_col] = pd.to_datetime(calendar_df[delivery_sig_col], errors="coerce")
+    valid_dates = calendar_df[delivery_sig_col].dropna()
     if not valid_dates.empty:
         min_date = valid_dates.min().date()
         max_date = valid_dates.max().date()
@@ -3033,11 +3413,33 @@ def main():
         config["route_penalty_amount"] = float(route_penalty_amount_input)
         Config.save(config)
 
-    df["__delivery_date"] = pd.to_datetime(df[delivery_sig_col], errors="coerce").dt.date
-    df = df[
-        (df["__delivery_date"] >= start_date) & (df["__delivery_date"] <= end_date)
-    ].copy()
-    df = df.drop(columns=["__delivery_date"], errors="ignore")
+    if st.sidebar.button("Clear cache & reload", help="Refresh sheet data if the workbook was updated."):
+        st.cache_data.clear()
+        st.rerun()
+
+    start_iso = iso_date(start_date)
+    end_iso = iso_date(end_date)
+
+    with st.spinner("Loading period data..."):
+        period = prepare_period_workbook(gsheet_url, sheets_json, start_iso, end_iso)
+
+    df = period.get("dispatch", pd.DataFrame())
+    pickup_df = period.get("pickup", pd.DataFrame())
+    reward_df = period.get("reward", pd.DataFrame())
+    return_df = period.get("return", pd.DataFrame())
+    bulky_df = period.get("bulky", pd.DataFrame())
+    attendance_df = period.get("attendance", pd.DataFrame())
+    duitnow_df = period.get("duitnow", pd.DataFrame())
+    ldr_df = period.get("ldr", pd.DataFrame())
+    fake_attempt_df = period.get("fake_attempt", pd.DataFrame())
+    cod_df = period.get("cod", pd.DataFrame())
+    binding_df = period.get("binding", pd.DataFrame())
+    hub_df = period.get("hub", pd.DataFrame())
+    socso_df = period.get("socso", pd.DataFrame())
+    overpaid_df = period.get("overpaid", pd.DataFrame())
+    pending_parcel_df = period.get("pending_parcel", pd.DataFrame())
+    no_outbound_scan_df = period.get("no_outbound_scan", pd.DataFrame())
+    parcel_lost_df = period.get("parcel_lost", pd.DataFrame())
 
     if df.empty:
         st.warning(
@@ -3050,78 +3452,13 @@ def main():
             f"to {end_date.strftime('%B %d, %Y')}."
         )
 
-    # Load supplemental sheets before dispatcher selection
-    pickup_df = DataSource.load_pickup_data(config)
-    reward_df = DataSource.load_reward_data(config)
-    return_df = DataSource.load_return_data(config)
-    bulky_df = DataSource.load_bulky_data(config)
-    attendance_df = DataSource.load_attendance_data(config)
-    duitnow_df = DataSource.load_duitnow_penalty_data(config)
-    ldr_df = DataSource.load_ldr_penalty_data(config)
-    fake_attempt_df = DataSource.load_fake_attempt_penalty_data(config)
-    cod_df = DataSource.load_cod_penalty_data(config)
-    binding_df = DataSource.load_binding_penalty_data(config)
-    hub_df = DataSource.load_hub_penalty_data(config)
-    socso_df = DataSource.load_socso_deduction_data(config)
-    overpaid_df = DataSource.load_overpaid_deduction_data(config)
-    pending_parcel_df = DataSource.load_pending_parcel_penalty_data(config)
-    no_outbound_scan_df = DataSource.load_no_outbound_scan_penalty_data(config)
-    parcel_lost_df = DataSource.load_parcel_lost_penalty_data(config)
-
-    pickup_df = filter_sheet_by_date_range(
-        pickup_df, start_date, end_date, ["date_pick_up", "Date Pick Up", "date pick up"]
-    )
-    return_df = filter_sheet_by_date_range(
-        return_df, start_date, end_date, ["Delivery Signature", "delivery_signature"]
-    )
-    bulky_df = filter_sheet_by_date_range(
-        bulky_df, start_date, end_date, ["Delivery Signature", "delivery_signature"]
-    )
-
-    penalty_filtered = filter_penalty_data_by_date(
-        {
-            "duitnow": duitnow_df,
-            "ldr": ldr_df,
-            "fake_attempt": fake_attempt_df,
-            "cod": cod_df,
-            "binding": binding_df,
-            "hub": hub_df,
-            "socso": socso_df,
-            "overpaid": overpaid_df,
-            "pending_parcel": pending_parcel_df,
-            "no_outbound_scan": no_outbound_scan_df,
-            "parcel_lost": parcel_lost_df,
-        },
-        start_date,
-        end_date,
-    )
-    duitnow_df = penalty_filtered.get("duitnow", duitnow_df if duitnow_df is not None else pd.DataFrame())
-    ldr_df = penalty_filtered.get("ldr", ldr_df if ldr_df is not None else pd.DataFrame())
-    fake_attempt_df = penalty_filtered.get("fake_attempt", fake_attempt_df if fake_attempt_df is not None else pd.DataFrame())
-    cod_df = penalty_filtered.get("cod", cod_df if cod_df is not None else pd.DataFrame())
-    binding_df = penalty_filtered.get("binding", binding_df if binding_df is not None else pd.DataFrame())
-    hub_df = penalty_filtered.get("hub", hub_df if hub_df is not None else pd.DataFrame())
-    socso_df = penalty_filtered.get("socso", socso_df if socso_df is not None else pd.DataFrame())
-    overpaid_df = penalty_filtered.get("overpaid", overpaid_df if overpaid_df is not None else pd.DataFrame())
-    pending_parcel_df = penalty_filtered.get("pending_parcel", pending_parcel_df if pending_parcel_df is not None else pd.DataFrame())
-    no_outbound_scan_df = penalty_filtered.get("no_outbound_scan", no_outbound_scan_df if no_outbound_scan_df is not None else pd.DataFrame())
-    parcel_lost_df = penalty_filtered.get("parcel_lost", parcel_lost_df if parcel_lost_df is not None else pd.DataFrame())
-
     st.subheader("👤 Dispatcher Selection")
-    dispatcher_mapping = {}
-    dispatcher_name_col = find_column(df, ["Dispatcher Name", "dispatcher_name", "Rider Name", "rider_name", "Name", "name"])
-
-    if not df.empty and dispatcher_name_col and dispatcher_id_col:
-        temp_mapping = df[[dispatcher_id_col, dispatcher_name_col]].dropna()
-        temp_mapping[dispatcher_id_col] = temp_mapping[dispatcher_id_col].astype(str)
-        temp_mapping[dispatcher_name_col] = temp_mapping[dispatcher_name_col].astype(str)
-        for _, row in temp_mapping.iterrows():
-            dispatcher_id = clean_penalty_dispatcher_id(row[dispatcher_id_col])
-            dispatcher_name = clean_dispatcher_name(row[dispatcher_name_col])
-            if dispatcher_id and dispatcher_id not in dispatcher_mapping:
-                dispatcher_mapping[dispatcher_id] = dispatcher_name
-
-    for penalty_id in collect_dispatcher_ids_from_penalty_sheets(
+    dispatcher_name_col = sheet_col(df if not df.empty else calendar_df, "dispatcher_name")
+    mapping_source_df = df if not df.empty else calendar_df
+    dispatcher_mapping = build_dispatcher_mapping(
+        mapping_source_df,
+        "dispatcher_id" if "dispatcher_id" in mapping_source_df.columns else dispatcher_id_col,
+        dispatcher_name_col,
         {
             "duitnow": duitnow_df,
             "ldr": ldr_df,
@@ -3135,39 +3472,17 @@ def main():
             "no_outbound_scan": no_outbound_scan_df,
             "parcel_lost": parcel_lost_df,
             "attendance": attendance_df,
-        }
-    ):
-        dispatcher_mapping.setdefault(penalty_id, "")
-
-    if reward_df is not None and not reward_df.empty:
-        reward_id_col = find_reward_employee_column(reward_df)
-        reward_name_col = find_reward_dispatcher_name_column(reward_df)
-        if reward_id_col:
-            reward_cols = [reward_id_col] + ([reward_name_col] if reward_name_col else [])
-            for _, row in reward_df[reward_cols].dropna(subset=[reward_id_col]).iterrows():
-                reward_id = clean_penalty_dispatcher_id(row[reward_id_col])
-                if not reward_id:
-                    continue
-                reward_name = ""
-                if reward_name_col:
-                    reward_name = clean_dispatcher_name(row[reward_name_col])
-                dispatcher_mapping.setdefault(reward_id, reward_name or dispatcher_mapping.get(reward_id, ""))
-
-    if bulky_df is not None and not bulky_df.empty:
-        bulky_id_col = find_dispatch_id_column(bulky_df)
-        bulky_name_col = find_column(
-            bulky_df, ["Dispatcher Name", "dispatcher_name", "Rider Name", "rider_name", "Name", "name"]
-        )
-        if bulky_id_col:
-            bulky_cols = [bulky_id_col] + ([bulky_name_col] if bulky_name_col else [])
-            for _, row in bulky_df[bulky_cols].dropna(subset=[bulky_id_col]).iterrows():
-                bulky_id = clean_penalty_dispatcher_id(row[bulky_id_col])
-                if not bulky_id:
-                    continue
-                bulky_name = ""
-                if bulky_name_col:
-                    bulky_name = clean_dispatcher_name(row[bulky_name_col])
-                dispatcher_mapping.setdefault(bulky_id, bulky_name or dispatcher_mapping.get(bulky_id, ""))
+        },
+        reward_df,
+        bulky_df,
+        clean_penalty_dispatcher_id,
+        clean_dispatcher_name,
+        collect_dispatcher_ids_from_penalty_sheets,
+        find_reward_employee_column,
+        find_reward_dispatcher_name_column,
+        find_dispatch_id_column,
+        find_column,
+    )
 
     dispatcher_options = []
     for dispatcher_id, dispatcher_name in dispatcher_mapping.items():
@@ -3201,19 +3516,6 @@ def main():
         add_footer()
         return
 
-    if not df.empty and dispatcher_id_col:
-        dispatcher_df = df[
-            df[dispatcher_id_col].apply(clean_penalty_dispatcher_id) == selected_dispatcher_id
-        ].copy()
-    else:
-        dispatcher_df = pd.DataFrame()
-
-    if dispatcher_df.empty:
-        st.info(
-            f"No delivery records for {selected_dispatcher_name or selected_dispatcher_id} "
-            f"in the selected period. Showing penalties and other earnings only."
-        )
-
     route_penalty_total = (
         float(config.get("route_penalty_amount", 0.0))
         if config.get("route_penalty_app_enabled", False)
@@ -3228,6 +3530,63 @@ def main():
     route_penalty_per_dispatcher = float(
         route_penalty_split.get(route_penalty_dispatcher_key(selected_dispatcher_id), 0.0)
     )
+
+    config_fp = payout_config_fingerprint(config)
+    try:
+        snapshot = compute_dispatcher_payout(
+            selected_dispatcher_id,
+            start_iso,
+            end_iso,
+            gsheet_url,
+            sheets_json,
+            config_fp,
+            route_penalty_per_dispatcher,
+            route_penalty_dispatcher_count,
+            route_penalty_total,
+        )
+    except Exception as exc:
+        st.error(f"Error calculating payout: {exc}")
+        st.exception(exc)
+        add_footer()
+        return
+
+    display_df = snapshot["display_df"]
+    per_day_df = snapshot["per_day_df"]
+    penalty_breakdown = snapshot["penalty_breakdown"]
+    base_delivery_payout = snapshot["base_delivery_payout"]
+    gross_delivery_payout = snapshot["gross_delivery_payout"]
+    gross_total_payout = snapshot["gross_total_payout"]
+    final_payout = snapshot["final_payout"]
+    advance_payout = snapshot["advance_payout"]
+    advance_enabled = snapshot["advance_enabled"]
+    advance_percentage = snapshot["advance_percentage"]
+    kpi_bonus = snapshot["kpi_bonus"]
+    kpi_description = snapshot["kpi_description"]
+    attendance_bonus = snapshot["attendance_bonus"]
+    attendance_desc = snapshot["attendance_desc"]
+    qualified_days = snapshot["qualified_days"]
+    pickup_payout = snapshot["pickup_payout"]
+    pickup_parcels = snapshot["pickup_parcels"]
+    pickup_filtered_df = snapshot.get("pickup_filtered_df", pd.DataFrame())
+    return_payout = snapshot["return_payout"]
+    return_count = snapshot["return_count"]
+    return_filtered_df = snapshot.get("return_filtered_df", pd.DataFrame())
+    reward_payout = snapshot["reward_payout"]
+    reward_count = snapshot["reward_count"]
+    socso_deduction = snapshot["socso_deduction"]
+    socso_deduction_count = snapshot["socso_deduction_count"]
+    overpaid_deduction = snapshot["overpaid_deduction"]
+    overpaid_deduction_count = snapshot["overpaid_deduction_count"]
+    designated_driver_breakdown = snapshot["designated_driver_breakdown"]
+    is_designated_driver = snapshot["is_designated_driver"]
+    total_awb = snapshot["total_awb"]
+    total_delivery_parcels = snapshot["total_delivery_parcels"]
+
+    if snapshot["dispatcher_df_empty"]:
+        st.info(
+            f"No delivery records for {selected_dispatcher_name or selected_dispatcher_id} "
+            f"in the selected period. Showing penalties and other earnings only."
+        )
 
     # Visibility: show which optional sheets are missing/empty and therefore treated as 0.
     optional_sheets = {
@@ -3274,7 +3633,6 @@ def main():
     # Calculate payout
     st.subheader(f"💰 Payout Calculation for {selected_dispatcher_name or selected_dispatcher_id}")
 
-    is_designated_driver = PayoutCalculator.is_designated_driver(selected_dispatcher_id, config)
     designated_driver_config = config.get("designated_driver", {})
     if is_designated_driver:
         basic_amount = float(designated_driver_config.get("basic_amount", 1700.0))
@@ -3289,172 +3647,18 @@ def main():
             f"Special rate incentives from config also apply on qualifying days."
         )
 
-    # Get advance payout configuration
     advance_config = config.get("advance_payout", {"enabled": False, "percentage": 0.0, "description": "Advance Payout"})
-    advance_enabled = advance_config.get("enabled", False)
-    advance_percentage = advance_config.get("percentage", 0.0)
     advance_description = advance_config.get("description", "Advance Payout (40% of Base Delivery)")
 
-    # Initialize variables that might be used in other tabs
-    advance_payout = 0.0
-    base_delivery_payout = 0.0
-    gross_delivery_payout = 0.0
-    gross_total_payout = 0.0
-    final_payout = 0.0
-    kpi_bonus = 0.0
-    attendance_bonus = 0.0
-    pickup_payout = 0.0
-    pickup_parcels = 0
-    return_payout = 0.0
-    return_count = 0
-    reward_payout = 0.0
-    reward_count = 0
-    socso_deduction = 0.0
-    socso_deduction_count = 0
-    overpaid_deduction = 0.0
-    overpaid_deduction_count = 0
-    kpi_description = ""
-    attendance_desc = ""
-    qualified_days = 0
-    display_df = pd.DataFrame()
-    penalty_breakdown = {'duitnow': {'amount': 0.0, 'count': 0, 'waybills': []},
-                        'ldr': {'amount': 0.0, 'count': 0, 'waybills': []},
-                        'fake_attempt': {'amount': 0.0, 'count': 0, 'waybills': []},
-                        'cod': {'amount': 0.0, 'count': 0},
-                        'binding': {'amount': 0.0, 'count': 0},
-                'hub': {'amount': 0.0, 'count': 0},
-                        'pending_parcel': {'amount': 0.0, 'count': 0, 'waybills': []},
-                        'no_outbound_scan': {'amount': 0.0, 'count': 0, 'waybills': []},
-                        'parcel_lost': {'amount': 0.0, 'count': 0, 'waybills': []},
-                        'route': {'amount': 0.0, 'count': 0, 'pool_total': 0.0},
-                        'attendance': {'amount': 0.0, 'count': 0},
-                        'total_amount': 0.0, 'total_count': 0}
-    per_day_df = pd.DataFrame()
-    pickup_filtered_df = pd.DataFrame()
-    return_filtered_df = pd.DataFrame()
-    reward_filtered_df = pd.DataFrame()
-    designated_driver_breakdown = None
+    active_view = st.radio(
+        "View",
+        ["📊 Payout Details", "📈 Performance Charts", "🧾 Invoice"],
+        horizontal=True,
+        key="payout_active_view",
+        label_visibility="collapsed",
+    )
 
-    # Create tabs for different views
-    tab1, tab2, tab3 = st.tabs(["📊 Payout Details", "📈 Performance Charts", "🧾 Invoice"])
-
-    with tab1:
-        # Calculate delivery payout (tiered or designated driver)
-        try:
-            payout_kwargs = dict(
-                filtered_df=dispatcher_df,
-                attendance_config=config.get("attendance_incentive", {}),
-                currency_symbol=config["currency_symbol"],
-                duitnow_df=duitnow_df,
-                ldr_df=ldr_df,
-                fake_df=fake_attempt_df,
-                cod_df=cod_df,
-                binding_df=binding_df,
-                hub_df=hub_df,
-                pending_parcel_df=pending_parcel_df,
-                no_outbound_scan_df=no_outbound_scan_df,
-                parcel_lost_df=parcel_lost_df,
-                attendance_df=attendance_df,
-                fake_attempt_penalty_per_parcel=config.get("fake_attempt_penalty_per_parcel", 2.0),
-                pending_parcel_penalty_per_parcel=config.get("pending_parcel_penalty_per_parcel", 2.0),
-                no_outbound_scan_penalty_per_parcel=config.get("no_outbound_scan_penalty_per_parcel", 3.0),
-                return_df=return_df,
-                route_penalty_per_dispatcher=route_penalty_per_dispatcher,
-                route_penalty_dispatcher_count=route_penalty_dispatcher_count,
-                route_penalty_pool_total=route_penalty_total,
-                pickup_df=pickup_df,
-                bulky_df=bulky_df,
-                special_rates_config=config.get("special_rates", []),
-                fallback_dispatcher_id=selected_dispatcher_id,
-            )
-
-            if is_designated_driver:
-                (display_df, base_delivery_payout, gross_delivery_payout, kpi_bonus, kpi_description,
-                 attendance_bonus, attendance_desc, qualified_days,
-                 per_day_df, penalty_breakdown) = PayoutCalculator.calculate_designated_driver(
-                    designated_driver_config=designated_driver_config,
-                    **payout_kwargs,
-                )
-            else:
-                (display_df, base_delivery_payout, gross_delivery_payout, kpi_bonus, kpi_description,
-                 attendance_bonus, attendance_desc, qualified_days,
-                 per_day_df, penalty_breakdown) = PayoutCalculator.calculate_tiered_daily(
-                    tiers_config=config["tiers"],
-                    kpi_config=config.get("kpi_incentives", []),
-                    **payout_kwargs,
-                )
-
-            if is_designated_driver:
-                total_delivery_parcels = int(display_df['Total Parcel'].sum()) if 'Total Parcel' in display_df.columns else 0
-                designated_driver_breakdown = PayoutCalculator.build_designated_driver_breakdown(
-                    per_day_df,
-                    designated_driver_config,
-                    total_delivery_parcels,
-                    base_delivery_payout,
-                )
-
-            # Calculate pickup payout (Order Source rules; fallback rate from config)
-            pickup_parcels, pickup_payout, pickup_filtered_df = PayoutCalculator.calculate_pickup(
-                pickup_df,
-                selected_dispatcher_id,
-                rate=float(config.get("pickup_payout_per_parcel", 1.0)),
-            )
-
-            return_count, return_payout, return_filtered_df = PayoutCalculator.calculate_return(
-                return_df,
-                selected_dispatcher_id,
-                rate=float(config.get("return_payout_per_parcel", 0.5)),
-            )
-
-            reward_payout, reward_count, reward_filtered_df = PayoutCalculator.calculate_reward(
-                reward_df,
-                selected_dispatcher_id,
-            )
-
-            socso_deduction, socso_deduction_count = PayoutCalculator.calculate_benefit_deduction(
-                selected_dispatcher_id,
-                socso_df,
-            )
-            overpaid_deduction, overpaid_deduction_count = PayoutCalculator.calculate_benefit_deduction(
-                selected_dispatcher_id,
-                overpaid_df,
-            )
-
-            gross_total_payout = PayoutCalculator.calculate_gross_payout(
-                base_delivery_payout,
-                pickup_payout,
-                return_payout,
-                reward_payout,
-                kpi_bonus,
-                attendance_bonus,
-                penalty_breakdown["total_amount"],
-                socso_deduction,
-                overpaid_deduction,
-            )
-
-            advance_payout = PayoutCalculator.calculate_advance_payout(
-                base_delivery_payout,
-                advance_percentage,
-                advance_enabled,
-            )
-
-            final_payout = PayoutCalculator.calculate_final_payout(
-                gross_total_payout,
-                advance_payout,
-            )
-
-            # Total AWB = delivery parcels + pickup parcels + return parcels.
-            total_delivery_parcels = (
-                int(display_df['Total Parcel'].sum())
-                if 'Total Parcel' in display_df.columns
-                else 0
-            )
-            total_awb = PayoutCalculator.count_total_awb(
-                total_delivery_parcels,
-                pickup_parcels,
-                return_count,
-            )
-
+    if active_view == "📊 Payout Details":
             summary_row1_col1, summary_row1_col2, summary_row1_col3 = st.columns(3)
             with summary_row1_col1:
                 st.metric(
@@ -3857,13 +4061,9 @@ def main():
                     - **Final Payout:** {config['currency_symbol']}{final_payout:,.2f}
                     """)
 
-        except Exception as e:
-            st.error(f"Error calculating payout: {str(e)}")
-            st.exception(e)
-
-    with tab2:
-        # Display performance charts
-        if 'per_day_df' in locals() and not per_day_df.empty:
+    elif active_view == "📈 Performance Charts":
+        # Display performance charts (lazy — skipped unless this view is selected)
+        if per_day_df is not None and not per_day_df.empty:
             charts = DataVisualizer.create_performance_charts(per_day_df, config["currency_symbol"])
 
             if charts:
@@ -3900,42 +4100,41 @@ def main():
             else:
                 st.info("No chart data available for this dispatcher.")
         else:
-            st.info("Performance data not available. Complete the calculation in the Payout Details tab first.")
+            st.info("Performance data not available for this dispatcher.")
 
-    with tab3:
-        # Generate and display invoice
-        if 'display_df' in locals() and not display_df.empty:
-            # Generate HTML invoice
-            invoice_html = InvoiceGenerator.build_invoice_html(
-                df_disp=display_df,
-                base_payout=base_delivery_payout,
-                gross_payout=gross_delivery_payout,
-                kpi_bonus=kpi_bonus,
-                attendance_bonus=attendance_bonus,
-                advance_payout=advance_payout,
-                advance_payout_desc=advance_description,
-                penalty_breakdown=penalty_breakdown,
-                socso_deduction=socso_deduction,
-                socso_deduction_count=socso_deduction_count,
-                overpaid_deduction=overpaid_deduction,
-                overpaid_deduction_count=overpaid_deduction_count,
-                reward_payout=reward_payout,
-                reward_count=reward_count,
-                name=selected_dispatcher_name or selected_dispatcher_id,
-                dpid=selected_dispatcher_id,
-                currency_symbol=config["currency_symbol"],
-                pickup_payout=pickup_payout,
-                pickup_parcels=pickup_parcels,
-                return_payout=return_payout,
-                return_count=return_count,
-                kpi_description=kpi_description,
-                attendance_description=attendance_desc,
-                total_awb=total_awb,
-                designated_driver_breakdown=designated_driver_breakdown,
-                pickup_rate=float(config.get("pickup_payout_per_parcel", 1.0)),
-                return_rate=float(config.get("return_payout_per_parcel", 0.5)),
-                advance_percentage=float(advance_percentage),
-                advance_enabled=bool(advance_enabled),
+    elif active_view == "🧾 Invoice":
+        # Generate and display invoice (lazy — skipped unless this view is selected)
+        if display_df is not None and not display_df.empty:
+            invoice_html = build_cached_invoice_html(
+                display_df.to_csv(index=False),
+                base_delivery_payout,
+                gross_delivery_payout,
+                kpi_bonus,
+                attendance_bonus,
+                advance_payout,
+                advance_description,
+                json.dumps(penalty_breakdown, default=str),
+                socso_deduction,
+                socso_deduction_count,
+                overpaid_deduction,
+                overpaid_deduction_count,
+                reward_payout,
+                reward_count,
+                selected_dispatcher_name or selected_dispatcher_id,
+                selected_dispatcher_id,
+                config["currency_symbol"],
+                pickup_payout,
+                pickup_parcels,
+                return_payout,
+                return_count,
+                kpi_description,
+                attendance_desc,
+                total_awb,
+                float(config.get("pickup_payout_per_parcel", 1.0)),
+                float(config.get("return_payout_per_parcel", 0.5)),
+                float(advance_percentage),
+                bool(advance_enabled),
+                json.dumps(designated_driver_breakdown, default=str) if designated_driver_breakdown else "",
             )
 
             # Display invoice
@@ -4038,7 +4237,7 @@ Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M')}
                     **stretch_width_kwargs(st.download_button),
                 )
         else:
-            st.info("No invoice data available. Complete the calculation in the Payout Details tab first.")
+            st.info("No invoice data available for this dispatcher.")
 
     # # Configuration sidebar
     # st.sidebar.title("⚙️ Configuration")
