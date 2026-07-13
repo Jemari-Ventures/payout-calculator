@@ -1,8 +1,4 @@
-streamlit
-pandas
-altair
-requests
-sqlalchemy
-prophet
-psycopg2-binary
-plotly
+streamlit>=1.28,<2
+pandas>=2.0,<3
+altair>=5.0,<6
+requests>=2.31,<3

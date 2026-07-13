@@ -8,22 +8,17 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
+from sheet_schema import sheet_col
+
 PENALTY_DATE_COLUMNS: Dict[str, List[str]] = {
-    "duitnow": ["created_at", "date", "Date"],
-    "ldr": ["created_at", "date", "Date"],
+    "duitnow": ["date", "created_at", "Date"],
+    "ldr": ["declaration_time", "generation_time", "date", "created_at", "Date"],
     "fake_attempt": ["Date", "date", "created_at"],
-    "cod": ["created_at", "date", "Date"],
-    "binding": ["created_at", "date", "Date"],
+    "cod": ["date", "created_at", "Date"],
+    "binding": ["date", "created_at", "Date"],
     "pending_parcel": ["date", "created_at", "Date"],
     "parcel_lost": ["date", "created_at", "Date"],
-    "no_outbound_scan": [
-        "Scanning Time | Last",
-        "Scanning Time|Last",
-        "scanning_time_last",
-        "Scanning Time",
-        "date",
-        "created_at",
-    ],
+    "no_outbound_scan": ["scanning_time_last", "date"],
 }
 
 
@@ -127,32 +122,7 @@ def waybill_column_read_dtypes(columns) -> Dict[str, str]:
 
 
 def find_penalty_waybill_column(df: pd.DataFrame) -> Optional[str]:
-    col = find_column(
-        df,
-        [
-            "AWB No.",
-            "AWB No",
-            "AWB NO.",
-            "AWB NO",
-            "Waybill Number",
-            "waybill_number",
-            "Waybill",
-            "waybill",
-            "AWB",
-            "awb_no",
-        ],
-    )
-    if col is not None:
-        return col
-    for c in df.columns:
-        s = str(c).strip().lower().replace(" ", "")
-        if s in ("awbno", "awbno.", "waybillnumber", "waybillno") or s == "awb_no":
-            return c
-    for c in df.columns:
-        s = str(c).strip().lower()
-        if ("awb" in s and "no" in s) or "waybill" in s:
-            return c
-    return None
+    return sheet_col(df, "waybill_number") or find_column(df, ["waybill_number"])
 
 
 def find_pickup_commission_column(df: pd.DataFrame) -> Optional[str]:
@@ -200,14 +170,11 @@ def normalize_pickup_order_source(value) -> str:
 
 
 def find_pickup_order_source_column(df: pd.DataFrame) -> Optional[str]:
-    return find_column(df, ["Order Source", "order_source", "ORDER SOURCE", "Order source"])
+    return sheet_col(df, "order_source") or find_column(df, ["order_source"])
 
 
 def find_pickup_billing_weight_column(df: pd.DataFrame) -> Optional[str]:
-    return find_column(
-        df,
-        ["Billing Weight", "billing_weight", "Billing weight", "Weight", "weight", "weight_kg"],
-    )
+    return sheet_col(df, "billing_weight") or find_column(df, ["billing_weight"])
 
 
 def pickup_commission_for_source_weight(order_source, billing_weight=0.0) -> float:
@@ -267,27 +234,7 @@ def sum_pickup_commission(df: pd.DataFrame, *, fallback_rate: float = 1.0) -> fl
 
 def find_penalty_dispatcher_column(df: pd.DataFrame) -> Optional[str]:
     """Resolve dispatcher_id column on penalty sheets (DuitNow, LDR, COD, etc.)."""
-    col = find_column(
-        df,
-        [
-            "dispatcher_id",
-            "Dispatcher ID",
-            "Dispatcher Id",
-            "DISPATCHER ID",
-            "DispatcherID",
-        ],
-    )
-    if col is not None:
-        return col
-    for c in df.columns:
-        cl = str(c).strip().lower().replace(" ", "_")
-        if cl in ("dispatcher_id", "dispatcherid"):
-            return c
-    for c in df.columns:
-        cl = str(c).strip().lower()
-        if "dispatcher" in cl and "id" in cl:
-            return c
-    return None
+    return sheet_col(df, "dispatcher_id") or find_column(df, ["dispatcher_id", "pickup_dispatcher_id"])
 
 
 def find_employee_id_column(df: pd.DataFrame) -> Optional[str]:
@@ -314,26 +261,75 @@ def find_achieve_column(df: pd.DataFrame) -> Optional[str]:
     return None
 
 
+def filter_duitnow_penalty_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Keep DuitNow rows that qualify for penalty (legacy Achieve=FAIL when column exists)."""
+    if df is None or df.empty:
+        return df
+    achieve_col = find_achieve_column(df)
+    if achieve_col is None:
+        return df
+    return df[
+        df[achieve_col].astype(str).str.strip().str.upper() == "FAIL"
+    ].copy()
+
+
 def find_amount_column(df: pd.DataFrame) -> Optional[str]:
-    """Resolve amount column on hub/socso/overpaid/reward style sheets."""
-    return find_column(df, ["Amount", "amount", "AMOUNT"])
+    """Resolve amount column on socso/rental/reward/parcel-lost style sheets."""
+    return find_column(df, ["amount", "Amount", "AMOUNT"])
+
+
+def find_penalty_amount_column(df: pd.DataFrame) -> Optional[str]:
+    """Resolve penalty column on binding/hub/duitnow/attendance/pending-parcel sheets."""
+    col = find_column(df, ["penalty", "Penalty", "PENALTY", "PENALTY BINDING RM5"])
+    if col is not None:
+        return col
+    for c in df.columns:
+        cl = str(c).strip().lower()
+        if "penalty" in cl and "sum of" not in cl and "penalty_amount" not in cl:
+            return c
+    return None
+
+
+def find_penalty_amount_value_column(df: pd.DataFrame) -> Optional[str]:
+    """Resolve penalty_amount column (LDR, COD)."""
+    return find_column(
+        df,
+        ["penalty_amount", "Penalty Amount", "penalty amount", "PENALTY_AMOUNT"],
+    )
+
+
+def find_ldr_penalty_value_column(df: pd.DataFrame) -> Optional[str]:
+    """LDR sheets may expose penalty_amount and/or penalty — prefer penalty_amount."""
+    return find_penalty_amount_value_column(df) or find_penalty_amount_column(df) or find_amount_column(df)
+
+
+def find_cod_penalty_value_column(df: pd.DataFrame) -> Optional[str]:
+    """COD sheets use penalty_amount for the deduction total."""
+    return find_penalty_amount_value_column(df) or find_penalty_amount_column(df)
+
+
+def find_deduction_value_column(df: pd.DataFrame) -> Optional[str]:
+    """Resolve a monetary column that may be named amount, penalty_amount, or penalty."""
+    return (
+        find_amount_column(df)
+        or find_penalty_amount_value_column(df)
+        or find_penalty_amount_column(df)
+    )
 
 
 def find_reward_dispatcher_name_column(df: pd.DataFrame) -> Optional[str]:
-    """Resolve dispatcher_name on Reward sheet."""
-    return find_column(df, ["dispatcher_name", "Dispatcher Name", "Dispatcher name"])
+    return sheet_col(df, "dispatcher_name")
 
 
 def find_reward_employee_column(df: pd.DataFrame) -> Optional[str]:
-    """Resolve employee/dispatcher ID on Reward sheet (employee_id or dispatcher_id)."""
-    return find_employee_id_column(df) or find_penalty_dispatcher_column(df)
+    return sheet_col(df, "dispatcher_id")
 
 
 def preprocess_dispatcher_amount_penalty_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Normalize hub/socso/overpaid sheets: Dispatcher ID + Amount."""
+    """Normalize hub/socso/overpaid sheets: dispatcher_id + amount or penalty column."""
     df_processed = df.copy()
     dispatcher_id_col = find_penalty_dispatcher_column(df)
-    amount_col = find_amount_column(df)
+    amount_col = find_deduction_value_column(df)
 
     if dispatcher_id_col:
         df_processed["_dispatcher_id_normalized"] = df_processed[dispatcher_id_col].apply(
@@ -376,7 +372,7 @@ def sum_rounded_penalty_numeric_records(
         return float(sum(rounded_penalties)), len(records)
 
     amount_df = source_df if source_df is not None else records
-    amount_col = find_amount_column(amount_df)
+    amount_col = find_deduction_value_column(amount_df)
     if amount_col is None:
         return 0.0, 0
     amount_values = records[amount_col].apply(penalty_cell_to_decimal)
@@ -402,7 +398,7 @@ def build_dispatcher_amount_deduction_map(
         return {}
 
     disp_col = find_penalty_dispatcher_column(df)
-    amount_col = find_amount_column(df)
+    amount_col = find_deduction_value_column(df)
     if disp_col is None or amount_col is None:
         return {}
 
@@ -434,7 +430,7 @@ def sum_dispatcher_amount_penalty_float(
     rows = filter_rows_for_penalty_dispatcher(df, disp_col, dispatcher_id)
     if rows.empty:
         return 0.0, 0
-    amount_col = find_amount_column(df)
+    amount_col = find_deduction_value_column(df)
     if amount_col is None:
         return 0.0, 0
     amount_values = rows[amount_col].apply(penalty_cell_to_float)
@@ -464,7 +460,7 @@ def sum_all_dispatcher_amount_penalty(df: Optional[pd.DataFrame]) -> float:
         ]
         return float(sum(rounded_penalties))
 
-    amount_col = find_amount_column(df)
+    amount_col = find_deduction_value_column(df)
     if amount_col is None:
         return 0.0
     work = df.copy()
@@ -477,17 +473,6 @@ def sum_all_dispatcher_amount_penalty(df: Optional[pd.DataFrame]) -> float:
         for penalty in filtered["penalty_numeric"].tolist()
     ]
     return float(sum(rounded_penalties))
-
-
-def find_penalty_amount_column(df: pd.DataFrame) -> Optional[str]:
-    col = find_column(df, ["Penalty", "penalty", "PENALTY", "PENALTY BINDING RM5"])
-    if col is not None:
-        return col
-    for c in df.columns:
-        cl = str(c).strip().lower()
-        if "penalty" in cl and "sum of" not in cl:
-            return c
-    return None
 
 
 def extract_waybill_list(series: pd.Series) -> List[str]:
