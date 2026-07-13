@@ -4567,14 +4567,12 @@ def main():
                 if 'ldr' in penalty_data and penalty_data['ldr'] is not None and not penalty_data['ldr'].empty:
                     ldr_df = penalty_data['ldr']
                     ldr_date_col = None
-                    # Use created_at specifically for LDR penalty filtering
-                    if 'created_at' in ldr_df.columns:
-                        ldr_date_col = 'created_at'
+                    if 'pushed_time' in ldr_df.columns:
+                        ldr_date_col = 'pushed_time'
                     else:
-                        # Case-insensitive match for created_at only
                         for col in ldr_df.columns:
-                            col_lower = str(col).lower()
-                            if col_lower == "created_at":
+                            col_lower = str(col).lower().strip().replace(" ", "_")
+                            if col_lower == "pushed_time":
                                 ldr_date_col = col
                                 break
 
@@ -4591,7 +4589,7 @@ def main():
                         if initial_ldr_count != filtered_ldr_count:
                             st.info(f"⚠️ Filtered LDR penalty: {initial_ldr_count:,} → {filtered_ldr_count:,} records")
                     else:
-                        st.warning("⚠️ LDR penalty table has no 'created_at' column; penalties are not filtered by date range.")
+                        st.warning("⚠️ LDR penalty table has no 'pushed_time' column; penalties are not filtered by date range.")
 
                 # Filter Fake Attempt penalty
                 if 'fake_attempt' in penalty_data and penalty_data['fake_attempt'] is not None and not penalty_data['fake_attempt'].empty:

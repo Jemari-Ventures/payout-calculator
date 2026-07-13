@@ -24,8 +24,7 @@ SHEET_COLUMNS: Dict[str, List[str]] = {
         "dispatcher_id", "dispatcher_name", "cod_quantity", "duitnow_quantity", "target", "penalty",
     ],
     "ldr": [
-        "waybill_number", "penalty", "dispatcher_id",
-        "declaration_time", "generation_time",
+        "waybill_number", "penalty", "dispatcher_id", "pushed_time",
     ],
     "cod": [
         "date", "dispatcher_id", "dispatcher_name", "total_cod",
@@ -70,8 +69,8 @@ _HEADER_MAP: Dict[str, str] = {
     "duitnow_quantity": "duitnow_quantity",
     "target": "target",
     "penalty": "penalty",
-    "penalty_amount": "penalty",
-    "penalty amount": "penalty",
+    "pushed_time": "pushed_time",
+    "pushed time": "pushed_time",
     "declaration_time": "declaration_time",
     "generation_time": "generation_time",
     "date": "date",
@@ -102,13 +101,11 @@ def canonical_header(raw: str) -> str:
 
 
 def _penalty_source_priority(raw_col: str) -> int:
-    """Prefer the literal penalty header when legacy penalty_amount also exists."""
+    """Prefer the literal penalty header when duplicates exist."""
     key = _header_key(raw_col)
     if key == "penalty":
         return 0
-    if key in ("penalty_amount", "penalty amount"):
-        return 1
-    return 2
+    return 1
 
 
 def _coalesce_sheet_columns(df: pd.DataFrame) -> pd.DataFrame:

@@ -12,7 +12,7 @@ from sheet_schema import sheet_col
 
 PENALTY_DATE_COLUMNS: Dict[str, List[str]] = {
     "duitnow": ["date", "created_at", "Date"],
-    "ldr": ["declaration_time", "generation_time", "date", "created_at", "Date"],
+    "ldr": ["pushed_time"],
     "fake_attempt": ["Date", "date", "created_at"],
     "cod": ["date", "created_at", "Date"],
     "binding": ["date", "created_at", "Date"],
@@ -570,6 +570,24 @@ def _coerce_datetime_series(series: pd.Series) -> pd.Series:
             return pd.to_datetime(series, errors="coerce")
 
 
+def _coalesce_datetime_from_columns(
+    df: pd.DataFrame,
+    date_column_names: Sequence[str],
+) -> Optional[pd.Series]:
+    """Parse date columns in priority order; fill blanks from later columns."""
+    present: List[str] = []
+    for name in date_column_names:
+        found = find_column(df, [name])
+        if found is not None and found not in present:
+            present.append(found)
+    if not present:
+        return None
+    parsed = _coerce_datetime_series(df[present[0]])
+    for col in present[1:]:
+        parsed = parsed.fillna(_coerce_datetime_series(df[col]))
+    return parsed
+
+
 def filter_penalty_sheet_by_date(
     sheet_df: Optional[pd.DataFrame],
     start_date,
@@ -578,11 +596,10 @@ def filter_penalty_sheet_by_date(
 ) -> Optional[pd.DataFrame]:
     if sheet_df is None or sheet_df.empty:
         return sheet_df
-    date_col = find_column(sheet_df, list(date_column_names))
-    if date_col is None:
+    parsed = _coalesce_datetime_from_columns(sheet_df, date_column_names)
+    if parsed is None:
         return sheet_df
     work = sheet_df.copy()
-    parsed = _coerce_datetime_series(work[date_col])
     start_ts = pd.Timestamp(start_date).normalize()
     end_ts = pd.Timestamp(end_date).normalize() + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
     return work[(parsed >= start_ts) & (parsed <= end_ts)].copy()
