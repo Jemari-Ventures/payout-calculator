@@ -1,1 +1,3 @@
-3.11
+# Streamlit Community Cloud: Debian/apt packages only (one per line).
+# This file does NOT set the Python version.
+# Set Python in the Cloud app Advanced settings (prefer 3.11 or 3.12).

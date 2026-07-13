@@ -36,7 +36,7 @@ Create **two apps** in [share.streamlit.io](https://share.streamlit.io) pointing
 |---------|--------|
 | **Branch** | `deploy/dispatcher` |
 | **Main file path** | `app.py` *(or `payout-calculator/app.py` if repo root is parent)* |
-| **Python version** | `3.11` via `packages.txt` |
+| **Python version** | **3.11 or 3.12** in Cloud **Advanced settings** (not via `packages.txt`) |
 
 ### Management app
 
@@ -44,7 +44,10 @@ Create **two apps** in [share.streamlit.io](https://share.streamlit.io) pointing
 |---------|--------|
 | **Branch** | `deploy/management` |
 | **Main file path** | `management.py` *(or `payout-calculator/management.py`)* |
-| **Python version** | `3.11` via `packages.txt` |
+| **Python version** | **3.11 or 3.12** in Cloud **Advanced settings** (not via `packages.txt`) |
+
+> `packages.txt` is only for apt packages. Community Cloud ignores it for Python version.
+> To change Python after deploy: delete the app and redeploy, selecting the version under Advanced settings.
 
 Both apps share:
 
@@ -112,6 +115,7 @@ streamlit run management.py
 | Stale sheet data | Use **Clear cache & reload** in the dispatcher app sidebar |
 | `width` / `use_container_width` errors | `streamlit_compat.py` handles version differences |
 | Merge conflict markers in `requirements.txt` | Run `./scripts/sync-requirements.sh management` (or `dispatcher`), commit, redeploy |
+| `TypedDict ... unexpected keyword argument 'closed'` (Altair on Python 3.14) | Needs `altair>=6`. Push updated `requirements.txt`, then reboot. Prefer Cloud Python **3.11/3.12** (Advanced settings; redeploy if wrong) |
 
 **After every merge into a deploy branch**, always run the sync script — never commit `requirements.txt` with `<<<<<<<` markers.
 
