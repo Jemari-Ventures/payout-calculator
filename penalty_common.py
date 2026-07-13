@@ -392,14 +392,17 @@ def build_dispatcher_amount_deduction_map(
 
     work = df.copy()
     work["_dispatcher_id_normalized"] = work[disp_col].apply(normalize_id)
-    work["penalty_numeric"] = work[amount_col].apply(penalty_cell_to_decimal)
+    # Use float (not Decimal): groupby.sum() of Decimal yields object dtype and
+    # Series.round() fails on pandas/Python 3.14.
+    work["penalty_numeric"] = work[amount_col].apply(penalty_cell_to_float)
     work = work[work["penalty_numeric"] > 0].copy()
     if work.empty:
         return {}
 
     grouped = (
-        work.groupby("_dispatcher_id_normalized")["penalty_numeric"]
+        work.groupby("_dispatcher_id_normalized", sort=False)["penalty_numeric"]
         .sum()
+        .astype(float)
         .round(2)
     )
     return {str(key): float(value) for key, value in grouped.items() if key}
