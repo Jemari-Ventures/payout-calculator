@@ -279,42 +279,30 @@ def find_amount_column(df: pd.DataFrame) -> Optional[str]:
 
 
 def find_penalty_amount_column(df: pd.DataFrame) -> Optional[str]:
-    """Resolve penalty column on binding/hub/duitnow/attendance/pending-parcel sheets."""
+    """Resolve penalty column on binding/hub/duitnow/COD/LDR/attendance/pending-parcel sheets."""
     col = find_column(df, ["penalty", "Penalty", "PENALTY", "PENALTY BINDING RM5"])
     if col is not None:
         return col
     for c in df.columns:
         cl = str(c).strip().lower()
-        if "penalty" in cl and "sum of" not in cl and "penalty_amount" not in cl:
+        if "penalty" in cl and "sum of" not in cl:
             return c
     return None
 
 
-def find_penalty_amount_value_column(df: pd.DataFrame) -> Optional[str]:
-    """Resolve penalty_amount column (LDR, COD)."""
-    return find_column(
-        df,
-        ["penalty_amount", "Penalty Amount", "penalty amount", "PENALTY_AMOUNT"],
-    )
-
-
 def find_ldr_penalty_value_column(df: pd.DataFrame) -> Optional[str]:
-    """LDR sheets may expose penalty_amount and/or penalty — prefer penalty_amount."""
-    return find_penalty_amount_value_column(df) or find_penalty_amount_column(df) or find_amount_column(df)
+    """LDR sheets use the penalty column for the deduction total."""
+    return find_penalty_amount_column(df) or find_amount_column(df)
 
 
 def find_cod_penalty_value_column(df: pd.DataFrame) -> Optional[str]:
-    """COD sheets use penalty_amount for the deduction total."""
-    return find_penalty_amount_value_column(df) or find_penalty_amount_column(df)
+    """COD sheets use the penalty column for the deduction total."""
+    return find_penalty_amount_column(df)
 
 
 def find_deduction_value_column(df: pd.DataFrame) -> Optional[str]:
-    """Resolve a monetary column that may be named amount, penalty_amount, or penalty."""
-    return (
-        find_amount_column(df)
-        or find_penalty_amount_value_column(df)
-        or find_penalty_amount_column(df)
-    )
+    """Resolve a monetary column that may be named amount or penalty."""
+    return find_amount_column(df) or find_penalty_amount_column(df)
 
 
 def find_reward_dispatcher_name_column(df: pd.DataFrame) -> Optional[str]:

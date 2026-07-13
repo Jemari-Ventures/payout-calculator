@@ -24,12 +24,12 @@ SHEET_COLUMNS: Dict[str, List[str]] = {
         "dispatcher_id", "dispatcher_name", "cod_quantity", "duitnow_quantity", "target", "penalty",
     ],
     "ldr": [
-        "waybill_number", "penalty", "penalty_amount", "dispatcher_id",
+        "waybill_number", "penalty", "dispatcher_id",
         "declaration_time", "generation_time",
     ],
     "cod": [
         "date", "dispatcher_id", "dispatcher_name", "total_cod",
-        "receivable_amount", "uncollected_amount", "penalty_amount", "remark",
+        "receivable_amount", "uncollected_amount", "penalty", "remark",
     ],
     "binding": ["dispatcher_id", "dispatcher_name", "penalty"],
     "hub": ["dispatcher_id", "dispatcher_name", "penalty"],
@@ -70,8 +70,8 @@ _HEADER_MAP: Dict[str, str] = {
     "duitnow_quantity": "duitnow_quantity",
     "target": "target",
     "penalty": "penalty",
-    "penalty_amount": "penalty_amount",
-    "penalty amount": "penalty_amount",
+    "penalty_amount": "penalty",
+    "penalty amount": "penalty",
     "declaration_time": "declaration_time",
     "generation_time": "generation_time",
     "date": "date",
@@ -101,13 +101,58 @@ def canonical_header(raw: str) -> str:
     return key.replace(" ", "_").replace("|", "").replace("/", "_").strip("_")
 
 
+def _penalty_source_priority(raw_col: str) -> int:
+    """Prefer the literal penalty header when legacy penalty_amount also exists."""
+    key = _header_key(raw_col)
+    if key == "penalty":
+        return 0
+    if key in ("penalty_amount", "penalty amount"):
+        return 1
+    return 2
+
+
+def _coalesce_sheet_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Merge source columns that canonicalize to the same name (e.g. penalty + penalty_amount)."""
+    canon_groups: Dict[str, List[int]] = {}
+    for i, col in enumerate(df.columns):
+        canon = canonical_header(col)
+        canon_groups.setdefault(canon, []).append(i)
+
+    if all(len(indices) == 1 for indices in canon_groups.values()):
+        rename = {df.columns[i]: canon for canon, indices in canon_groups.items() for i in indices}
+        return df.rename(columns=rename)
+
+    out = pd.DataFrame(index=df.index)
+    for canon, indices in canon_groups.items():
+        if len(indices) == 1:
+            out[canon] = df.iloc[:, indices[0]]
+            continue
+
+        ordered = sorted(
+            indices,
+            key=lambda i: (
+                _penalty_source_priority(df.columns[i]) if canon == "penalty" else 0,
+                i,
+            ),
+        )
+        combined = df.iloc[:, ordered[0]]
+        for idx in ordered[1:]:
+            fallback = df.iloc[:, idx]
+            empty = combined.isna()
+            if combined.dtype == object:
+                stripped = combined.astype(str).str.strip()
+                empty = empty | stripped.eq("") | stripped.str.lower().eq("nan")
+            combined = combined.where(~empty, fallback)
+        out[canon] = combined
+    return out
+
+
 def standardize_sheet(df: Optional[pd.DataFrame], sheet_key: str) -> pd.DataFrame:
     """Rename headers to canonical names and keep only columns used by this sheet."""
     if df is None or df.empty:
         return pd.DataFrame()
 
-    rename = {col: canonical_header(col) for col in df.columns}
-    out = df.rename(columns=rename)
+    out = _coalesce_sheet_columns(df)
 
     wanted = SHEET_COLUMNS.get(sheet_key)
     if wanted:

@@ -556,6 +556,10 @@ def penalty_cell_to_decimal(value) -> Decimal:
     """Parse penalty/COD amount cells; blanks, placeholders, and bad text → 0 (no crash)."""
     if value is None:
         return Decimal("0")
+    if isinstance(value, pd.Series):
+        if value.empty:
+            return Decimal("0")
+        return penalty_cell_to_decimal(value.iloc[0])
     if isinstance(value, bool):
         return Decimal(int(value))
     if isinstance(value, Decimal):
@@ -2485,11 +2489,7 @@ class PayoutCalculator:
                 st.warning("⚠️ COD penalty dataframe is empty (may have been filtered out by date range)")
                 penalty_totals['cod'] = 0.0
             else:
-                penalty_col = None
-                for col in cod_df.columns:
-                    if col.lower() == 'penalty':
-                        penalty_col = col
-                        break
+                penalty_col = find_cod_penalty_value_column(cod_df)
 
                 if penalty_col:
                     # Filter to only include records with positive penalty amounts
