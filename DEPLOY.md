@@ -111,6 +111,9 @@ streamlit run management.py
 | App crashes / OOM on dispatcher | Ensure Cloud app uses **`deploy/dispatcher`**, not management branch |
 | Stale sheet data | Use **Clear cache & reload** in the dispatcher app sidebar |
 | `width` / `use_container_width` errors | `streamlit_compat.py` handles version differences |
+| Merge conflict markers in `requirements.txt` | Run `./scripts/sync-requirements.sh management` (or `dispatcher`), commit, redeploy |
+
+**After every merge into a deploy branch**, always run the sync script — never commit `requirements.txt` with `<<<<<<<` markers.
 
 ---
 
