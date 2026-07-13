@@ -16,10 +16,11 @@ def _supports_param(func, name: str) -> bool:
 
 def stretch_width_kwargs(func) -> Dict[str, Any]:
     """Full-width kwarg for charts, dataframes, buttons, etc."""
-    if _supports_param(func, "width"):
-        return {"width": "stretch"}
+    # Prefer use_container_width on older Streamlit (e.g. 1.37) where `width` is int-only.
     if _supports_param(func, "use_container_width"):
         return {"use_container_width": True}
+    if _supports_param(func, "width"):
+        return {"width": "stretch"}
     return {}
 
 
