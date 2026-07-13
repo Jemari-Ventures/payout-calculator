@@ -581,6 +581,22 @@ def dedupe_no_outbound_scan_by_awb(records: pd.DataFrame, source_df: pd.DataFram
     return work.drop_duplicates(subset=["_awb_norm"], keep="first")
 
 
+def _coerce_datetime_series(series: pd.Series) -> pd.Series:
+    """Parse mixed date formats without pandas format-inference warnings."""
+    try:
+        return pd.to_datetime(series, errors="coerce", format="mixed")
+    except (TypeError, ValueError):
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="Could not infer format.*",
+                category=UserWarning,
+            )
+            return pd.to_datetime(series, errors="coerce")
+
+
 def filter_penalty_sheet_by_date(
     sheet_df: Optional[pd.DataFrame],
     start_date,
@@ -593,7 +609,7 @@ def filter_penalty_sheet_by_date(
     if date_col is None:
         return sheet_df
     work = sheet_df.copy()
-    parsed = pd.to_datetime(work[date_col], errors="coerce")
+    parsed = _coerce_datetime_series(work[date_col])
     start_ts = pd.Timestamp(start_date).normalize()
     end_ts = pd.Timestamp(end_date).normalize() + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
     return work[(parsed >= start_ts) & (parsed <= end_ts)].copy()

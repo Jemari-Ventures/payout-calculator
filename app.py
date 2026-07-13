@@ -47,6 +47,7 @@ from penalty_common import (
     sum_benefit_deduction_float,
     sum_dispatcher_amount_penalty_float,
 )
+from streamlit_compat import render_html, stretch_width_kwargs
 
 # =============================================================================
 # COLOR SCHEME CONSTANTS
@@ -3546,7 +3547,6 @@ def main():
             st.subheader("📅 Daily Delivery Breakdown")
             st.dataframe(
                 display_df,
-                use_container_width=True,
                 hide_index=True,
                 column_config={
                     "Date": st.column_config.DateColumn("Date", format="DD/MM/YYYY"),
@@ -3554,7 +3554,8 @@ def main():
                     "Tier": "Tier",
                     "Payout Rate": "Rate",
                     "Payout": st.column_config.TextColumn("Payout")
-                }
+                },
+                **stretch_width_kwargs(st.dataframe),
             )
 
             # Display bonuses and penalties
@@ -3670,9 +3671,9 @@ def main():
                     # Display the filtered pickup dataframe
                     st.dataframe(
                         display_pickup_df,
-                        use_container_width=True,
                         hide_index=True,
-                        column_config=column_config if column_config else None
+                        column_config=column_config if column_config else None,
+                        **stretch_width_kwargs(st.dataframe),
                     )
             else:
                 with st.expander("📦 Pickup Details", expanded=False):
@@ -3735,9 +3736,9 @@ def main():
                     # Display the filtered return dataframe
                     st.dataframe(
                         display_return_df,
-                        use_container_width=True,
                         hide_index=True,
-                        column_config=column_config if column_config else None
+                        column_config=column_config if column_config else None,
+                        **stretch_width_kwargs(st.dataframe),
                     )
             else:
                 with st.expander("📦 Return Details", expanded=False):
@@ -3869,12 +3870,12 @@ def main():
                 col1, col2 = st.columns(2)
 
                 with col1:
-                    st.altair_chart(charts.get('parcels_payout'), use_container_width=True)
+                    st.altair_chart(charts.get('parcels_payout'), **stretch_width_kwargs(st.altair_chart))
 
                 with col2:
-                    st.altair_chart(charts.get('performance_scatter'), use_container_width=True)
+                    st.altair_chart(charts.get('performance_scatter'), **stretch_width_kwargs(st.altair_chart))
 
-                st.altair_chart(charts.get('payout_trend'), use_container_width=True)
+                st.altair_chart(charts.get('payout_trend'), **stretch_width_kwargs(st.altair_chart))
 
                 # Additional statistics
                 st.subheader("📊 Performance Statistics")
@@ -3938,7 +3939,7 @@ def main():
             )
 
             # Display invoice
-            st.components.v1.html(invoice_html, height=1200, scrolling=True)
+            render_html(invoice_html, height=1200, scrolling=True)
 
             # Generate date range string for file names
             date_range_str = f"{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}"
@@ -3954,7 +3955,7 @@ def main():
                     data=invoice_html,
                     file_name=f"invoice_{selected_dispatcher_id}_{date_range_str}.html",
                     mime="text/html",
-                    use_container_width=True
+                    **stretch_width_kwargs(st.download_button),
                 )
 
             with col2:
@@ -3965,7 +3966,7 @@ def main():
                     data=csv_data,
                     file_name=f"breakdown_{selected_dispatcher_id}_{date_range_str}.csv",
                     mime="text/csv",
-                    use_container_width=True
+                    **stretch_width_kwargs(st.download_button),
                 )
 
             with col3:
@@ -4034,7 +4035,7 @@ Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M')}
                     data=summary_text,
                     file_name=f"summary_{selected_dispatcher_id}_{date_range_str}.txt",
                     mime="text/plain",
-                    use_container_width=True
+                    **stretch_width_kwargs(st.download_button),
                 )
         else:
             st.info("No invoice data available. Complete the calculation in the Payout Details tab first.")
@@ -4042,7 +4043,7 @@ Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M')}
     # # Configuration sidebar
     # st.sidebar.title("⚙️ Configuration")
 
-    # if st.sidebar.button("🔄 Reload Data", use_container_width=True):
+    # if st.sidebar.button("🔄 Reload Data", width="stretch"):
     #     st.cache_data.clear()
     #     st.rerun()
 
@@ -4055,7 +4056,7 @@ Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M')}
     # # Configuration editor
     # st.sidebar.subheader("⚙️ Edit Configuration")
 
-    # if st.sidebar.button("Edit Configuration", use_container_width=True):
+    # if st.sidebar.button("Edit Configuration", width="stretch"):
     #     # Open configuration in a modal or new page
     #     st.session_state.edit_config = True
 
@@ -4095,14 +4096,14 @@ Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M')}
     #         # Save configuration
     #         col1, col2 = st.columns(2)
     #         with col1:
-    #             if st.button("💾 Save", use_container_width=True):
+    #             if st.button("💾 Save", width="stretch"):
     #                 config["data_source"]["gsheet_url"] = new_gsheet_url
     #                 if Config.save(config):
     #                     st.success("Configuration saved!")
     #                     st.cache_data.clear()
     #                     st.rerun()
     #         with col2:
-    #             if st.button("❌ Cancel", use_container_width=True):
+    #             if st.button("❌ Cancel", width="stretch"):
     #                 st.session_state.edit_config = False
     #                 st.rerun()
 

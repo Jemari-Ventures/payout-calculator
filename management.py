@@ -43,6 +43,7 @@ from penalty_common import (
     sum_all_dispatcher_amount_penalty,
     sum_rounded_penalty_numeric_records,
 )
+from streamlit_compat import render_html, stretch_width_kwargs
 
 # =============================================================================
 # CONSTANTS
@@ -5079,13 +5080,13 @@ def main():
         col1, col2 = st.columns([1, 1])
         with col1:
             if 'daily_trend' in charts:
-                st.altair_chart(charts['daily_trend'], use_container_width=True)
+                st.altair_chart(charts['daily_trend'], **stretch_width_kwargs(st.altair_chart))
             if 'performers' in charts:
-                st.altair_chart(charts['performers'], use_container_width=True)
+                st.altair_chart(charts['performers'], **stretch_width_kwargs(st.altair_chart))
 
         with col2:
             if 'payout_dist' in charts:
-                st.altair_chart(charts['payout_dist'], use_container_width=True)
+                st.altair_chart(charts['payout_dist'], **stretch_width_kwargs(st.altair_chart))
 
     # Top Performers and Top Penalties side by side
     with tab_overview:
@@ -5234,7 +5235,7 @@ def main():
             # Reorder the display dataframe
             display_df_reordered = display_df[final_columns]
 
-            st.dataframe(display_df_reordered, use_container_width=True, hide_index=True)
+            st.dataframe(display_df_reordered, hide_index=True, **stretch_width_kwargs(st.dataframe))
 
         # Pickup Parcels Details
         if pickup_df is not None and not pickup_df.empty:
@@ -5261,13 +5262,13 @@ def main():
                     ).reset_index()
                     pickup_summary = pickup_summary.rename(columns={pickup_dispatcher_col: 'Dispatcher ID', 'parcel_count': 'Pickup Parcels'})
                     pickup_summary = pickup_summary.sort_values('Pickup Parcels', ascending=False)
-                    st.dataframe(pickup_summary, use_container_width=True, hide_index=True)
+                    st.dataframe(pickup_summary, hide_index=True, **stretch_width_kwargs(st.dataframe))
 
                     # Show full details
                     st.markdown("#### Full Pickup Data")
-                    st.dataframe(pickup_df, use_container_width=True, hide_index=True)
+                    st.dataframe(pickup_df, hide_index=True, **stretch_width_kwargs(st.dataframe))
                 else:
-                    st.dataframe(pickup_df, use_container_width=True, hide_index=True)
+                    st.dataframe(pickup_df, hide_index=True, **stretch_width_kwargs(st.dataframe))
 
         # Return Parcels Details
         if return_df is not None and not return_df.empty:
@@ -5297,13 +5298,13 @@ def main():
                     ).reset_index()
                     return_summary = return_summary.rename(columns={'_key': 'Dispatcher ID', 'parcel_count': 'Return Parcels'})
                     return_summary = return_summary.sort_values('Return Parcels', ascending=False)
-                    st.dataframe(return_summary, use_container_width=True, hide_index=True)
+                    st.dataframe(return_summary, hide_index=True, **stretch_width_kwargs(st.dataframe))
 
                     # Show full details
                     st.markdown("#### Full Return Data")
-                    st.dataframe(return_df, use_container_width=True, hide_index=True)
+                    st.dataframe(return_df, hide_index=True, **stretch_width_kwargs(st.dataframe))
                 else:
-                    st.dataframe(return_df, use_container_width=True, hide_index=True)
+                    st.dataframe(return_df, hide_index=True, **stretch_width_kwargs(st.dataframe))
 
         # Penalty Details Section
         if 'Penalty Parcels' in numeric_df.columns and numeric_df['Penalty Parcels'].sum() > 0:
@@ -5341,7 +5342,7 @@ def main():
 
                 if penalty_rows:
                     penalty_table = pd.DataFrame(penalty_rows)
-                    st.dataframe(penalty_table, use_container_width=True, hide_index=True)
+                    st.dataframe(penalty_table, hide_index=True, **stretch_width_kwargs(st.dataframe))
                 else:
                     st.info("No penalty waybill numbers available")
 
@@ -5396,7 +5397,7 @@ def main():
                             value_column='total_parcels',
                             y_title='Parcels'
                         )
-                        st.altair_chart(forecast_chart, use_container_width=True)
+                        st.altair_chart(forecast_chart, **stretch_width_kwargs(st.altair_chart))
 
                     else:
                         st.warning("Could not generate parcel forecast.")
@@ -5449,7 +5450,7 @@ def main():
                                 value_column='total_payout',
                                 y_title=f'Payout ({currency})'
                             )
-                            st.altair_chart(payout_forecast_chart, use_container_width=True)
+                            st.altair_chart(payout_forecast_chart, **stretch_width_kwargs(st.altair_chart))
 
                             # Combined forecast table and insights in expander
                             with st.expander("📅 Forecast Details", expanded=False):
@@ -5487,7 +5488,7 @@ def main():
                                         lambda x: f"{currency} {x:,.2f}"
                                     )
 
-                                    st.dataframe(combined_forecast, use_container_width=True, hide_index=True)
+                                    st.dataframe(combined_forecast, hide_index=True, **stretch_width_kwargs(st.dataframe))
 
                                 # Forecast insights
                                 st.markdown("##### 🔮 Forecast Insights")
@@ -5532,14 +5533,14 @@ def main():
         st.markdown("---")
         st.subheader("📄 Invoice Generation")
         invoice_html = InvoiceGenerator.build_invoice_html(display_df, numeric_df, total_payout, currency, pickup_payout_per_parcel)
-        st.components.v1.html(invoice_html, height=1200, scrolling=True)
+        render_html(invoice_html, height=1200, scrolling=True)
 
         st.download_button(
             label="📥 Download Invoice (HTML)",
             data=invoice_html.encode("utf-8"),
             file_name=f"invoice_{datetime.now().strftime('%Y%m%d')}.html",
             mime="text/html",
-            use_container_width=True
+            **stretch_width_kwargs(st.download_button),
         )
 
     with tab_details:
