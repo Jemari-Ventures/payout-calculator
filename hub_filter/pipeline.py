@@ -1,6 +1,7 @@
 """Hub filter pipeline: JMS Excel → Template JMR–shaped workbook."""
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -10,6 +11,33 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import pandas as pd
 
 from hub_filter.contract import COLUMN_ALIASES, OUTPUT_SHEETS, contract_columns
+
+
+def _is_wildcard_pass_through(filter_values: Sequence[str]) -> bool:
+    """True when config means 'keep all rows' (no dispatcher ID filter)."""
+    if not filter_values:
+        return True
+    tokens = [str(v).strip() for v in filter_values if str(v).strip()]
+    if not tokens:
+        return True
+    return any(token in ("*", "**") for token in tokens)
+
+
+def row_matches_dispatcher_filters(value: Any, filter_values: Sequence[str]) -> bool:
+    """Match a dispatcher ID against exact IDs and/or fnmatch patterns (e.g. PEN364*)."""
+    text = str(value).strip() if pd.notna(value) else ""
+    if not text:
+        return False
+    for pattern in filter_values:
+        pat = str(pattern).strip()
+        if not pat:
+            continue
+        if any(ch in pat for ch in "*?[]"):
+            if fnmatch.fnmatch(text, pat):
+                return True
+        elif text == pat:
+            return True
+    return False
 
 
 def _normalize_col_name(name: str) -> str:
@@ -93,8 +121,12 @@ def process_task(
                 f"Available: {list(df.columns)}"
             )
             filtered = df.iloc[0:0].copy()
+        elif _is_wildcard_pass_through(task_values):
+            filtered = df.copy()
+            messages.append(f"ℹ {sheet_tab}: dispatcher filter is wildcard/empty — keeping all rows.")
         else:
-            filtered = df[df[filter_col].astype(str).isin([str(v) for v in task_values])].copy()
+            mask = df[filter_col].apply(lambda v: row_matches_dispatcher_filters(v, task_values))
+            filtered = df[mask].copy()
 
     if sheet_tab in OUTPUT_SHEETS:
         shaped = build_contract_frame(filtered, sheet_tab, messages)
@@ -115,7 +147,8 @@ def load_hub_config(config_path: Path) -> Dict[str, Any]:
 
 def run_hub_filter(config_path: Path, *, max_workers: Optional[int] = None) -> Path:
     cfg = load_hub_config(config_path)
-    dispatcher_ids = cfg["dispatcher_ids"]
+    # Omit, [], ["*"], or patterns like "PEN364*" are supported.
+    dispatcher_ids = cfg.get("dispatcher_ids", ["*"])
     output_file = Path(cfg["output_file"])
     tasks: Dict[str, Dict[str, Any]] = cfg["tasks"]
     if not tasks:

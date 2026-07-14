@@ -1,71 +1,27 @@
 {
   "hub_id": "PEN364",
-  "dispatcher_ids": ["PEN3645579"],
-  "output_file": "/Users/UMARI.ZULKIFLI/Documents/Jemari Ventures/Worksheet/JMR MAY 2026-PEN364.xlsx",
+  "dispatcher_ids": ["PEN364*"],
+  "output_file": "/Users/UMARI.ZULKIFLI/Documents/Jemari Ventures/Worksheet/ECP JULY 2026-PEN353.xlsx",
   "tasks": {
     "Dispatch": {
-      "file": "/Users/UMARI.ZULKIFLI/Documents/Jemari Ventures/Worksheet/KOMISYEN EARNING PEN364 MAY 2026 (1).xlsx",
-      "sheet": "DELIVERY KOMISYEN",
+      "file": "/Users/UMARI.ZULKIFLI/Documents/Jemari Ventures/Worksheet/PEN364 Dispatch July 2026.xlsx",
+      "sheet": "sheet0",
       "header": 0,
       "column": "Dispatcher ID"
     },
     "Pickup": {
-      "file": "/Users/UMARI.ZULKIFLI/Documents/Jemari Ventures/Worksheet/KOMISYEN EARNING PEN364 MAY 2026 (1).xlsx",
-      "sheet": "PICKUP KOMISYEN",
+      "file": "/Users/UMARI.ZULKIFLI/Documents/Jemari Ventures/Worksheet/PEN364 Pickup July 2026.xlsx",
+      "sheet": "sheet1",
       "header": 0,
       "column": "Pick Up Dispatcher ID"
     },
-    "DuitNow": {
-      "file": "/Users/UMARI.ZULKIFLI/Documents/Jemari Ventures/Worksheet/DEDUCTION PEN364 MAY 2026.xlsx",
-      "sheet": "DUITNOW PENALTY",
-      "header": 1,
-      "column": "Dispatcher ID",
-      "rename_columns": {
-        "Volume | Delivery Signature": "cod_quantity",
-        "DuitNow Usage": "duitnow_quantity",
-        "Target 23%": "target",
-        "PENALTY (RM)": "penalty"
-      }
-    },
-    "LDR": {
-      "file": "/Users/UMARI.ZULKIFLI/Documents/Jemari Ventures/Worksheet/DEDUCTION PEN364 MAY 2026.xlsx",
-      "sheet": "LD&R",
+    "Return": {
+      "file": "/Users/UMARI.ZULKIFLI/Documents/Jemari Ventures/Worksheet/PEN364 Return July 2026.xlsx",
+      "sheet": "Shipping AWB",
       "header": 0,
-      "column": "Dispatcher ID"
-    },
-    "Fake Attempt": {
-      "file": "/Users/UMARI.ZULKIFLI/Documents/Jemari Ventures/Worksheet/DEDUCTION PEN364 MAY 2026.xlsx",
-      "sheet": "FAKE ATTEMPT",
-      "header": 0,
-      "column": "Dispatcher ID"
-    },
-    "COD": {
-      "file": "/Users/UMARI.ZULKIFLI/Documents/Jemari Ventures/Worksheet/DEDUCTION PEN364 MAY 2026.xlsx",
-      "sheet": "PENDING COD",
-      "header": 1,
       "column": "Dispatcher ID",
       "rename_columns": {
-        "ID STAFF": "Dispatcher ID"
-      }
-    },
-    "Binding": {
-      "file": "/Users/UMARI.ZULKIFLI/Documents/Jemari Ventures/Worksheet/DEDUCTION PEN364 MAY 2026.xlsx",
-      "sheet": "BINDING",
-      "header": 1,
-      "column": "Dispatcher ID",
-      "rename_columns": {
-        "业务员编码": "Dispatcher ID",
-        "业务员名称": "Dispatcher Name",
-        "PENALTY BINDING RM5": "penalty"
-      }
-    },
-    "No Outbound Scan": {
-      "file": "/Users/UMARI.ZULKIFLI/Documents/Jemari Ventures/Worksheet/DEDUCTION PEN364 MAY 2026.xlsx",
-      "sheet": "NO OUTBOUND SCANNING",
-      "header": 1,
-      "column": "Dispatcher ID",
-      "rename_columns": {
-        "Operator | Last": "Dispatcher ID"
+        "Dispatcher No. | Delivery": "Dispatcher ID"
       }
     }
   }

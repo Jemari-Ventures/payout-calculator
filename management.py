@@ -630,12 +630,75 @@ def split_route_penalty_pool(pool_total: float, dispatcher_ids) -> dict:
 
 
 def clean_dispatcher_name(name: str) -> str:
-    """Remove prefixes from dispatcher names."""
+    """Remove JMR / PT / JMR PT and legacy hub prefixes from dispatcher names."""
     cleaned = str(name).strip()
-    for prefix in DISPATCHER_PREFIXES:
-        if cleaned.startswith(prefix):
-            return cleaned[len(prefix):].lstrip(' -')
-    return cleaned
+    if not cleaned or cleaned.lower() in ('nan', 'none', 'unknown'):
+        return cleaned
+
+    prefix_tokens = ('JMR PT', 'JMR', 'PT', 'ECP', 'AF', 'PEN', 'KUL', 'JHR')
+
+    changed = True
+    while changed:
+        changed = False
+        upper = cleaned.upper()
+        for prefix in prefix_tokens:
+            if upper.startswith(prefix.upper()):
+                cleaned = cleaned[len(prefix):].lstrip(' -')
+                changed = True
+                break
+    return cleaned.strip()
+
+
+def build_dispatcher_name_map(df: Optional[pd.DataFrame]) -> Dict[str, str]:
+    """Build normalized dispatcher ID -> cleaned name from a delivery sheet."""
+    if df is None or df.empty:
+        return {}
+
+    disp_col = find_dispatch_id_column(df)
+    if not disp_col:
+        return {}
+
+    name_col = find_column(df, 'dispatcher_name')
+    if not name_col:
+        for col in df.columns:
+            col_lower = str(col).strip().lower()
+            if col_lower in ('dispatcher_name', 'dispatcher name', 'rider_name', 'rider name'):
+                name_col = col
+                break
+    if not name_col:
+        return {}
+
+    name_map: Dict[str, str] = {}
+    for _, row in df[[disp_col, name_col]].drop_duplicates(subset=[disp_col]).iterrows():
+        key = normalize_dispatcher_id(row[disp_col])
+        if not key:
+            continue
+        raw_name = row[name_col]
+        if pd.isna(raw_name):
+            continue
+        raw_text = str(raw_name).strip()
+        if not raw_text or raw_text.lower() in ('nan', 'none', 'unknown'):
+            continue
+        cleaned = clean_dispatcher_name(raw_text)
+        if cleaned:
+            name_map[key] = cleaned
+    return name_map
+
+
+def lookup_dispatcher_name(
+    disp_id,
+    name_map: Optional[Dict[str, str]],
+    fallback: str = 'Unknown',
+) -> str:
+    """Resolve dispatcher display name from dispatch sheet map."""
+    key = normalize_dispatcher_id(disp_id)
+    if name_map and key and name_map.get(key):
+        return name_map[key]
+
+    fb = '' if fallback is None or pd.isna(fallback) else str(fallback).strip()
+    if fb and fb.lower() not in ('unknown', 'nan', 'none', ''):
+        return clean_dispatcher_name(fb)
+    return 'Unknown'
 
 
 def normalize_weight(series: pd.Series) -> pd.Series:
@@ -714,7 +777,7 @@ class DataSource:
                     or "invalid" in error_sample
                 ):
                     return pd.DataFrame()
-            raise
+            return pd.DataFrame()
 
         resp_content = resp.content
         if sheet_name and str(sheet_name).strip():
@@ -728,13 +791,16 @@ class DataSource:
             ):
                 return pd.DataFrame()
 
-        df = pd.read_csv(
-            io.BytesIO(resp_content),
-            keep_default_na=False,
-            na_values=[],
-            encoding='utf-8',
-            low_memory=False
-        )
+        try:
+            df = pd.read_csv(
+                io.BytesIO(resp_content),
+                keep_default_na=False,
+                na_values=[],
+                encoding='utf-8',
+                low_memory=False
+            )
+        except Exception:
+            return pd.DataFrame()
 
         waybill_col = find_column(df, "waybill")
         if waybill_col:
@@ -786,6 +852,29 @@ class DataSource:
             .astype(str)
         )
         return candidate_sample.equals(dispatch_sample)
+
+    @staticmethod
+    def _read_optional_sheet_without_dispatch_fallback(
+        gsheet_url: str,
+        sheet_name: str,
+        dispatch_sheet_name: str = "Dispatch",
+    ) -> pd.DataFrame:
+        """Read an optional tab; return empty when missing or Dispatch fallback."""
+        try:
+            sheet_df = DataSource.read_google_sheet(gsheet_url, sheet_name=sheet_name)
+        except Exception:
+            return pd.DataFrame()
+        if sheet_df is None or sheet_df.empty:
+            return pd.DataFrame()
+
+        try:
+            dispatch_df = DataSource.read_google_sheet(gsheet_url, sheet_name=dispatch_sheet_name)
+        except Exception:
+            return pd.DataFrame()
+
+        if DataSource._is_fallback_dispatch_sheet(sheet_df, dispatch_df):
+            return pd.DataFrame()
+        return sheet_df
 
     @staticmethod
     def _get_postgres_connection():
@@ -1107,23 +1196,22 @@ class DataSource:
 
             gsheet_url = data_source.get("gsheet_url")
             if not gsheet_url:
-                st.warning("Google Sheet URL not provided for penalty data")
                 return None
             dispatch_sheet = DataSource._get_excel_sheet_name(config, "dispatch", "Dispatch")
-            dispatch_df = DataSource.read_google_sheet(gsheet_url, sheet_name=dispatch_sheet)
+            try:
+                dispatch_df = DataSource.read_google_sheet(gsheet_url, sheet_name=dispatch_sheet)
+            except Exception:
+                dispatch_df = pd.DataFrame()
             for key, sheet_name in sheet_map.items():
                 try:
                     df = DataSource.read_google_sheet(gsheet_url, sheet_name=sheet_name)
                     if df.empty:
                         continue
                     if DataSource._is_fallback_dispatch_sheet(df, dispatch_df):
-                        st.warning(
-                            f"Skipped {key} penalty sheet '{sheet_name}' — tab missing or returned Dispatch data."
-                        )
                         continue
                     penalty_data[key] = standardize_sheet(df, key)
-                except Exception as exc:
-                    st.warning(f"Could not load {key} penalty data from Excel sheet '{sheet_name}': {exc}")
+                except Exception:
+                    continue
 
             return penalty_data if penalty_data else None
 
@@ -1138,64 +1226,64 @@ class DataSource:
             duitnow_df = DataSource.read_postgres_table(engine, 'duitnow_penalty')
             if not duitnow_df.empty:
                 penalty_data['duitnow'] = duitnow_df
-        except Exception as exc:
-            st.warning(f"Could not load DuitNow penalty data: {exc}")
+        except Exception:
+            pass
 
         # Load LDR penalty
         try:
             ldr_df = DataSource.read_postgres_table(engine, 'ldr_penalty')
             if not ldr_df.empty:
                 penalty_data['ldr'] = ldr_df
-        except Exception as exc:
-            st.warning(f"Could not load LDR penalty data: {exc}")
+        except Exception:
+            pass
 
         # Load Fake Attempt penalty
         try:
             fake_attempt_df = DataSource.read_postgres_table(engine, 'fake_attempt_penalty')
             if not fake_attempt_df.empty:
                 penalty_data['fake_attempt'] = fake_attempt_df
-        except Exception as exc:
-            st.warning(f"Could not load Fake Attempt penalty data: {exc}")
+        except Exception:
+            pass
 
         # Load COD penalty
         try:
             cod_df = DataSource.read_postgres_table(engine, 'cod_penalty')
             if not cod_df.empty:
                 penalty_data['cod'] = cod_df
-        except Exception as exc:
-            st.warning(f"Could not load COD penalty data: {exc}")
+        except Exception:
+            pass
 
         # Load Binding penalty
         try:
             binding_df = DataSource.read_postgres_table(engine, 'binding_penalty')
             if not binding_df.empty:
                 penalty_data['binding'] = binding_df
-        except Exception as exc:
-            st.warning(f"Could not load Binding penalty data: {exc}")
+        except Exception:
+            pass
 
         # Load Pending Parcel penalty
         try:
             pending_parcel_df = DataSource.read_postgres_table(engine, 'pending_parcel_penalty')
             if not pending_parcel_df.empty:
                 penalty_data['pending_parcel'] = pending_parcel_df
-        except Exception as exc:
-            st.warning(f"Could not load Pending Parcel penalty data: {exc}")
+        except Exception:
+            pass
 
         # Load Parcel Lost penalty (waybill_number, Dispatcher ID — per-parcel rate from config)
         try:
             parcel_lost_df = DataSource.read_postgres_table(engine, 'parcel_lost_penalty')
             if not parcel_lost_df.empty:
                 penalty_data['parcel_lost'] = parcel_lost_df
-        except Exception as exc:
-            st.warning(f"Could not load Parcel Lost penalty data: {exc}")
+        except Exception:
+            pass
 
         # Load No Outbound Scan penalty
         try:
             no_outbound_scan_df = DataSource.read_postgres_table(engine, 'no_outbound_scan_penalty')
             if not no_outbound_scan_df.empty:
                 penalty_data['no_outbound_scan'] = no_outbound_scan_df
-        except Exception as exc:
-            st.warning(f"Could not load No Outbound Scan penalty data: {exc}")
+        except Exception:
+            pass
 
         return penalty_data if penalty_data else None
 
@@ -1208,12 +1296,17 @@ class DataSource:
         if source_type == "excel":
             try:
                 sheet_name = DataSource._get_excel_sheet_name(config, "pickup", "Pickup")
+                dispatch_sheet_name = DataSource._get_excel_sheet_name(config, "dispatch", "Dispatch")
                 gsheet_url = data_source.get("gsheet_url")
                 if not gsheet_url:
                     return None
-                return DataSource.read_google_sheet(gsheet_url, sheet_name=sheet_name)
-            except Exception as exc:
-                st.warning(f"Could not load pickup data from Excel sheet '{sheet_name}': {exc}")
+                pickup_df = DataSource._read_optional_sheet_without_dispatch_fallback(
+                    gsheet_url, sheet_name=sheet_name, dispatch_sheet_name=dispatch_sheet_name
+                )
+                if pickup_df.empty:
+                    return pd.DataFrame()
+                return standardize_sheet(pickup_df, "pickup")
+            except Exception:
                 return None
 
         engine = DataSource.get_postgres_engine()
@@ -1225,8 +1318,7 @@ class DataSource:
             pickup_table = data_source.get("pickup_table", "pickup")
             df = DataSource.read_postgres_table(engine, pickup_table)
             return df
-        except Exception as exc:
-            st.warning(f"Could not load pickup data from PostgreSQL table '{pickup_table}': {exc}")
+        except Exception:
             return None
 
     @staticmethod
@@ -1242,13 +1334,13 @@ class DataSource:
                 gsheet_url = data_source.get("gsheet_url")
                 if not gsheet_url:
                     return None
-                return_df = DataSource.read_google_sheet(gsheet_url, sheet_name=sheet_name)
-                dispatch_df = DataSource.read_google_sheet(gsheet_url, sheet_name=dispatch_sheet_name)
-                if DataSource._is_fallback_dispatch_sheet(return_df, dispatch_df):
+                return_df = DataSource._read_optional_sheet_without_dispatch_fallback(
+                    gsheet_url, sheet_name=sheet_name, dispatch_sheet_name=dispatch_sheet_name
+                )
+                if return_df.empty:
                     return pd.DataFrame()
-                return return_df
-            except Exception as exc:
-                st.warning(f"Could not load return data from Excel sheet '{sheet_name}': {exc}")
+                return standardize_sheet(return_df, "return")
+            except Exception:
                 return None
 
         engine = DataSource.get_postgres_engine()
@@ -1259,8 +1351,7 @@ class DataSource:
         try:
             df = DataSource.read_postgres_table(engine, 'return')
             return df
-        except Exception as exc:
-            st.warning(f"Could not load return data from PostgreSQL table 'return': {exc}")
+        except Exception:
             return None
 
     @staticmethod
@@ -1272,12 +1363,17 @@ class DataSource:
         if source_type == "excel":
             try:
                 sheet_name = DataSource._get_excel_sheet_name(config, "bulky", "Bulky")
+                dispatch_sheet_name = DataSource._get_excel_sheet_name(config, "dispatch", "Dispatch")
                 gsheet_url = data_source.get("gsheet_url")
                 if not gsheet_url:
                     return None
-                return DataSource.read_google_sheet(gsheet_url, sheet_name=sheet_name)
-            except Exception as exc:
-                st.warning(f"Could not load bulky data from Excel sheet '{sheet_name}': {exc}")
+                bulky_df = DataSource._read_optional_sheet_without_dispatch_fallback(
+                    gsheet_url, sheet_name=sheet_name, dispatch_sheet_name=dispatch_sheet_name
+                )
+                if bulky_df.empty:
+                    return pd.DataFrame()
+                return standardize_sheet(bulky_df, "bulky")
+            except Exception:
                 return None
 
         engine = DataSource.get_postgres_engine()
@@ -1286,8 +1382,7 @@ class DataSource:
 
         try:
             return DataSource.read_postgres_table(engine, "bulky")
-        except Exception as exc:
-            st.warning(f"Could not load bulky data from PostgreSQL table 'bulky': {exc}")
+        except Exception:
             return None
 
     @staticmethod
@@ -1299,15 +1394,21 @@ class DataSource:
         if source_type == "excel":
             try:
                 sheet_name = DataSource._get_excel_sheet_name(config, "attendance", "Attendance")
+                dispatch_sheet_name = DataSource._get_excel_sheet_name(config, "dispatch", "Dispatch")
                 gsheet_url = data_source.get("gsheet_url")
                 if not gsheet_url:
                     return None
-                df = DataSource.read_google_sheet(gsheet_url, sheet_name=sheet_name)
+                df = DataSource._read_optional_sheet_without_dispatch_fallback(
+                    gsheet_url, sheet_name=sheet_name, dispatch_sheet_name=dispatch_sheet_name
+                )
                 if df.empty and sheet_name != sheet_name.upper():
-                    df = DataSource.read_google_sheet(gsheet_url, sheet_name=sheet_name.upper())
-                return df
-            except Exception as exc:
-                st.warning(f"Could not load attendance data from Excel sheet '{sheet_name}': {exc}")
+                    df = DataSource._read_optional_sheet_without_dispatch_fallback(
+                        gsheet_url, sheet_name=sheet_name.upper(), dispatch_sheet_name=dispatch_sheet_name
+                    )
+                if df.empty:
+                    return pd.DataFrame()
+                return standardize_sheet(df, "attendance")
+            except Exception:
                 return None
 
         engine = DataSource.get_postgres_engine()
@@ -1317,8 +1418,7 @@ class DataSource:
         try:
             df = DataSource.read_postgres_table(engine, 'attendance')
             return df
-        except Exception as exc:
-            st.warning(f"Could not load attendance data from PostgreSQL table 'attendance': {exc}")
+        except Exception:
             return None
 
     @staticmethod
@@ -1330,15 +1430,21 @@ class DataSource:
         if source_type == "excel":
             try:
                 sheet_name = DataSource._get_excel_sheet_name(config, "reward", "Reward")
+                dispatch_sheet_name = DataSource._get_excel_sheet_name(config, "dispatch", "Dispatch")
                 gsheet_url = data_source.get("gsheet_url")
                 if not gsheet_url:
                     return None
-                df = DataSource.read_google_sheet(gsheet_url, sheet_name=sheet_name)
+                df = DataSource._read_optional_sheet_without_dispatch_fallback(
+                    gsheet_url, sheet_name=sheet_name, dispatch_sheet_name=dispatch_sheet_name
+                )
                 if df.empty and sheet_name != sheet_name.upper():
-                    df = DataSource.read_google_sheet(gsheet_url, sheet_name=sheet_name.upper())
-                return df
-            except Exception as exc:
-                st.warning(f"Could not load reward data from Excel sheet '{sheet_name}': {exc}")
+                    df = DataSource._read_optional_sheet_without_dispatch_fallback(
+                        gsheet_url, sheet_name=sheet_name.upper(), dispatch_sheet_name=dispatch_sheet_name
+                    )
+                if df.empty:
+                    return pd.DataFrame()
+                return standardize_sheet(df, "reward")
+            except Exception:
                 return None
 
         engine = DataSource.get_postgres_engine()
@@ -1348,8 +1454,7 @@ class DataSource:
         try:
             df = DataSource.read_postgres_table(engine, 'reward')
             return df
-        except Exception as exc:
-            st.warning(f"Could not load reward data from PostgreSQL table 'reward': {exc}")
+        except Exception:
             return None
 
     @staticmethod
@@ -1361,15 +1466,21 @@ class DataSource:
         if source_type == "excel":
             try:
                 sheet_name = DataSource._get_excel_sheet_name(config, "rental", "Rental")
+                dispatch_sheet_name = DataSource._get_excel_sheet_name(config, "dispatch", "Dispatch")
                 gsheet_url = data_source.get("gsheet_url")
                 if not gsheet_url:
                     return None
-                df = DataSource.read_google_sheet(gsheet_url, sheet_name=sheet_name)
+                df = DataSource._read_optional_sheet_without_dispatch_fallback(
+                    gsheet_url, sheet_name=sheet_name, dispatch_sheet_name=dispatch_sheet_name
+                )
                 if df.empty and sheet_name != sheet_name.upper():
-                    df = DataSource.read_google_sheet(gsheet_url, sheet_name=sheet_name.upper())
-                return df
-            except Exception as exc:
-                st.warning(f"Could not load rental data from Excel sheet '{sheet_name}': {exc}")
+                    df = DataSource._read_optional_sheet_without_dispatch_fallback(
+                        gsheet_url, sheet_name=sheet_name.upper(), dispatch_sheet_name=dispatch_sheet_name
+                    )
+                if df.empty:
+                    return pd.DataFrame()
+                return standardize_sheet(df, "rental")
+            except Exception:
                 return None
 
         engine = DataSource.get_postgres_engine()
@@ -1379,8 +1490,7 @@ class DataSource:
         try:
             df = DataSource.read_postgres_table(engine, 'rental')
             return df
-        except Exception as exc:
-            st.warning(f"Could not load rental data from PostgreSQL table 'rental': {exc}")
+        except Exception:
             return None
 
 # =============================================================================
@@ -1403,7 +1513,15 @@ class DataProcessor:
                 df_clean[standard_name] = df_clean[col]
 
         # Clean dispatcher names
-        if 'dispatcher_name' in df_clean.columns:
+        name_col = find_column(df_clean, 'dispatcher_name')
+        if not name_col:
+            for col in df_clean.columns:
+                if str(col).strip().lower() in ('dispatcher_name', 'dispatcher name', 'rider_name', 'rider name'):
+                    name_col = col
+                    break
+        if name_col:
+            if name_col != 'dispatcher_name':
+                df_clean['dispatcher_name'] = df_clean[name_col]
             df_clean['dispatcher_name'] = df_clean['dispatcher_name'].apply(clean_dispatcher_name)
         else:
             df_clean['dispatcher_name'] = 'Unknown'
@@ -2609,7 +2727,12 @@ class PayoutCalculator:
         return penalty_totals
 
     @staticmethod
-    def calculate_pickup_payout(pickup_df: pd.DataFrame, dispatcher_summary_df: pd.DataFrame, pickup_payout_per_parcel: float = 1.50) -> pd.DataFrame:
+    def calculate_pickup_payout(
+        pickup_df: pd.DataFrame,
+        dispatcher_summary_df: pd.DataFrame,
+        pickup_payout_per_parcel: float = 1.50,
+        dispatcher_name_map: Optional[Dict[str, str]] = None,
+    ) -> pd.DataFrame:
         """
         Calculate pickup payout per dispatcher from Order Source commission rules.
 
@@ -2630,7 +2753,6 @@ class PayoutCalculator:
                     break
 
         if not pickup_dispatcher_col:
-            st.warning("⚠️ No pickup dispatcher ID column found in pickup data")
             dispatcher_summary_df['pickup_parcels'] = 0
             dispatcher_summary_df['pickup_payout'] = 0.0
             return dispatcher_summary_df
@@ -2644,7 +2766,6 @@ class PayoutCalculator:
                     break
 
         if not waybill_col:
-            st.warning("⚠️ No waybill column found in pickup data")
             dispatcher_summary_df['pickup_parcels'] = 0
             dispatcher_summary_df['pickup_payout'] = 0.0
             return dispatcher_summary_df
@@ -2685,7 +2806,9 @@ class PayoutCalculator:
             pickup_only_rows = pd.DataFrame({
                 'dispatcher_id': pickup_only['dispatcher_id'].astype(str),
                 '_dispatcher_key': pickup_only['_dispatcher_key'],
-                'dispatcher_name': 'Unknown',
+                'dispatcher_name': pickup_only['dispatcher_id'].apply(
+                    lambda x: lookup_dispatcher_name(x, dispatcher_name_map)
+                ),
                 'parcel_count': 0,
                 'pickup_parcels': pickup_only['pickup_parcels'].astype(int),
                 'pickup_payout': pickup_only['pickup_payout'].astype(float),
@@ -2755,7 +2878,6 @@ class PayoutCalculator:
                 break
 
         if not return_dispatcher_col:
-            st.warning("⚠️ No dispatcher ID column found in return data")
             dispatcher_summary_df['return_parcels'] = 0
             dispatcher_summary_df['return_payout'] = 0.0
             return dispatcher_summary_df
@@ -2769,7 +2891,6 @@ class PayoutCalculator:
                 break
 
         if not waybill_col:
-            st.warning("⚠️ No waybill column found in return data")
             dispatcher_summary_df['return_parcels'] = 0
             dispatcher_summary_df['return_payout'] = 0.0
             return dispatcher_summary_df
@@ -2808,6 +2929,7 @@ class PayoutCalculator:
         bulky_df: pd.DataFrame,
         dispatcher_summary_df: pd.DataFrame,
         bulky_config: Optional[dict] = None,
+        dispatcher_name_map: Optional[Dict[str, str]] = None,
     ) -> pd.DataFrame:
         """Calculate bulky parcel payout per dispatcher using weight-based flat rates."""
         if bulky_df is None or bulky_df.empty:
@@ -2831,7 +2953,6 @@ class PayoutCalculator:
                     break
 
         if not bulky_dispatcher_col or not waybill_col or not weight_col:
-            st.warning("⚠️ Bulky sheet is missing dispatcher, waybill, or weight column")
             dispatcher_summary_df['bulky_parcels'] = 0
             dispatcher_summary_df['bulky_payout'] = 0.0
             return dispatcher_summary_df
@@ -2870,7 +2991,9 @@ class PayoutCalculator:
             bulky_only_rows = pd.DataFrame({
                 'dispatcher_id': bulky_only['dispatcher_id'].astype(str),
                 '_dispatcher_key': bulky_only['_dispatcher_key'],
-                'dispatcher_name': 'Unknown',
+                'dispatcher_name': bulky_only['dispatcher_id'].apply(
+                    lambda x: lookup_dispatcher_name(x, dispatcher_name_map)
+                ),
                 'parcel_count': 0,
                 'bulky_parcels': bulky_only['bulky_parcels'].astype(int),
                 'bulky_payout': bulky_only['bulky_payout'].astype(float),
@@ -2954,6 +3077,14 @@ class PayoutCalculator:
                     pass
             return s
 
+        dispatch_reference_df = df.copy() if df is not None else pd.DataFrame()
+
+        dispatcher_name_map = build_dispatcher_name_map(dispatch_reference_df)
+        if bulky_df is not None and not bulky_df.empty:
+            if not DataSource._is_fallback_dispatch_sheet(bulky_df, dispatch_reference_df):
+                for key, name in build_dispatcher_name_map(bulky_df).items():
+                    dispatcher_name_map.setdefault(key, name)
+
         # Exclude return/bulky/pickup waybills from dispatch tier payout (counted separately).
         dispatch_disp_col = find_dispatch_id_column(df)
         dispatch_wb_col = find_waybill_column(df)
@@ -2965,16 +3096,22 @@ class PayoutCalculator:
             )
 
         if pickup_df is not None and not pickup_df.empty:
-            pickup_waybills = build_pickup_waybill_set(pickup_df)
-            df = exclude_dispatch_rows_by_waybill_set(df, pickup_waybills, dispatch_wb_col)
+            if DataSource._is_fallback_dispatch_sheet(pickup_df, dispatch_reference_df):
+                pickup_df = pd.DataFrame()
+            else:
+                pickup_waybills = build_pickup_waybill_set(pickup_df)
+                df = exclude_dispatch_rows_by_waybill_set(df, pickup_waybills, dispatch_wb_col)
 
         if bulky_df is not None and not bulky_df.empty:
-            bulky_disp_col = find_dispatch_id_column(bulky_df)
-            if bulky_disp_col is None:
-                bulky_disp_col = PayoutCalculator._find_dispatcher_id_column(bulky_df)
-            df = exclude_dispatch_rows_by_dispatcher_sheet(
-                df, bulky_df, bulky_disp_col, dispatch_disp_col, dispatch_wb_col
-            )
+            if DataSource._is_fallback_dispatch_sheet(bulky_df, dispatch_reference_df):
+                bulky_df = pd.DataFrame()
+            else:
+                bulky_disp_col = find_dispatch_id_column(bulky_df)
+                if bulky_disp_col is None:
+                    bulky_disp_col = PayoutCalculator._find_dispatcher_id_column(bulky_df)
+                df = exclude_dispatch_rows_by_dispatcher_sheet(
+                    df, bulky_df, bulky_disp_col, dispatch_disp_col, dispatch_wb_col
+                )
 
         # Prepare data (now on delivery-only rows)
         df_clean = DataProcessor.prepare_dataframe(df)
@@ -3058,12 +3195,6 @@ class PayoutCalculator:
                         reward=('_reward_amount', 'sum'),
                         dispatcher_id=('_dispatcher_id', 'first'),
                     ).reset_index()
-            elif reward_df is not None and not reward_df.empty:
-                st.warning(
-                    "⚠️ Could not load reward data: expected columns "
-                    f"employee_id (or dispatcher_id) and amount. "
-                    f"Found: {list(reward_df.columns)}"
-                )
 
         rental_map = {}
         if rental_df is not None and not rental_df.empty:
@@ -3132,6 +3263,15 @@ class PayoutCalculator:
             tier3_parcels=('tier3_count', 'sum'),
             tier4_parcels=('tier4_count', 'sum')
         ).reset_index()
+
+        grouped['dispatcher_name'] = grouped.apply(
+            lambda row: lookup_dispatcher_name(
+                row['dispatcher_id'],
+                dispatcher_name_map,
+                row.get('dispatcher_name'),
+            ),
+            axis=1,
+        )
 
         # Recompute total payout from tier counts
         tier_rates = [rate_tier1, rate_tier2, rate_tier3, rate_tier4]
@@ -3253,13 +3393,17 @@ class PayoutCalculator:
         )
 
         # Calculate pickup payout
-        grouped = PayoutCalculator.calculate_pickup_payout(pickup_df, grouped, pickup_payout_per_parcel)
+        grouped = PayoutCalculator.calculate_pickup_payout(
+            pickup_df, grouped, pickup_payout_per_parcel, dispatcher_name_map
+        )
 
         # Calculate return payout
         grouped = PayoutCalculator.calculate_return_payout(return_df, grouped, return_payout_per_parcel)
 
         # Calculate bulky payout
-        grouped = PayoutCalculator.calculate_bulky_payout(bulky_df, grouped, bulky_config)
+        grouped = PayoutCalculator.calculate_bulky_payout(
+            bulky_df, grouped, bulky_config, dispatcher_name_map
+        )
 
         # Parcels Delivered = dispatch + return + bulky (pickup excluded).
         grouped['pickup_parcels'] = pd.to_numeric(grouped['pickup_parcels'], errors='coerce').fillna(0).astype(int)
@@ -3293,7 +3437,9 @@ class PayoutCalculator:
                 reward_only_rows = pd.DataFrame({
                     'dispatcher_id': reward_only['dispatcher_id'].astype(str),
                     '_dispatcher_key': reward_only['_dispatcher_key'],
-                    'dispatcher_name': 'Unknown',
+                    'dispatcher_name': reward_only['dispatcher_id'].apply(
+                        lambda x: lookup_dispatcher_name(x, dispatcher_name_map)
+                    ),
                     'parcel_count': 0,
                     'pickup_parcels': 0,
                     'pickup_payout': 0.0,
@@ -4896,16 +5042,22 @@ def main():
     currency = config.get("currency_symbol", "RM")
     return_payout_per_parcel = config.get("return_payout_per_parcel", 1.50)
 
-    display_df, numeric_df, total_payout = PayoutCalculator.calculate_payout(
-        df, currency, penalty_data, pickup_df, pickup_payout_per_parcel,
-        return_df, return_payout_per_parcel,
-        bulky_df=bulky_df,
-        bulky_config=config.get("bulky_rates"),
-        reward_df=reward_df,
-        rental_df=rental_df,
-        attendance_df=attendance_df,
-        processing_warnings=processing_warnings
-    )
+    try:
+        display_df, numeric_df, total_payout = PayoutCalculator.calculate_payout(
+            df, currency, penalty_data, pickup_df, pickup_payout_per_parcel,
+            return_df, return_payout_per_parcel,
+            bulky_df=bulky_df,
+            bulky_config=config.get("bulky_rates"),
+            reward_df=reward_df,
+            rental_df=rental_df,
+            attendance_df=attendance_df,
+            processing_warnings=processing_warnings
+        )
+    except Exception as exc:
+        st.error(f"Error calculating payouts: {exc}")
+        st.exception(exc)
+        add_footer()
+        return
 
     if numeric_df.empty:
         st.warning("No data after filtering.")

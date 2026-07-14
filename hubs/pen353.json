@@ -1,40 +1,41 @@
 {
   "hub_id": "PEN353",
   "dispatcher_ids": [
-    "PEN3533400", "PEN3533893", "PEN3533904", "PEN3533054",
-    "PEN3533630", "PEN3533654", "PEN3533410", "PEN3533252",
-    "PEN3533833", "PEN3535052", "PEN3533858", "PEN3533830",
-    "PEN3533835", "PEN3533195", "PEN3535028", "PEN3533906",
-    "PEN3533802", "PEN3535034", "PEN3533892", "PEN3533905",
-    "PEN3533887", "PEN3535078", "PEN3533895", "PEN3533812",
-    "PEN3533156", "PEN3533834", "PEN3535058", "PEN3533908",
+    "PEN3535078", "PEN3535028", "PEN3533156", "PEN3535052",
+    "PEN3533252", "PEN3533195", "PEN3533054", "PEN3535034",
+    "PEN3533917", "PEN3533910", "PEN3533914", "PEN3533410",
+    "PEN3533833", "PEN3535058", "PEN3533835", "PEN3533908",
+    "PEN3533400", "PEN3533915", "PEN3533834", "PEN3533907",
+    "PEN3533923", "PEN3535255", "PEN3533945", "PEN3533700",
+    "PEN3533906", "PEN3533905",
+    "PEN3533893", "PEN3533904", "PEN3533630", "PEN3533654",
+    "PEN3533858", "PEN3533830", "PEN3535028", "PEN3533802",
+    "PEN3533892", "PEN3533887", "PEN3533895", "PEN3533812",
     "PEN3533409", "PEN3533425", "PEN3533446", "PEN3533371",
-    "PEN3535255", "PEN3533428", "PEN3533417", "PEN3533470",
-    "PEN3533501", "PEN3533512", "PEN3533502", "PEN3533553",
-    "PEN3533636", "PEN3533650", "PEN3533652", "PEN3535573",
-    "PEN3533816", "PEN3533910", "PEN3533915", "PEN3533914",
-    "PEN3533917", "PEN3533918", "PEN3533921", "PEN3533923",
-    "PEN3533926", "PEN3535595", "PEN3533907", "PEN3533936",
-    "PEN3533935", "PEN3533938"
+    "PEN3533428", "PEN3533417", "PEN3533470", "PEN3533501",
+    "PEN3533512", "PEN3533502", "PEN3533553", "PEN3533636",
+    "PEN3533650", "PEN3533652", "PEN3535573", "PEN3533816",
+    "PEN3533918", "PEN3533921", "PEN3533926", "PEN3535595",
+    "PEN3533936", "PEN3533935", "PEN3533938"
   ],
-  "output_file": "/Users/UMARI.ZULKIFLI/Documents/Jemari Ventures/Worksheet/JMR JUNE 2026-PEN353-iha.xlsx",
+  "output_file": "/Users/UMARI.ZULKIFLI/Documents/Jemari Ventures/Worksheet/JMR JULY 2026-PEN353-filtered.xlsx",
   "tasks": {
     "Dispatch": {
-      "file": "/Users/UMARI.ZULKIFLI/Documents/Jemari Ventures/Worksheet/PEN353 TEMPLATE COMMISSION.xlsx",
-      "sheet": "DELIVERY",
+      "file": "/Users/UMARI.ZULKIFLI/Documents/Jemari Ventures/Worksheet/JMR Dispatch July 2026.xlsx",
+      "sheet": "sheet0",
       "header": 0,
       "column": "Dispatcher ID"
     },
     "Pickup": {
-      "file": "/Users/UMARI.ZULKIFLI/Documents/Jemari Ventures/Worksheet/PEN353 TEMPLATE COMMISSION.xlsx",
-      "sheet": "PICKUP",
+      "file": "/Users/UMARI.ZULKIFLI/Documents/Jemari Ventures/Worksheet/JMR Pickup July 2026.xlsx",
+      "sheet": "sheet1",
       "header": 0,
       "column": "Pick Up Dispatcher ID"
     },
     "Return": {
-      "file": "/Users/UMARI.ZULKIFLI/Documents/Jemari Ventures/Worksheet/PEN353 TEMPLATE COMMISSION.xlsx",
-      "sheet": "SRS",
-      "header": 1,
+      "file": "/Users/UMARI.ZULKIFLI/Documents/Jemari Ventures/Worksheet/JMR Return July 2026.xlsx",
+      "sheet": "Shipping AWB",
+      "header": 0,
       "column": "Dispatcher ID",
       "rename_columns": {
         "Dispatcher No. | Delivery": "Dispatcher ID"
@@ -82,15 +83,6 @@
       "sheet": "FAKE ATTEMPT",
       "header": 0,
       "column": "Dispatcher ID"
-    },
-    "No Outbound Scan": {
-      "file": "/Users/UMARI.ZULKIFLI/Documents/Jemari Ventures/Worksheet/PEN353 TEMPLATE DEDUCTION.xlsx",
-      "sheet": "NO OUTBOUND SCANNING",
-      "header": 1,
-      "column": "Dispatcher ID",
-      "rename_columns": {
-        "Operator | Last": "Dispatcher ID"
-      }
     }
   }
 }
