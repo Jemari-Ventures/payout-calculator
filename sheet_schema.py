@@ -6,6 +6,7 @@ from typing import Dict, List, Optional
 import pandas as pd
 
 # Internal column names used everywhere after standardize_sheet().
+# Keep in sync with hub_filter.contract.OUTPUT_SHEETS and Template JMR.xlsx.
 SHEET_COLUMNS: Dict[str, List[str]] = {
     "dispatch": [
         "waybill_number", "delivery_signature", "dispatcher_id", "dispatcher_name", "billing_weight",
@@ -38,9 +39,10 @@ SHEET_COLUMNS: Dict[str, List[str]] = {
     "attendance": ["dispatcher_id", "penalty"],
     "socso": ["dispatcher_id", "dispatcher_name", "amount"],
     "rental": ["dispatcher_id", "amount"],
-    "fake_attempt": ["waybill_number", "dispatcher_id", "date"],
-    "no_outbound_scan": ["waybill_number", "dispatcher_id", "scanning_time_last", "date"],
-    "overpaid": ["dispatcher_id", "amount"],
+    "fake_attempt": ["date", "waybill_number", "dispatcher_id", "dispatcher_name"],
+    "no_outbound_scan": ["waybill_number", "dispatcher_id"],
+    "overpaid": ["dispatcher_id", "dispatcher_name", "amount"],
+    # Legacy: QR commission is Pickup rows with order_source == "JTD QR" (no separate sheet).
     "qr_order": ["waybill_number", "dispatcher_id", "date"],
 }
 
@@ -48,11 +50,14 @@ SHEET_COLUMNS: Dict[str, List[str]] = {
 _HEADER_MAP: Dict[str, str] = {
     "waybill_number": "waybill_number",
     "waybill number": "waybill_number",
+    "awb no.": "waybill_number",
+    "awb no": "waybill_number",
     "delivery_signature": "delivery_signature",
     "delivery signature": "delivery_signature",
     "dispatcher_id": "dispatcher_id",
     "dispatcher name": "dispatcher_name",
     "dispatcher_name": "dispatcher_name",
+    "dispatcher": "dispatcher_name",
     "billing_weight": "billing_weight",
     "billing weight": "billing_weight",
     "date_pick_up": "date_pick_up",
@@ -109,7 +114,7 @@ def _penalty_source_priority(raw_col: str) -> int:
 
 
 def _coalesce_sheet_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Merge source columns that canonicalize to the same name (e.g. penalty + penalty_amount)."""
+    """Merge source columns that canonicalize to the same name."""
     canon_groups: Dict[str, List[int]] = {}
     for i, col in enumerate(df.columns):
         canon = canonical_header(col)

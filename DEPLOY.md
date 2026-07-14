@@ -129,3 +129,18 @@ main / mgmt  ──merge──►  deploy/dispatcher  (requirements-dispatcher.t
 ```
 
 Do **not** develop only on deploy branches — merge from `main`/`mgmt` regularly to avoid drift.
+
+---
+
+## Multi-hub (PEN353, PEN364, …)
+
+Do **not** fork Git per hub. See **`HUB_DATA_CONTRACT.md`**.
+
+| Layer | Approach |
+|-------|----------|
+| Code | Shared `deploy/dispatcher` + `deploy/management` |
+| Data prep | `python -m hub_filter --hub pen353` (configs in `hubs/`) |
+| Isolation | Separate Google Sheet + Streamlit Cloud **app** per hub |
+| Secrets | Per-app `gsheet_url` (and Postgres if used) |
+
+Adding hub 364 = new filter config + new Sheet + new Cloud app pointing at the **same** deploy branch.

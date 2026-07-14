@@ -13,12 +13,13 @@ from sheet_schema import sheet_col
 PENALTY_DATE_COLUMNS: Dict[str, List[str]] = {
     "duitnow": ["date", "created_at", "Date"],
     "ldr": ["pushed_time"],
-    "fake_attempt": ["Date", "date", "created_at"],
+    "fake_attempt": ["date", "Date", "created_at"],
     "cod": ["date", "created_at", "Date"],
     "binding": ["date", "created_at", "Date"],
     "pending_parcel": ["date", "created_at", "Date"],
     "parcel_lost": ["date", "created_at", "Date"],
-    "no_outbound_scan": ["scanning_time_last", "date"],
+    # No Outbound Scan template has no date column — period filter is a no-op.
+    "no_outbound_scan": [],
 }
 
 
