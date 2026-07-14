@@ -776,13 +776,13 @@ class DataSource:
         candidate_sample = (
             candidate_df.head(sample_size)
             .fillna("")
-            .applymap(DataSource._normalize_compare_value)
+            .map(DataSource._normalize_compare_value)
             .astype(str)
         )
         dispatch_sample = (
             dispatch_df.head(sample_size)
             .fillna("")
-            .applymap(DataSource._normalize_compare_value)
+            .map(DataSource._normalize_compare_value)
             .astype(str)
         )
         return candidate_sample.equals(dispatch_sample)
@@ -3175,7 +3175,7 @@ class PayoutCalculator:
                 ]
                 _route_split = split_route_penalty_pool(_route_pool, _route_keys)
 
-        # Use apply instead of iterrows for better performance
+        # Use apply with result_type='expand' so multi-column assignment is always aligned.
         def calculate_penalties(row):
             dispatcher_id = str(row['dispatcher_id'])
             dispatcher_key = normalize_dispatcher_id(dispatcher_id)
@@ -3194,24 +3194,47 @@ class PayoutCalculator:
                 'penalty_amount': penalty_amount,
                 'penalty_count': penalty_count,
                 'penalty_waybills': ', '.join(penalty_waybills) if penalty_waybills else '',
-                'duitnow_penalty': penalty_breakdown['duitnow'],
-                'ldr_penalty': penalty_breakdown['ldr'],
-                'fake_attempt_penalty': penalty_breakdown['fake_attempt'],
-                'cod_penalty': penalty_breakdown['cod'],
-                'binding_penalty': penalty_breakdown['binding'],
-                'hub_penalty': penalty_breakdown['hub'],
-                'pending_parcel_penalty': penalty_breakdown['pending_parcel'],
-                'no_outbound_scan_penalty': penalty_breakdown['no_outbound_scan'],
-                'parcel_lost_penalty': penalty_breakdown['parcel_lost'],
-                'route_penalty': penalty_breakdown['route'],
+                'duitnow_penalty': penalty_breakdown.get('duitnow', 0.0),
+                'ldr_penalty': penalty_breakdown.get('ldr', 0.0),
+                'fake_attempt_penalty': penalty_breakdown.get('fake_attempt', 0.0),
+                'cod_penalty': penalty_breakdown.get('cod', 0.0),
+                'binding_penalty': penalty_breakdown.get('binding', 0.0),
+                'hub_penalty': penalty_breakdown.get('hub', 0.0),
+                'pending_parcel_penalty': penalty_breakdown.get('pending_parcel', 0.0),
+                'no_outbound_scan_penalty': penalty_breakdown.get('no_outbound_scan', 0.0),
+                'parcel_lost_penalty': penalty_breakdown.get('parcel_lost', 0.0),
+                'route_penalty': penalty_breakdown.get('route', 0.0),
                 'attendance_penalty': attendance_penalty
             })
 
-        penalty_results = grouped.apply(calculate_penalties, axis=1)
-        grouped[['penalty_amount', 'penalty_count', 'penalty_waybills',
-                 'duitnow_penalty', 'ldr_penalty', 'fake_attempt_penalty', 'cod_penalty',
-                 'binding_penalty', 'hub_penalty', 'pending_parcel_penalty', 'no_outbound_scan_penalty', 'parcel_lost_penalty', 'route_penalty',
-                 'attendance_penalty']] = penalty_results
+        _penalty_assign_cols = [
+            'penalty_amount', 'penalty_count', 'penalty_waybills',
+            'duitnow_penalty', 'ldr_penalty', 'fake_attempt_penalty', 'cod_penalty',
+            'binding_penalty', 'hub_penalty', 'pending_parcel_penalty',
+            'no_outbound_scan_penalty', 'parcel_lost_penalty', 'route_penalty',
+            'attendance_penalty',
+        ]
+        if grouped.empty:
+            for col in _penalty_assign_cols:
+                if col == 'penalty_waybills':
+                    grouped[col] = ''
+                elif col == 'penalty_count':
+                    grouped[col] = 0
+                else:
+                    grouped[col] = 0.0
+        else:
+            penalty_results = grouped.apply(calculate_penalties, axis=1, result_type='expand')
+            if not isinstance(penalty_results, pd.DataFrame):
+                penalty_results = pd.DataFrame(penalty_results)
+            for col in _penalty_assign_cols:
+                if col in penalty_results.columns:
+                    grouped[col] = penalty_results[col].values
+                elif col == 'penalty_waybills':
+                    grouped[col] = ''
+                elif col == 'penalty_count':
+                    grouped[col] = 0
+                else:
+                    grouped[col] = 0.0
 
         # Penalty total = sum of penalty columns only (excludes SOCSO/Overpaid benefit deductions).
         _penalty_component_cols = [
