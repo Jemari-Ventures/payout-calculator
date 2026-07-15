@@ -1,7 +1,7 @@
 {
   "data_source": {
     "type": "excel",
-    "gsheet_url": "https://docs.google.com/spreadsheets/d/1t2dC77Xt200IpVZ1ci5qRCwoeFn3-zAF2GMtSA3fI7c",
+    "gsheet_url": "https://docs.google.com/spreadsheets/d/1CkGPtWdWv_91vdEZD9J0zhMHqmoZiAFj",
     "postgres_table": "dispatch",
     "pickup_table": "pickup",
     "excel_file": "",
