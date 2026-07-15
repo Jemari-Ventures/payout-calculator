@@ -11,6 +11,12 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import pandas as pd
 
 from hub_filter.contract import COLUMN_ALIASES, OUTPUT_SHEETS, contract_columns
+from return_sender_filter import (
+    build_sender_name_allowlist,
+    find_sender_name_column,
+    normalize_sender_name,
+    resolve_return_sender_names,
+)
 
 
 def _is_wildcard_pass_through(filter_values: Sequence[str]) -> bool:
@@ -82,6 +88,7 @@ def process_task(
     sheet_tab: str,
     cfg: Dict[str, Any],
     filter_values: Sequence[str],
+    hub_cfg: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, pd.DataFrame, List[str]]:
     messages: List[str] = []
     path = cfg["file"]
@@ -128,6 +135,28 @@ def process_task(
             mask = df[filter_col].apply(lambda v: row_matches_dispatcher_filters(v, task_values))
             filtered = df[mask].copy()
 
+    sender_names_cfg = cfg.get("sender_names")
+    if sender_names_cfg is None and hub_cfg is not None:
+        sender_names_cfg = hub_cfg.get("return_sender_names")
+    if sender_names_cfg is None and str(sheet_tab).strip().lower() == "return":
+        sender_names_cfg = True  # use DEFAULT_RETURN_SENDER_NAMES
+
+    allowlist_names = resolve_return_sender_names(sender_names_cfg)
+    if allowlist_names:
+        sender_col = find_sender_name_column(filtered)
+        if sender_col is None:
+            messages.append(f"⚠ {sheet_tab}: sender_name filter configured but column not found.")
+            filtered = filtered.iloc[0:0].copy()
+        else:
+            allowed = build_sender_name_allowlist(allowlist_names)
+            before = len(filtered)
+            filtered = filtered[
+                filtered[sender_col].apply(lambda v: normalize_sender_name(v) in allowed)
+            ].copy()
+            messages.append(
+                f"ℹ {sheet_tab}: sender_name filter {before:,} → {len(filtered):,} rows"
+            )
+
     if sheet_tab in OUTPUT_SHEETS:
         shaped = build_contract_frame(filtered, sheet_tab, messages)
     else:
@@ -159,7 +188,7 @@ def run_hub_filter(config_path: Path, *, max_workers: Optional[int] = None) -> P
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
-            executor.submit(process_task, name, task_cfg, dispatcher_ids): name
+            executor.submit(process_task, name, task_cfg, dispatcher_ids, cfg): name
             for name, task_cfg in tasks.items()
         }
         for future in as_completed(futures):

@@ -26,6 +26,7 @@ from prophet.plot import plot_plotly
 import plotly.graph_objs as go
 
 from sheet_schema import standardize_sheet
+from return_sender_filter import filter_return_by_sender_name
 from penalty_common import (
     clean_penalty_dispatcher_id,
     extract_waybill_list,
@@ -352,6 +353,30 @@ def find_pickup_dispatcher_column(df: pd.DataFrame) -> Optional[str]:
     for name in ("Dispatcher ID", "dispatcher_id"):
         if name.lower() in columns_by_lower:
             return columns_by_lower[name.lower()]
+    return None
+
+
+def find_pickup_dispatcher_name_column(df: pd.DataFrame) -> Optional[str]:
+    """Find pickup dispatcher name column."""
+    if df is None or df.empty:
+        return None
+    columns_by_lower = {str(c).strip().lower(): c for c in df.columns}
+    for name in (
+        "Pick Up Dispatcher Name",
+        "Pickup Dispatcher Name",
+        "pickup_dispatcher_name",
+        "pick_up_dispatcher_name",
+        "Rider Name",
+        "rider_name",
+        "dispatcher_name",
+        "Dispatcher Name",
+    ):
+        if name.lower() in columns_by_lower:
+            return columns_by_lower[name.lower()]
+    for col in df.columns:
+        c_lower = str(col).strip().lower()
+        if "pickup" in c_lower and "name" in c_lower:
+            return col
     return None
 
 
@@ -683,6 +708,52 @@ def build_dispatcher_name_map(df: Optional[pd.DataFrame]) -> Dict[str, str]:
         if cleaned:
             name_map[key] = cleaned
     return name_map
+
+
+def build_pickup_dispatcher_name_map(df: Optional[pd.DataFrame]) -> Dict[str, str]:
+    """Build normalized pickup dispatcher ID -> cleaned name from the Pickup sheet."""
+    if df is None or df.empty:
+        return {}
+
+    disp_col = find_pickup_dispatcher_column(df)
+    if not disp_col:
+        return {}
+
+    name_col = find_pickup_dispatcher_name_column(df)
+    if not name_col:
+        name_col = find_column(df, 'dispatcher_name')
+    if not name_col:
+        return {}
+
+    name_map: Dict[str, str] = {}
+    for _, row in df[[disp_col, name_col]].drop_duplicates(subset=[disp_col]).iterrows():
+        key = normalize_dispatcher_id(row[disp_col])
+        if not key:
+            continue
+        raw_name = row[name_col]
+        if pd.isna(raw_name):
+            continue
+        raw_text = str(raw_name).strip()
+        if not raw_text or raw_text.lower() in ('nan', 'none', 'unknown'):
+            continue
+        cleaned = clean_dispatcher_name(raw_text)
+        if cleaned:
+            name_map.setdefault(key, cleaned)
+    return name_map
+
+
+def apply_dispatcher_name_map_entries(
+    name_map: Dict[str, str],
+    additions: Optional[Dict[str, str]],
+) -> None:
+    """Merge name entries; existing non-empty names are kept."""
+    if not additions:
+        return
+    for key, name in additions.items():
+        if not key or not name:
+            continue
+        if not str(name_map.get(key, "")).strip():
+            name_map[key] = name
 
 
 def lookup_dispatcher_name(
@@ -1339,7 +1410,8 @@ class DataSource:
                 )
                 if return_df.empty:
                     return pd.DataFrame()
-                return standardize_sheet(return_df, "return")
+                return_df = standardize_sheet(return_df, "return")
+                return filter_return_by_sender_name(return_df, config.get("return_sender_names"))
             except Exception:
                 return None
 
@@ -1350,7 +1422,7 @@ class DataSource:
 
         try:
             df = DataSource.read_postgres_table(engine, 'return')
-            return df
+            return filter_return_by_sender_name(df, config.get("return_sender_names"))
         except Exception:
             return None
 
@@ -3078,12 +3150,25 @@ class PayoutCalculator:
             return s
 
         dispatch_reference_df = df.copy() if df is not None else pd.DataFrame()
+        pickup_reference_df = (
+            pickup_df.copy()
+            if pickup_df is not None and not pickup_df.empty
+            else pd.DataFrame()
+        )
 
         dispatcher_name_map = build_dispatcher_name_map(dispatch_reference_df)
+        if not pickup_reference_df.empty:
+            if not DataSource._is_fallback_dispatch_sheet(pickup_reference_df, dispatch_reference_df):
+                apply_dispatcher_name_map_entries(
+                    dispatcher_name_map,
+                    build_pickup_dispatcher_name_map(pickup_reference_df),
+                )
         if bulky_df is not None and not bulky_df.empty:
             if not DataSource._is_fallback_dispatch_sheet(bulky_df, dispatch_reference_df):
-                for key, name in build_dispatcher_name_map(bulky_df).items():
-                    dispatcher_name_map.setdefault(key, name)
+                apply_dispatcher_name_map_entries(
+                    dispatcher_name_map,
+                    build_dispatcher_name_map(bulky_df),
+                )
 
         # Exclude return/bulky/pickup waybills from dispatch tier payout (counted separately).
         dispatch_disp_col = find_dispatch_id_column(df)

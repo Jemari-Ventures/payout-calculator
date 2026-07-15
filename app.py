@@ -57,6 +57,7 @@ from app_runtime import (
     payout_config_fingerprint,
     trim_sheet_columns,
 )
+from return_sender_filter import filter_return_by_sender_name
 from streamlit_compat import render_html, stretch_width_kwargs
 
 # =============================================================================
@@ -345,6 +346,30 @@ def find_pickup_dispatcher_column(df: pd.DataFrame) -> Optional[str]:
     for name in ("Dispatcher ID", "dispatcher_id"):
         if name.lower() in columns_by_lower:
             return columns_by_lower[name.lower()]
+    return None
+
+
+def find_pickup_dispatcher_name_column(df: pd.DataFrame) -> Optional[str]:
+    """Find pickup dispatcher name column."""
+    if df is None or df.empty:
+        return None
+    columns_by_lower = {str(c).strip().lower(): c for c in df.columns}
+    for name in (
+        "Pick Up Dispatcher Name",
+        "Pickup Dispatcher Name",
+        "pickup_dispatcher_name",
+        "pick_up_dispatcher_name",
+        "Rider Name",
+        "rider_name",
+        "dispatcher_name",
+        "Dispatcher Name",
+    ):
+        if name.lower() in columns_by_lower:
+            return columns_by_lower[name.lower()]
+    for col in df.columns:
+        c_lower = str(col).strip().lower()
+        if "pickup" in c_lower and "name" in c_lower:
+            return col
     return None
 
 
@@ -3019,7 +3044,11 @@ def prepare_period_workbook(
         filter_sheet_by_date_range(bundle.get("pickup"), start_date, end_date, ["date_pick_up"])
     )
     period["return"] = _df_or_empty(
-        filter_sheet_by_date_range(bundle.get("return"), start_date, end_date, ["delivery_signature"])
+        filter_return_by_sender_name(
+            filter_sheet_by_date_range(
+                bundle.get("return"), start_date, end_date, ["delivery_signature"]
+            )
+        )
     )
     period["bulky"] = _df_or_empty(
         filter_sheet_by_date_range(bundle.get("bulky"), start_date, end_date, ["delivery_signature"])
@@ -3513,6 +3542,9 @@ def main():
         find_reward_dispatcher_name_column,
         find_dispatch_id_column,
         find_column,
+        pickup_df=pickup_df,
+        find_pickup_dispatcher_column_fn=find_pickup_dispatcher_column,
+        find_pickup_dispatcher_name_column_fn=find_pickup_dispatcher_name_column,
     )
 
     dispatcher_options = []
