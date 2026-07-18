@@ -72,19 +72,63 @@ def find_column(df: pd.DataFrame, preferred_names: Sequence[str]) -> Optional[st
     return None
 
 
-def build_contract_frame(df: pd.DataFrame, sheet_tab: str, messages: List[str]) -> pd.DataFrame:
-    """Project/rename to exact Template JMR columns for this tab."""
+def build_contract_frame(
+    df: pd.DataFrame,
+    sheet_tab: str,
+    messages: List[str],
+    column_map: Optional[Dict[str, str]] = None,
+) -> pd.DataFrame:
+    """Project/rename to exact Template JMR columns for this tab.
+
+    If *column_map* is provided (canonical → raw header), those mappings win.
+    Otherwise fall back to COLUMN_ALIASES auto-detect.
+    """
     wanted = contract_columns(sheet_tab)
     out = pd.DataFrame(index=df.index)
+    column_map = column_map or {}
     for canon in wanted:
-        aliases = COLUMN_ALIASES.get(canon, [canon])
-        source = find_column(df, aliases)
+        mapped = str(column_map.get(canon) or "").strip()
+        source = None
+        if mapped and mapped in df.columns:
+            source = mapped
+        elif mapped:
+            lower = {str(c).strip().lower(): c for c in df.columns}
+            source = lower.get(mapped.lower())
+        if source is None:
+            aliases = COLUMN_ALIASES.get(canon, [canon])
+            source = find_column(df, aliases)
         if source is None:
             messages.append(f"⚠ {sheet_tab}: column '{canon}' not found; writing blank.")
             out[canon] = ""
         else:
             out[canon] = df[source]
     return out
+
+
+def peek_excel_columns(
+    source: ExcelSource,
+    *,
+    sheet_name: Any = 0,
+    header: int = 0,
+) -> List[str]:
+    """Read only the header row from an Excel sheet."""
+    handle, _ = _as_excel_handle(source)
+    preview = pd.read_excel(handle, sheet_name=sheet_name, header=header, nrows=0)
+    return [str(c).strip() for c in preview.columns]
+
+
+def suggest_column_map(raw_columns: Sequence[str], sheet_tab: str) -> Dict[str, str]:
+    """Best-effort canonical → raw header map using COLUMN_ALIASES."""
+    if not raw_columns:
+        return {}
+    stub = pd.DataFrame(columns=list(raw_columns))
+    mapping: Dict[str, str] = {}
+    for canon in contract_columns(sheet_tab):
+        aliases = COLUMN_ALIASES.get(canon, [canon])
+        hit = find_column(stub, aliases)
+        if hit is not None:
+            mapping[canon] = str(hit)
+    return mapping
 
 
 def _as_excel_handle(source: ExcelSource) -> Tuple[Any, bool]:
@@ -211,7 +255,12 @@ def process_task(
             )
 
     if sheet_tab in OUTPUT_SHEETS:
-        shaped = build_contract_frame(filtered, sheet_tab, messages)
+        shaped = build_contract_frame(
+            filtered,
+            sheet_tab,
+            messages,
+            column_map=cfg.get("column_map"),
+        )
     else:
         messages.append(f"⚠ {sheet_tab}: not in OUTPUT_SHEETS contract; writing raw filtered rows.")
         shaped = filtered
