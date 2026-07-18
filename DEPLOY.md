@@ -1,13 +1,14 @@
 # Streamlit Cloud deployment
 
-This repo runs **two** Streamlit apps from the same codebase:
+This repo runs **three** Streamlit apps from the same codebase:
 
 | App | Entry file | Branch | Dependencies |
 |-----|------------|--------|--------------|
 | **Dispatcher payout** | `app.py` | `deploy/dispatcher` | Lightweight (no Prophet/plotly) |
 | **Management batch** | `management.py` | `deploy/management` | Full (`prophet`, `plotly`, `sqlalchemy`, …) |
+| **Filter prep** | `filter_app.py` | `deploy/filter` *(planned)* | Streamlit + pandas + openpyxl |
 
-Shared code (`penalty_common.py`, `sheet_schema.py`, `config.json`, etc.) lives on both branches. Only `requirements.txt` differs per deploy branch.
+Shared code (`penalty_common.py`, `sheet_schema.py`, `hub_filter/`, `config.json`, etc.) lives on deploy branches. Only `requirements.txt` differs per deploy branch.
 
 ---
 
@@ -17,11 +18,13 @@ Shared code (`penalty_common.py`, `sheet_schema.py`, `config.json`, etc.) lives 
 |------|---------|
 | `requirements-dispatcher.txt` | `app.py` / dispatcher Cloud app |
 | `requirements-management.txt` | `management.py` / management Cloud app |
+| `requirements-filter.txt` | `filter_app.py` / filter prep Cloud app |
 | `requirements.txt` | **Generated** — do not edit by hand on deploy branches; run the sync script |
 
 ```bash
 ./scripts/sync-requirements.sh dispatcher   # app
 ./scripts/sync-requirements.sh management   # management
+./scripts/sync-requirements.sh filter       # filter_app
 ```
 
 ---
@@ -45,6 +48,21 @@ Create **two apps** in [share.streamlit.io](https://share.streamlit.io) pointing
 | **Branch** | `deploy/management` |
 | **Main file path** | `management.py` *(or `payout-calculator/management.py`)* |
 | **Python version** | **3.11 or 3.12** in Cloud **Advanced settings** (not via `packages.txt`) |
+
+### Filter prep app
+
+| Setting | Value |
+|---------|--------|
+| **Branch** | `deploy/filter` *(create when ready — merge from `feat/filter-web-app`)* |
+| **Main file path** | `filter_app.py` |
+| **Python version** | **3.11 or 3.12** |
+| **Requirements** | `./scripts/sync-requirements.sh filter` |
+
+Local run:
+
+```bash
+streamlit run filter_app.py
+```
 
 > `packages.txt` is only for apt packages. Community Cloud ignores it for Python version.
 > To change Python after deploy: delete the app and redeploy, selecting the version under Advanced settings.

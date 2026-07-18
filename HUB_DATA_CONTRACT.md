@@ -5,6 +5,7 @@ End-to-end path for every hub (PEN353, PEN364, …):
 ```
 JMS export (https://jms.jtexpress.my)
   → python -m hub_filter --hub pen353   (or pen364)
+     OR  streamlit run filter_app.py   (upload Excel → download Template JMR)
   → Template JMR–shaped .xlsx
   → upload / sync to that hub’s Google Sheet
   → Streamlit Cloud app (same deploy/* branch, different secrets.gsheet_url)
