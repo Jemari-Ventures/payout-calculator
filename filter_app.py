@@ -100,8 +100,7 @@ def _render_column_mapper(
         if selected and selected != NONE_OPTION:
             column_map[canon] = selected
 
-    with st.expander("Detected raw columns", expanded=False):
-        st.code("\n".join(raw_columns) if raw_columns else "(none)")
+    st.caption("Detected raw columns: " + ", ".join(f"`{c}`" for c in raw_columns))
 
     return column_map
 
