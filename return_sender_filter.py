@@ -64,10 +64,15 @@ def find_sender_name_column(df: pd.DataFrame) -> Optional[str]:
 def resolve_return_sender_names(
     configured: Optional[Iterable[str] | bool] = None,
 ) -> Optional[tuple[str, ...]]:
-    """Return allowlist to apply, or None when filtering is disabled."""
+    """Return allowlist to apply, or None when filtering is disabled.
+
+    - False → disable filter
+    - None / True → default merchant allowlist
+    - sequence of names → custom allowlist
+    """
     if configured is False:
         return None
-    if configured is None:
+    if configured is None or configured is True:
         return DEFAULT_RETURN_SENDER_NAMES
     names = tuple(str(n).strip() for n in configured if str(n).strip())
     return names or None
