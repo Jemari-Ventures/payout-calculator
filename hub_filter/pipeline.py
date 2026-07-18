@@ -54,7 +54,7 @@ def _normalize_col_name(name: str) -> str:
 
 
 def find_column(df: pd.DataFrame, preferred_names: Sequence[str]) -> Optional[str]:
-    if df is None or df.empty:
+    if df is None or len(df.columns) == 0:
         return None
     cols = list(df.columns)
     lower = {str(c).strip().lower(): c for c in cols}
