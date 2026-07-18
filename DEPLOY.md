@@ -6,7 +6,7 @@ This repo runs **three** Streamlit apps from the same codebase:
 |-----|------------|--------|--------------|
 | **Dispatcher payout** | `app.py` | `deploy/dispatcher` | Lightweight (no Prophet/plotly) |
 | **Management batch** | `management.py` | `deploy/management` | Full (`prophet`, `plotly`, `sqlalchemy`, …) |
-| **Filter prep** | `filter_app.py` | `deploy/filter` *(planned)* | Streamlit + pandas + openpyxl |
+| **Filter prep** | `filter_app.py` | `deploy/filter` | Streamlit + pandas + openpyxl |
 
 Shared code (`penalty_common.py`, `sheet_schema.py`, `hub_filter/`, `config.json`, etc.) lives on deploy branches. Only `requirements.txt` differs per deploy branch.
 
@@ -31,7 +31,7 @@ Shared code (`penalty_common.py`, `sheet_schema.py`, `hub_filter/`, `config.json
 
 ## Streamlit Community Cloud settings
 
-Create **two apps** in [share.streamlit.io](https://share.streamlit.io) pointing at the same GitHub repo.
+Create **three apps** in [share.streamlit.io](https://share.streamlit.io) pointing at the same GitHub repo.
 
 ### Dispatcher app
 
@@ -53,7 +53,7 @@ Create **two apps** in [share.streamlit.io](https://share.streamlit.io) pointing
 
 | Setting | Value |
 |---------|--------|
-| **Branch** | `deploy/filter` *(create when ready — merge from `feat/filter-web-app`)* |
+| **Branch** | `deploy/filter` |
 | **Main file path** | `filter_app.py` |
 | **Python version** | **3.11 or 3.12** |
 | **Requirements** | `./scripts/sync-requirements.sh filter` |
@@ -67,7 +67,7 @@ streamlit run filter_app.py
 > `packages.txt` is only for apt packages. Community Cloud ignores it for Python version.
 > To change Python after deploy: delete the app and redeploy, selecting the version under Advanced settings.
 
-Both apps share:
+All apps share:
 
 - `.streamlit/config.toml` (repo root)
 - `.streamlit/secrets.toml` (not committed — configure in Cloud **Secrets**)
@@ -77,7 +77,7 @@ Both apps share:
 ## Development workflow
 
 1. **Develop on `main` or `mgmt`** (feature branches → merge there).
-2. **Merge into both deploy branches** when ready to release:
+2. **Merge into deploy branches** when ready to release:
 
 ```bash
 # From your dev branch (e.g. mgmt or main)
@@ -98,6 +98,14 @@ git merge mgmt   # or main
 git add requirements.txt
 git commit -m "deploy: sync management requirements"  # skip if unchanged
 git push -u origin deploy/management
+
+# Filter prep
+git checkout deploy/filter
+git merge feat/filter-web-app   # or main once merged
+./scripts/sync-requirements.sh filter
+git add requirements.txt
+git commit -m "deploy: sync filter requirements"  # skip if unchanged
+git push -u origin deploy/filter
 
 git checkout mgmt
 ```
@@ -120,6 +128,11 @@ streamlit run app.py
 ./scripts/sync-requirements.sh management
 pip install -r requirements.txt
 streamlit run management.py
+
+# Filter prep
+./scripts/sync-requirements.sh filter
+pip install -r requirements.txt
+streamlit run filter_app.py
 ```
 
 ---
@@ -143,7 +156,8 @@ streamlit run management.py
 
 ```
 main / mgmt  ──merge──►  deploy/dispatcher  (requirements-dispatcher.txt → requirements.txt)
-              └──merge──►  deploy/management   (requirements-management.txt → requirements.txt)
+              ├──merge──►  deploy/management   (requirements-management.txt → requirements.txt)
+              └──merge──►  deploy/filter       (requirements-filter.txt → requirements.txt)
 ```
 
 Do **not** develop only on deploy branches — merge from `main`/`mgmt` regularly to avoid drift.
