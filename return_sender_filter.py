@@ -48,7 +48,7 @@ def build_sender_name_allowlist(sender_names: Sequence[str]) -> Set[str]:
 
 
 def find_sender_name_column(df: pd.DataFrame) -> Optional[str]:
-    if df is None or df.empty:
+    if df is None or len(getattr(df, "columns", [])) == 0:
         return None
     columns_by_lower = {str(c).strip().lower(): c for c in df.columns}
     for alias in SENDER_NAME_COLUMN_ALIASES:
@@ -74,8 +74,21 @@ def resolve_return_sender_names(
         return None
     if configured is None or configured is True:
         return DEFAULT_RETURN_SENDER_NAMES
+    if isinstance(configured, str):
+        names = tuple(
+            part.strip()
+            for part in configured.replace(",", "\n").splitlines()
+            if part.strip()
+        )
+        return names or None
     names = tuple(str(n).strip() for n in configured if str(n).strip())
     return names or None
+
+
+def parse_sender_names_text(raw: str) -> tuple[str, ...]:
+    """Parse a textarea of sender names (one per line, or comma-separated)."""
+    resolved = resolve_return_sender_names(raw or "")
+    return resolved or tuple()
 
 
 def filter_return_by_sender_name(

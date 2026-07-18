@@ -21,7 +21,7 @@ from hub_filter.pipeline import (
     run_upload_filter,
     suggest_column_map,
 )
-from return_sender_filter import DEFAULT_RETURN_SENDER_NAMES
+from return_sender_filter import DEFAULT_RETURN_SENDER_NAMES, parse_sender_names_text
 
 ROOT = Path(__file__).resolve().parent
 HUBS_DIR = ROOT / "hubs"
@@ -143,11 +143,20 @@ def main() -> None:
         apply_return_sender_filter = st.checkbox(
             "Filter Return by allowed sender_name",
             value=True,
-            help="Uses the default merchant allowlist when enabled.",
+            help="Only applies to the Return sheet.",
         )
+        return_sender_names: Optional[tuple[str, ...]] = None
         if apply_return_sender_filter:
-            with st.expander("Allowed Return sender names", expanded=False):
-                st.code("\n".join(DEFAULT_RETURN_SENDER_NAMES))
+            sender_text = st.text_area(
+                "Allowed Return sender names",
+                value="\n".join(DEFAULT_RETURN_SENDER_NAMES),
+                height=220,
+                help="One name per line (or comma-separated). Matching is case-insensitive.",
+            )
+            return_sender_names = parse_sender_names_text(sender_text)
+            st.caption(f"{len(return_sender_names)} name(s) configured.")
+            if not return_sender_names:
+                st.warning("Allowlist is empty — Return filter would drop all rows.")
 
         st.markdown("---")
         st.caption("CLI equivalent still works: `python -m hub_filter --hub pen353`")
@@ -284,7 +293,10 @@ def main() -> None:
                 task_cfg.pop("column", None)
                 task_cfg.pop("filter_column", None)
             if tab.lower() == "return":
-                task_cfg["sender_names"] = True if apply_return_sender_filter else False
+                if apply_return_sender_filter:
+                    task_cfg["sender_names"] = list(return_sender_names or ())
+                else:
+                    task_cfg["sender_names"] = False
 
             built_tasks[tab] = task_cfg
             upload_summary.append(
@@ -301,7 +313,9 @@ def main() -> None:
 
     if st.button("Run filter", type="primary"):
         hub_runtime = dict(hub_cfg)
-        if not apply_return_sender_filter:
+        if apply_return_sender_filter:
+            hub_runtime["return_sender_names"] = list(return_sender_names or ())
+        else:
             hub_runtime["return_sender_names"] = False
 
         with st.spinner("Filtering…"):
