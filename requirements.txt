@@ -2,3 +2,7 @@ streamlit>=1.28,<2
 pandas>=2.0,<3
 altair>=6.0,<7
 requests>=2.31,<3
+sqlalchemy>=2.0,<3
+prophet>=1.1,<2
+psycopg2-binary>=2.9,<3
+plotly>=5.18,<6
