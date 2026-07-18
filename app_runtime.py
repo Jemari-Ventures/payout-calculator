@@ -57,6 +57,9 @@ def build_dispatcher_mapping(
     find_reward_dispatcher_name_column,
     find_dispatch_id_column,
     find_column_fn,
+    pickup_df: Optional[pd.DataFrame] = None,
+    find_pickup_dispatcher_column_fn=None,
+    find_pickup_dispatcher_name_column_fn=None,
 ) -> Dict[str, str]:
     """Build dispatcher_id -> name map without row-wise Python loops on large frames."""
     mapping: Dict[str, str] = {}
@@ -79,6 +82,37 @@ def build_dispatcher_mapping(
             for disp_id in work["_id"].drop_duplicates():
                 if disp_id and disp_id not in mapping:
                     mapping[str(disp_id)] = ""
+
+    if (
+        pickup_df is not None
+        and not pickup_df.empty
+        and find_pickup_dispatcher_column_fn is not None
+    ):
+        pickup_id_col = find_pickup_dispatcher_column_fn(pickup_df)
+        pickup_name_col = (
+            find_pickup_dispatcher_name_column_fn(pickup_df)
+            if find_pickup_dispatcher_name_column_fn is not None
+            else None
+        )
+        if pickup_id_col:
+            cols = [pickup_id_col] + ([pickup_name_col] if pickup_name_col else [])
+            pickup_work = pickup_df[cols].dropna(subset=[pickup_id_col]).copy()
+            pickup_work["_id"] = pickup_work[pickup_id_col].map(clean_id)
+            pickup_work = pickup_work[pickup_work["_id"].astype(bool)]
+            if pickup_name_col and pickup_name_col in pickup_work.columns:
+                pickup_work["_name"] = pickup_work[pickup_name_col].astype(str).map(clean_name)
+                for disp_id, name in pickup_work.drop_duplicates("_id")[["_id", "_name"]].itertuples(index=False):
+                    key = str(disp_id)
+                    if not key:
+                        continue
+                    nm = str(name or "").strip()
+                    if nm and not str(mapping.get(key, "")).strip():
+                        mapping[key] = nm
+                    elif key not in mapping:
+                        mapping[key] = nm
+            else:
+                for disp_id in pickup_work["_id"].drop_duplicates():
+                    mapping.setdefault(str(disp_id), mapping.get(str(disp_id), ""))
 
     for penalty_id in collect_penalty_ids(penalty_sheets):
         mapping.setdefault(penalty_id, "")
@@ -112,7 +146,14 @@ def build_dispatcher_mapping(
             if bulky_name_col and bulky_name_col in bulky_work.columns:
                 bulky_work["_name"] = bulky_work[bulky_name_col].astype(str).map(clean_name)
                 for disp_id, name in bulky_work.drop_duplicates("_id")[["_id", "_name"]].itertuples(index=False):
-                    mapping.setdefault(str(disp_id), str(name or mapping.get(str(disp_id), "")))
+                    key = str(disp_id)
+                    if not key:
+                        continue
+                    nm = str(name or "").strip()
+                    if nm and not str(mapping.get(key, "")).strip():
+                        mapping[key] = nm
+                    elif key not in mapping:
+                        mapping[key] = nm
             else:
                 for disp_id in bulky_work["_id"].drop_duplicates():
                     mapping.setdefault(str(disp_id), "")

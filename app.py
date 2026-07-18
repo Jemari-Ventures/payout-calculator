@@ -57,6 +57,7 @@ from app_runtime import (
     payout_config_fingerprint,
     trim_sheet_columns,
 )
+from return_sender_filter import filter_return_by_sender_name
 from streamlit_compat import render_html, stretch_width_kwargs
 
 # =============================================================================
@@ -348,6 +349,30 @@ def find_pickup_dispatcher_column(df: pd.DataFrame) -> Optional[str]:
     return None
 
 
+def find_pickup_dispatcher_name_column(df: pd.DataFrame) -> Optional[str]:
+    """Find pickup dispatcher name column."""
+    if df is None or df.empty:
+        return None
+    columns_by_lower = {str(c).strip().lower(): c for c in df.columns}
+    for name in (
+        "Pick Up Dispatcher Name",
+        "Pickup Dispatcher Name",
+        "pickup_dispatcher_name",
+        "pick_up_dispatcher_name",
+        "Rider Name",
+        "rider_name",
+        "dispatcher_name",
+        "Dispatcher Name",
+    ):
+        if name.lower() in columns_by_lower:
+            return columns_by_lower[name.lower()]
+    for col in df.columns:
+        c_lower = str(col).strip().lower()
+        if "pickup" in c_lower and "name" in c_lower:
+            return col
+    return None
+
+
 def build_pickup_waybill_set(pickup_df: pd.DataFrame) -> set:
     """All normalized waybills listed on the pickup sheet."""
     if pickup_df is None or pickup_df.empty:
@@ -539,6 +564,8 @@ class DataSource:
                 raise
 
             resp_content = resp.content
+            if not resp_content or not str(resp_content).strip():
+                return pd.DataFrame()
 
             # If a specific sheet name was requested but doesn't exist, Sheets returns HTML/error text.
             # In that case, treat it as an empty sheet so downstream calculations are 0.
@@ -554,26 +581,33 @@ class DataSource:
                     return pd.DataFrame()
 
             # Read CSV with waybill columns as text.
-            header_preview = pd.read_csv(
-                io.BytesIO(resp_content),
-                nrows=0,
-                encoding="utf-8-sig",
-            )
+            try:
+                header_preview = pd.read_csv(
+                    io.BytesIO(resp_content),
+                    nrows=0,
+                    encoding="utf-8-sig",
+                )
+            except pd.errors.EmptyDataError:
+                return pd.DataFrame()
             raw_columns = list(header_preview.columns)
+            if not raw_columns:
+                return pd.DataFrame()
             clean_columns = [str(c).replace("\ufeff", "").strip() for c in raw_columns]
-            df = pd.read_csv(
-                io.BytesIO(resp_content),
-                dtype=waybill_column_read_dtypes(raw_columns) or None,
-                keep_default_na=False,
-                na_values=[],
-                encoding="utf-8-sig",
-                low_memory=False,
-            )
+            try:
+                df = pd.read_csv(
+                    io.BytesIO(resp_content),
+                    dtype=waybill_column_read_dtypes(raw_columns) or None,
+                    keep_default_na=False,
+                    na_values=[],
+                    encoding="utf-8-sig",
+                    low_memory=False,
+                )
+            except pd.errors.EmptyDataError:
+                return pd.DataFrame()
             df.columns = clean_columns
             return df
-        except Exception as exc:
-            st.error(f"Failed to fetch Google Sheet: {exc}")
-            raise
+        except Exception:
+            return pd.DataFrame()
 
     @staticmethod
     @st.cache_data(ttl=300, show_spinner=False)
@@ -645,11 +679,18 @@ class DataSource:
         Read an optional sheet and guard against Google Sheets fallback behavior
         where a missing tab may return Dispatch content instead.
         """
-        sheet_df = DataSource.read_google_sheet(gsheet_url, sheet_name=sheet_name)
+        try:
+            sheet_df = DataSource.read_google_sheet(gsheet_url, sheet_name=sheet_name)
+        except Exception:
+            return pd.DataFrame()
         if sheet_df is None or sheet_df.empty:
             return pd.DataFrame()
 
-        dispatch_df = DataSource.read_google_sheet(gsheet_url, sheet_name=dispatch_sheet_name)
+        try:
+            dispatch_df = DataSource.read_google_sheet(gsheet_url, sheet_name=dispatch_sheet_name)
+        except Exception:
+            return pd.DataFrame()
+
         if DataSource._is_fallback_dispatch_sheet(sheet_df, dispatch_df):
             return pd.DataFrame()
         return sheet_df
@@ -667,8 +708,7 @@ class DataSource:
                 sheet_name=sheet_name,
                 dispatch_sheet_name=dispatch_sheet,
             )
-        except Exception as exc:
-            st.warning(f"Could not load {sheet_key} data from '{sheet_name}': {exc}")
+        except Exception:
             return None
 
     @staticmethod
@@ -742,16 +782,20 @@ class DataSource:
         bundle: Dict[str, pd.DataFrame] = {}
         for key, sheet_name in sheet_map.items():
             if key == "dispatch":
-                bundle[key] = trim_sheet_columns(
-                    DataSource.read_google_sheet(gsheet_url, sheet_name=sheet_name),
-                    "dispatch",
-                )
+                try:
+                    raw_dispatch = DataSource.read_google_sheet(gsheet_url, sheet_name=sheet_name)
+                except Exception:
+                    raw_dispatch = pd.DataFrame()
+                bundle[key] = trim_sheet_columns(raw_dispatch, "dispatch")
                 continue
-            raw = DataSource._read_optional_sheet_without_dispatch_fallback(
-                gsheet_url,
-                sheet_name=sheet_name,
-                dispatch_sheet_name=dispatch_sheet,
-            )
+            try:
+                raw = DataSource._read_optional_sheet_without_dispatch_fallback(
+                    gsheet_url,
+                    sheet_name=sheet_name,
+                    dispatch_sheet_name=dispatch_sheet,
+                )
+            except Exception:
+                raw = pd.DataFrame()
             bundle[key] = trim_sheet_columns(raw, key)
         return bundle
 
@@ -774,17 +818,13 @@ class DataSource:
 
     @staticmethod
     def load_bulky_data(config: dict) -> Optional[pd.DataFrame]:
-        """Load bulky parcel data directly from the Bulky sheet (same as management.py)."""
-        data_source = config["data_source"]
-        gsheet_url = data_source.get("gsheet_url")
-        if not gsheet_url:
-            return None
-        sheet_name = DataSource._get_excel_sheet_name(config, "bulky", "Bulky")
-        try:
-            return DataSource.read_google_sheet(gsheet_url, sheet_name=sheet_name)
-        except Exception as exc:
-            st.warning(f"Could not load bulky data from sheet '{sheet_name}': {exc}")
-            return None
+        """Load Bulky tab rows for the dispatcher app.
+
+        Unlike management.py, this app does not use weight-based bulky_rates.
+        Bulky AWBs are deduplicated against Dispatch, then counted in the same
+        daily parcel-tier base rate as normal delivery.
+        """
+        return DataSource._load_optional_sheet(config, "bulky", "Bulky")
 
     @staticmethod
     def load_attendance_data(config: dict) -> Optional[pd.DataFrame]:
@@ -801,8 +841,7 @@ class DataSource:
                 return DataSource._read_optional_sheet_without_dispatch_fallback(
                     data_source["gsheet_url"], sheet_name=sheet
                 )
-            except Exception as exc:
-                st.warning(f"Could not load Attendance data: {exc}")
+            except Exception:
                 return None
         return None
 
@@ -1051,7 +1090,11 @@ class PayoutCalculator:
         bulky_df: Optional[pd.DataFrame],
         dispatcher_id: str,
     ) -> pd.DataFrame:
-        """Add all bulky sheet rows for this dispatcher as delivery records."""
+        """Add Bulky-tab rows for this dispatcher into the delivery pool.
+
+        These rows are included in daily parcel counts and paid at the normal
+        tier rate (not management.py weight-based bulky_rates).
+        """
         if work is None:
             work = pd.DataFrame()
         if bulky_df is None or bulky_df.empty or not dispatcher_id:
@@ -1652,10 +1695,12 @@ class PayoutCalculator:
                               bulky_df: Optional[pd.DataFrame] = None,
                               designated_driver_config: Optional[dict] = None,
                               fallback_dispatcher_id: Optional[str] = None) -> Tuple:
-        """Calculate tiered base delivery payout from dispatch and bulky sheet rows.
+        """Calculate tiered base delivery payout from Dispatch and Bulky sheet rows.
 
-        Dispatch AWBs on Return or Pickup are excluded. Dispatch rows that also appear on
-        the Bulky sheet are excluded from dispatch counting and counted via Bulky instead.
+        Dispatch AWBs on Return or Pickup are excluded. Overlapping Dispatch/Bulky AWBs
+        are deduplicated (counted once via Bulky). All delivery rows—including Bulky—
+        use the same daily parcel-tier rate. management.py is different: it applies
+        separate weight-based bulky_rates there, not here.
         """
         penalty_id = clean_penalty_dispatcher_id(fallback_dispatcher_id or "")
         dispatcher_id = str(fallback_dispatcher_id or "").strip()
@@ -2190,11 +2235,17 @@ class InvoiceGenerator:
             .brand {{ font-weight: 700; font-size: 24px; letter-spacing: -0.5px; }}
             .idline {{ opacity: 0.9; font-size: 14px; margin-top: 4px; }}
             .summary {{
-              margin-top: 24px; display: flex; gap: 12px; flex-wrap: wrap; justify-content: center;
+              margin-top: 24px;
+              display: flex;
+              gap: 10px;
+              flex-wrap: nowrap;
+              justify-content: stretch;
+              overflow-x: auto;
             }}
             .chip {{
               border: 1px solid var(--border); border-radius: 12px;
-              padding: 16px; background: var(--surface); min-width: 160px;
+              padding: 12px 10px; background: var(--surface);
+              flex: 1 1 0; min-width: 0;
               box-shadow: 0 1px 3px rgba(0,0,0,0.1);
               transition: transform 0.2s, box-shadow 0.2s;
               text-align: center;
@@ -2204,8 +2255,8 @@ class InvoiceGenerator:
               box-shadow: 0 4px 12px rgba(0,0,0,0.15);
               border-color: var(--primary-light);
             }}
-            .chip .label {{ color: var(--text-secondary); font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600; }}
-            .chip .value {{ font-size: 18px; font-weight: 700; margin-top: 6px; color: var(--primary); }}
+            .chip .label {{ color: var(--text-secondary); font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; font-weight: 600; line-height: 1.3; }}
+            .chip .value {{ font-size: 16px; font-weight: 700; margin-top: 6px; color: var(--primary); word-break: break-word; }}
             .bonus-section {{
               margin-top: 24px;
               display: grid;
@@ -2368,8 +2419,8 @@ class InvoiceGenerator:
             }}
             @media (max-width: 768px) {{
               .header {{ grid-template-columns: 1fr; text-align: center; }}
-              .summary {{ flex-direction: column; }}
-              .chip {{ min-width: auto; }}
+              .summary {{ flex-wrap: nowrap; overflow-x: auto; }}
+              .chip {{ flex: 0 0 120px; min-width: 120px; }}
               .bonus-section {{ grid-template-columns: 1fr; }}
             }}
             </style>
@@ -2993,7 +3044,11 @@ def prepare_period_workbook(
         filter_sheet_by_date_range(bundle.get("pickup"), start_date, end_date, ["date_pick_up"])
     )
     period["return"] = _df_or_empty(
-        filter_sheet_by_date_range(bundle.get("return"), start_date, end_date, ["delivery_signature"])
+        filter_return_by_sender_name(
+            filter_sheet_by_date_range(
+                bundle.get("return"), start_date, end_date, ["delivery_signature"]
+            )
+        )
     )
     period["bulky"] = _df_or_empty(
         filter_sheet_by_date_range(bundle.get("bulky"), start_date, end_date, ["delivery_signature"])
@@ -3336,7 +3391,6 @@ def main():
         calendar_df = DataSource.load_dispatch_calendar(gsheet_url, dispatch_sheet)
 
     if calendar_df is None or calendar_df.empty:
-        st.warning("No data found in the Dispatch sheet.")
         add_footer()
         return
 
@@ -3421,7 +3475,13 @@ def main():
     end_iso = iso_date(end_date)
 
     with st.spinner("Loading period data..."):
-        period = prepare_period_workbook(gsheet_url, sheets_json, start_iso, end_iso)
+        try:
+            period = prepare_period_workbook(gsheet_url, sheets_json, start_iso, end_iso)
+        except Exception as exc:
+            st.error(f"Error loading workbook data: {exc}")
+            st.exception(exc)
+            add_footer()
+            return
 
     df = period.get("dispatch", pd.DataFrame())
     pickup_df = period.get("pickup", pd.DataFrame())
@@ -3482,6 +3542,9 @@ def main():
         find_reward_dispatcher_name_column,
         find_dispatch_id_column,
         find_column,
+        pickup_df=pickup_df,
+        find_pickup_dispatcher_column_fn=find_pickup_dispatcher_column,
+        find_pickup_dispatcher_name_column_fn=find_pickup_dispatcher_name_column,
     )
 
     dispatcher_options = []
@@ -3588,48 +3651,6 @@ def main():
             f"in the selected period. Showing penalties and other earnings only."
         )
 
-    # Visibility: show which optional sheets are missing/empty and therefore treated as 0.
-    optional_sheets = {
-        "Pickup": pickup_df,
-        "DuitNow": duitnow_df,
-        "LDR": ldr_df,
-        "Fake Attempt": fake_attempt_df,
-        "COD": cod_df,
-        "Binding": binding_df,
-        "Hub": hub_df,
-        "SOCSO": socso_df,
-        "Overpaid": overpaid_df,
-        "Pending Parcel": pending_parcel_df,
-        "No Outbound Scan": no_outbound_scan_df,
-        "Parcel Lost": parcel_lost_df,
-        "Return": return_df,
-        "Bulky": bulky_df,
-        "Reward": reward_df,
-        "Attendance": attendance_df,
-    }
-    missing_or_empty_sheets = [
-        sheet_name for sheet_name, sheet_df in optional_sheets.items()
-        if sheet_df is None or sheet_df.empty
-    ]
-    if missing_or_empty_sheets:
-        sheet_list = ", ".join(missing_or_empty_sheets)
-        attendance_tab = (
-            config.get("data_source", {})
-            .get("excel_sheets", {})
-            .get("attendance", "Attendance")
-        )
-        st.warning(
-            f"Missing or empty optional sheet(s): {sheet_list}. "
-            f"Related pickup/penalty calculations are treated as 0."
-        )
-        if "Attendance" in missing_or_empty_sheets:
-            st.caption(
-                f"Attendance: the workbook tab name must match config "
-                f"data_source.excel_sheets.attendance (currently \"{attendance_tab}\"), "
-                f"the tab needs at least one data row (not only headers), and the CSV export must not be "
-                f"identical to Dispatch (a wrong tab name can make Google return Dispatch data, which this app ignores)."
-            )
-
     # Calculate payout
     st.subheader(f"💰 Payout Calculation for {selected_dispatcher_name or selected_dispatcher_id}")
 
@@ -3675,8 +3696,9 @@ def main():
                     "Parcels Delivered",
                     f"{display_df['Total Parcel'].sum():,}",
                     help=(
-                        "Dispatch and bulky parcels for tier base rate "
-                        "(excludes return and pickup AWBs; overlap counted via Bulky only)."
+                        "Dispatch and Bulky parcels for daily tier base rate "
+                        "(Bulky uses the same tier rate as Dispatch, not management weight rates; "
+                        "excludes return and pickup AWBs; overlap counted via Bulky only)."
                     ),
                 )
             with summary_row1_col3:

@@ -1,0 +1,28 @@
+{
+  "hub_id": "PEN364",
+  "dispatcher_ids": ["PEN364*"],
+  "output_file": "/Users/UMARI.ZULKIFLI/Documents/Jemari Ventures/Worksheet/ECP JULY 2026-PEN353.xlsx",
+  "tasks": {
+    "Dispatch": {
+      "file": "/Users/UMARI.ZULKIFLI/Documents/Jemari Ventures/Worksheet/PEN364 Dispatch July 2026.xlsx",
+      "sheet": "sheet0",
+      "header": 0,
+      "column": "Dispatcher ID"
+    },
+    "Pickup": {
+      "file": "/Users/UMARI.ZULKIFLI/Documents/Jemari Ventures/Worksheet/PEN364 Pickup July 2026.xlsx",
+      "sheet": "sheet1",
+      "header": 0,
+      "column": "Pick Up Dispatcher ID"
+    },
+    "Return": {
+      "file": "/Users/UMARI.ZULKIFLI/Documents/Jemari Ventures/Worksheet/PEN364 Return July 2026.xlsx",
+      "sheet": "Shipping AWB",
+      "header": 0,
+      "column": "Dispatcher ID",
+      "rename_columns": {
+        "Dispatcher No. | Delivery": "Dispatcher ID"
+      }
+    }
+  }
+}
