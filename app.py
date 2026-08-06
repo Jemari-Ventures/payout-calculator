@@ -178,6 +178,8 @@ class Config:
                         "no_outbound_scan": "No Outbound Scan",
                         "parcel_lost": "Parcel lost",
                         "hub": "Hub",
+                        "route": "Route",
+                        "sla": "SLA",
                         "socso": "Socso",
                         "overpaid": "Overpaid",
                         "rental": "Rental",
@@ -754,6 +756,14 @@ class DataSource:
         return DataSource._load_optional_sheet(config, "hub", "hub")
 
     @staticmethod
+    def load_route_penalty_data(config: dict) -> Optional[pd.DataFrame]:
+        return DataSource._load_optional_sheet(config, "route", "Route")
+
+    @staticmethod
+    def load_sla_penalty_data(config: dict) -> Optional[pd.DataFrame]:
+        return DataSource._load_optional_sheet(config, "sla", "SLA")
+
+    @staticmethod
     def load_socso_deduction_data(config: dict) -> Optional[pd.DataFrame]:
         return DataSource._load_optional_sheet(config, "socso", "Socso")
 
@@ -1178,6 +1188,8 @@ class PayoutCalculator:
                          cod_df: Optional[pd.DataFrame] = None,
                          binding_df: Optional[pd.DataFrame] = None,
                          hub_df: Optional[pd.DataFrame] = None,
+                         route_df: Optional[pd.DataFrame] = None,
+                         sla_df: Optional[pd.DataFrame] = None,
                          pending_parcel_df: Optional[pd.DataFrame] = None,
                          no_outbound_scan_df: Optional[pd.DataFrame] = None,
                          parcel_lost_df: Optional[pd.DataFrame] = None,
@@ -1215,6 +1227,7 @@ class PayoutCalculator:
             'no_outbound_scan': {'amount': 0.0, 'count': 0, 'waybills': []},
             'parcel_lost': {'amount': 0.0, 'count': 0, 'waybills': []},
             'route': {'amount': 0.0, 'count': 0, 'pool_total': 0.0},
+            'sla': {'amount': 0.0, 'count': 0},
             'attendance': {'amount': 0.0, 'count': 0},
             'total_amount': 0.0,
             'total_count': 0
@@ -1356,11 +1369,35 @@ class PayoutCalculator:
                     if pl_waybill_col:
                         penalty_breakdown['parcel_lost']['waybills'] = extract_waybill_list(pl_rows[pl_waybill_col])
 
-        # 8. Route penalty: total from config divided equally among dispatchers (see main / calculate_tiered_daily)
-        if route_penalty_per_dispatcher > 0:
+        # 8. Route penalty: prefer Route sheet; else legacy equal-split pool
+        if route_df is not None and not route_df.empty:
+            route_disp_col = find_penalty_dispatcher_column(route_df)
+            if route_disp_col is not None:
+                route_rows = filter_rows_for_penalty_dispatcher(route_df, route_disp_col, dispatcher_id)
+                if not route_rows.empty:
+                    penalty_col = find_penalty_amount_column(route_df)
+                    if penalty_col is not None:
+                        penalty_values = route_rows[penalty_col].apply(penalty_cell_to_float)
+                        penalty_values = penalty_values[penalty_values > 0]
+                        penalty_breakdown['route']['amount'] = round(float(penalty_values.sum()), 2)
+                        penalty_breakdown['route']['count'] = int(len(penalty_values))
+        if penalty_breakdown['route']['amount'] <= 0 and route_penalty_per_dispatcher > 0:
             penalty_breakdown['route']['amount'] = round(float(route_penalty_per_dispatcher), 2)
             penalty_breakdown['route']['count'] = int(route_penalty_dispatcher_count) if route_penalty_dispatcher_count else 0
             penalty_breakdown['route']['pool_total'] = round(float(route_penalty_pool_total), 2)
+
+        # 8b. SLA penalty from SLA sheet
+        if sla_df is not None and not sla_df.empty:
+            sla_disp_col = find_penalty_dispatcher_column(sla_df)
+            if sla_disp_col is not None:
+                sla_rows = filter_rows_for_penalty_dispatcher(sla_df, sla_disp_col, dispatcher_id)
+                if not sla_rows.empty:
+                    penalty_col = find_penalty_amount_column(sla_df)
+                    if penalty_col is not None:
+                        penalty_values = sla_rows[penalty_col].apply(penalty_cell_to_float)
+                        penalty_values = penalty_values[penalty_values > 0]
+                        penalty_breakdown['sla']['amount'] = round(float(penalty_values.sum()), 2)
+                        penalty_breakdown['sla']['count'] = int(len(penalty_values))
 
         # 9. Process Attendance penalty (Attendance sheet) - direct penalty column sum by dispatcher_id
         if attendance_df is not None and not attendance_df.empty:
@@ -1387,6 +1424,7 @@ class PayoutCalculator:
             penalty_breakdown['no_outbound_scan']['amount'] +
             penalty_breakdown['parcel_lost']['amount'] +
             penalty_breakdown['route']['amount'] +
+            penalty_breakdown['sla']['amount'] +
             penalty_breakdown['attendance']['amount'],
             2
         )
@@ -1401,7 +1439,8 @@ class PayoutCalculator:
             penalty_breakdown['no_outbound_scan']['count'] +
             penalty_breakdown['parcel_lost']['count'] +
             penalty_breakdown['attendance']['count'] +
-            (1 if penalty_breakdown['route']['amount'] > 0 else 0)
+            (1 if penalty_breakdown['route']['amount'] > 0 else 0) +
+            penalty_breakdown['sla']['count']
         )
 
         return penalty_breakdown
@@ -1680,6 +1719,8 @@ class PayoutCalculator:
                               cod_df: Optional[pd.DataFrame] = None,
                               binding_df: Optional[pd.DataFrame] = None,
                               hub_df: Optional[pd.DataFrame] = None,
+                              route_df: Optional[pd.DataFrame] = None,
+                              sla_df: Optional[pd.DataFrame] = None,
                               pending_parcel_df: Optional[pd.DataFrame] = None,
                               no_outbound_scan_df: Optional[pd.DataFrame] = None,
                               parcel_lost_df: Optional[pd.DataFrame] = None,
@@ -1736,6 +1777,8 @@ class PayoutCalculator:
                     cod_df,
                     binding_df,
                     hub_df,
+                    route_df,
+                    sla_df,
                     pending_parcel_df,
                     no_outbound_scan_df,
                     parcel_lost_df,
@@ -1758,6 +1801,7 @@ class PayoutCalculator:
                     'no_outbound_scan': {'amount': 0.0, 'count': 0, 'waybills': []},
                     'parcel_lost': {'amount': 0.0, 'count': 0, 'waybills': []},
                     'route': {'amount': 0.0, 'count': 0, 'pool_total': 0.0},
+                    'sla': {'amount': 0.0, 'count': 0},
                     'attendance': {'amount': 0.0, 'count': 0},
                     'total_amount': 0.0,
                     'total_count': 0,
@@ -1830,6 +1874,8 @@ class PayoutCalculator:
                 cod_df,
                 binding_df,
                 hub_df,
+                route_df,
+                sla_df,
                 pending_parcel_df,
                 no_outbound_scan_df,
                 parcel_lost_df,
@@ -1852,6 +1898,7 @@ class PayoutCalculator:
                 'no_outbound_scan': {'amount': 0.0, 'count': 0, 'waybills': []},
                 'parcel_lost': {'amount': 0.0, 'count': 0, 'waybills': []},
                 'route': {'amount': 0.0, 'count': 0, 'pool_total': 0.0},
+                'sla': {'amount': 0.0, 'count': 0},
                 'attendance': {'amount': 0.0, 'count': 0},
                 'total_amount': 0.0,
                 'total_count': 0,
@@ -1932,6 +1979,7 @@ class PayoutCalculator:
                            'no_outbound_scan': {'amount': 0.0, 'count': 0, 'waybills': []},
                            'parcel_lost': {'amount': 0.0, 'count': 0, 'waybills': []},
                            'route': {'amount': 0.0, 'count': 0, 'pool_total': 0.0},
+                           'sla': {'amount': 0.0, 'count': 0},
                            'attendance': {'amount': 0.0, 'count': 0},
                            'total_amount': 0.0, 'total_count': 0}
 
@@ -1947,6 +1995,8 @@ class PayoutCalculator:
                 cod_df,
                 binding_df,
                 hub_df,
+                route_df,
+                sla_df,
                 pending_parcel_df,
                 no_outbound_scan_df,
                 parcel_lost_df,
@@ -1995,6 +2045,8 @@ class PayoutCalculator:
         cod_df: Optional[pd.DataFrame] = None,
         binding_df: Optional[pd.DataFrame] = None,
         hub_df: Optional[pd.DataFrame] = None,
+        route_df: Optional[pd.DataFrame] = None,
+        sla_df: Optional[pd.DataFrame] = None,
         pending_parcel_df: Optional[pd.DataFrame] = None,
         no_outbound_scan_df: Optional[pd.DataFrame] = None,
         parcel_lost_df: Optional[pd.DataFrame] = None,
@@ -2030,6 +2082,8 @@ class PayoutCalculator:
             cod_df=cod_df,
             binding_df=binding_df,
             hub_df=hub_df,
+            route_df=route_df,
+            sla_df=sla_df,
             pending_parcel_df=pending_parcel_df,
             no_outbound_scan_df=no_outbound_scan_df,
             parcel_lost_df=parcel_lost_df,
@@ -2621,10 +2675,23 @@ class InvoiceGenerator:
                 if penalty_breakdown.get('route', {}).get('amount', 0) > 0:
                     rc = penalty_breakdown['route'].get('count', 0) or 0
                     pool = float(penalty_breakdown['route'].get('pool_total', 0) or 0)
+                    route_label = (
+                        f"{currency_symbol}{pool:,.2f} ÷ {rc} dispatchers"
+                        if pool > 0
+                        else f"{rc} record(s)"
+                    )
                     html_content += f"""
                         <div class="penalty-item">
-                            <span><strong>Route:</strong> {currency_symbol}{pool:,.2f} ÷ {rc} dispatchers</span>
+                            <span><strong>Route:</strong> {route_label}</span>
                             <span>- {currency_symbol} {penalty_breakdown['route']['amount']:,.2f}</span>
+                        </div>
+                    """
+
+                if penalty_breakdown.get('sla', {}).get('count', 0) > 0:
+                    html_content += f"""
+                        <div class="penalty-item">
+                            <span><strong>SLA:</strong> {penalty_breakdown['sla']['count']} record(s)</span>
+                            <span>- {currency_symbol} {penalty_breakdown['sla']['amount']:,.2f}</span>
                         </div>
                     """
 
@@ -2795,10 +2862,22 @@ class InvoiceGenerator:
             if penalty_breakdown.get('route', {}).get('amount', 0) > 0:
                 rc = penalty_breakdown['route'].get('count', 0) or 0
                 pool = float(penalty_breakdown['route'].get('pool_total', 0) or 0)
+                route_label = (
+                    f"{currency_symbol}{pool:,.2f} ÷ {rc} dispatchers"
+                    if pool > 0
+                    else f"{rc} record(s)"
+                )
                 html_content += f"""
                 <div class="payout-row penalty-detail-row">
-                    <span>↳ Route ({currency_symbol}{pool:,.2f} ÷ {rc} dispatchers):</span>
+                    <span>↳ Route ({route_label}):</span>
                     <span>- {currency_symbol} {penalty_breakdown['route']['amount']:,.2f}</span>
+                </div>"""
+
+            if penalty_breakdown.get('sla', {}).get('count', 0) > 0:
+                html_content += f"""
+                <div class="payout-row penalty-detail-row">
+                    <span>↳ SLA ({penalty_breakdown['sla']['count']} record(s)):</span>
+                    <span>- {currency_symbol} {penalty_breakdown['sla']['amount']:,.2f}</span>
                 </div>"""
 
             if penalty_breakdown['attendance']['amount'] > 0:
@@ -3064,6 +3143,8 @@ def prepare_period_workbook(
             "cod": bundle.get("cod"),
             "binding": bundle.get("binding"),
             "hub": bundle.get("hub"),
+            "route": bundle.get("route"),
+            "sla": bundle.get("sla"),
             "socso": bundle.get("socso"),
             "overpaid": bundle.get("overpaid"),
             "pending_parcel": bundle.get("pending_parcel"),
@@ -3076,7 +3157,7 @@ def prepare_period_workbook(
     for key, df in penalty_filtered.items():
         period[key] = df
     for key in (
-        "duitnow", "ldr", "fake_attempt", "cod", "binding", "hub",
+        "duitnow", "ldr", "fake_attempt", "cod", "binding", "hub", "route", "sla",
         "socso", "overpaid", "pending_parcel", "no_outbound_scan", "parcel_lost",
     ):
         period.setdefault(key, pd.DataFrame())
@@ -3122,6 +3203,8 @@ def compute_dispatcher_payout(
     cod_df = period.get("cod", pd.DataFrame())
     binding_df = period.get("binding", pd.DataFrame())
     hub_df = period.get("hub", pd.DataFrame())
+    route_df = period.get("route", pd.DataFrame())
+    sla_df = period.get("sla", pd.DataFrame())
     socso_df = period.get("socso", pd.DataFrame())
     overpaid_df = period.get("overpaid", pd.DataFrame())
     pending_parcel_df = period.get("pending_parcel", pd.DataFrame())
@@ -3138,6 +3221,8 @@ def compute_dispatcher_payout(
         cod_df=cod_df,
         binding_df=binding_df,
         hub_df=hub_df,
+        route_df=route_df,
+        sla_df=sla_df,
         pending_parcel_df=pending_parcel_df,
         no_outbound_scan_df=no_outbound_scan_df,
         parcel_lost_df=parcel_lost_df,
@@ -3445,10 +3530,11 @@ def main():
 
     st.sidebar.markdown("---")
     st.sidebar.subheader("🛣️ Route Penalty")
+    st.sidebar.caption("Primary source: Route sheet (`dispatcher_id`, `dispatcher_name`, `penalty`).")
     route_penalty_app_enabled = st.sidebar.checkbox(
-        "Apply route penalty",
+        "Apply route penalty pool (legacy)",
         value=bool(config.get("route_penalty_app_enabled", False)),
-        help="Total pool split equally across dispatchers in the selected period.",
+        help="Only used when the Route sheet is missing/empty for a dispatcher.",
     )
     if route_penalty_app_enabled != bool(config.get("route_penalty_app_enabled", False)):
         config["route_penalty_app_enabled"] = route_penalty_app_enabled
@@ -3461,7 +3547,7 @@ def main():
         value=float(config.get("route_penalty_amount", 0.0)),
         step=50.0,
         disabled=not route_penalty_app_enabled,
-        help="Each dispatcher's share = total ÷ number of dispatchers in period.",
+        help="Legacy fallback: each dispatcher share = total ÷ number of dispatchers in period.",
     )
     if route_penalty_amount_input != float(config.get("route_penalty_amount", 0.0)):
         config["route_penalty_amount"] = float(route_penalty_amount_input)
@@ -3495,6 +3581,8 @@ def main():
     cod_df = period.get("cod", pd.DataFrame())
     binding_df = period.get("binding", pd.DataFrame())
     hub_df = period.get("hub", pd.DataFrame())
+    route_df = period.get("route", pd.DataFrame())
+    sla_df = period.get("sla", pd.DataFrame())
     socso_df = period.get("socso", pd.DataFrame())
     overpaid_df = period.get("overpaid", pd.DataFrame())
     pending_parcel_df = period.get("pending_parcel", pd.DataFrame())
@@ -3526,6 +3614,8 @@ def main():
             "cod": cod_df,
             "binding": binding_df,
             "hub": hub_df,
+            "route": route_df,
+            "sla": sla_df,
             "socso": socso_df,
             "overpaid": overpaid_df,
             "pending_parcel": pending_parcel_df,
@@ -3579,10 +3669,16 @@ def main():
         add_footer()
         return
 
+    # Prefer Route sheet amounts; legacy pool only when sheet has no rows for anyone.
+    has_route_sheet = route_df is not None and not route_df.empty
     route_penalty_total = (
-        float(config.get("route_penalty_amount", 0.0))
-        if config.get("route_penalty_app_enabled", False)
-        else 0.0
+        0.0
+        if has_route_sheet
+        else (
+            float(config.get("route_penalty_amount", 0.0))
+            if config.get("route_penalty_app_enabled", False)
+            else 0.0
+        )
     )
     if not df.empty and dispatcher_id_col:
         route_id_list = df[dispatcher_id_col].dropna().astype(str).str.strip().unique().tolist()
@@ -3973,7 +4069,7 @@ def main():
             # Display penalty details if any
             if penalty_breakdown['total_amount'] > 0:
                 with st.expander("⚠️ Penalty Details"):
-                    penalty_col1, penalty_col2, penalty_col3, penalty_col4, penalty_col5, penalty_col6, penalty_col7, penalty_col8, penalty_col9, penalty_col10 = st.columns(10)
+                    penalty_col1, penalty_col2, penalty_col3, penalty_col4, penalty_col5, penalty_col6, penalty_col7, penalty_col8, penalty_col9, penalty_col10, penalty_col11 = st.columns(11)
 
                     with penalty_col1:
                         if penalty_breakdown['duitnow']['amount'] > 0:
@@ -4024,12 +4120,23 @@ def main():
                     with penalty_col9:
                         if penalty_breakdown.get('route', {}).get('amount', 0) > 0:
                             rc = penalty_breakdown['route'].get('count', 0) or 0
+                            pool = float(penalty_breakdown['route'].get('pool_total', 0) or 0)
+                            route_label = (
+                                f"{rc} dispatcher(s)" if pool > 0 else f"{rc} record(s)"
+                            )
                             st.error(
-                                f"**Route:** {rc} dispatcher(s) - "
+                                f"**Route:** {route_label} - "
                                 f"{config['currency_symbol']}{penalty_breakdown['route']['amount']:,.2f}"
                             )
 
                     with penalty_col10:
+                        if penalty_breakdown.get('sla', {}).get('count', 0) > 0:
+                            st.error(
+                                f"**SLA:** {penalty_breakdown['sla']['count']} record(s) - "
+                                f"{config['currency_symbol']}{penalty_breakdown['sla']['amount']:,.2f}"
+                            )
+
+                    with penalty_col11:
                         if penalty_breakdown['attendance']['amount'] > 0:
                             st.error(f"**Attendance:** Missing Clock-in - {config['currency_symbol']}{penalty_breakdown['attendance']['amount']:,.2f}")
 
