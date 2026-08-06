@@ -33,6 +33,8 @@ SHEET_COLUMNS: Dict[str, List[str]] = {
     ],
     "binding": ["dispatcher_id", "dispatcher_name", "penalty"],
     "hub": ["dispatcher_id", "dispatcher_name", "penalty"],
+    "route": ["dispatcher_id", "dispatcher_name", "penalty"],
+    "sla": ["dispatcher_id", "dispatcher_name", "penalty"],
     "pending_parcel": ["waybill_number", "penalty", "dispatcher_name", "dispatcher_id", "reason"],
     "parcel_lost": ["waybill_number", "amount", "dispatcher_id"],
     "reward": ["dispatcher_id", "amount"],

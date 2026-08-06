@@ -18,7 +18,9 @@ PENALTY_DATE_COLUMNS: Dict[str, List[str]] = {
     "binding": ["date", "created_at", "Date"],
     "pending_parcel": ["date", "created_at", "Date"],
     "parcel_lost": ["date", "created_at", "Date"],
-    # No Outbound Scan template has no date column — period filter is a no-op.
+    # Route / SLA / No Outbound Scan templates have no date column — period filter is a no-op.
+    "route": [],
+    "sla": [],
     "no_outbound_scan": [],
 }
 
