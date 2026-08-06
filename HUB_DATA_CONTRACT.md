@@ -20,6 +20,8 @@ JMS export (https://jms.jtexpress.my)
 6. **COD** money = `penalty`.
 7. **Fake Attempt** keep: `date`, `waybill_number`, `dispatcher_id`, `dispatcher_name` (RM2 × rows).
 8. **No Outbound Scan** keep: `waybill_number`, `dispatcher_id` (RM3 × unique AWB). No date → export only the payroll month into the tab.
+9. **Route** keep: `dispatcher_id`, `dispatcher_name`, `penalty` (sum `penalty` per dispatcher).
+10. **SLA** keep: `dispatcher_id`, `dispatcher_name`, `penalty` (sum `penalty` per dispatcher).
 
 ## Run filter
 

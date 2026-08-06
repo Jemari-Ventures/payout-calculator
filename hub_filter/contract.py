@@ -87,6 +87,14 @@ OUTPUT_SHEETS: Dict[str, Tuple[str, List[str]]] = {
         "hub",
         ["dispatcher_id", "dispatcher_name", "penalty"],
     ),
+    "Route": (
+        "route",
+        ["dispatcher_id", "dispatcher_name", "penalty"],
+    ),
+    "SLA": (
+        "sla",
+        ["dispatcher_id", "dispatcher_name", "penalty"],
+    ),
     "Pending Parcel": (
         "pending_parcel",
         [
