@@ -1,5 +1,7 @@
 Dispatcher Payout Calculator
 
+> **Movix IC (Kulim) couriers:** use the standalone app — see [MOVIX_README.md](MOVIX_README.md) (`streamlit run movix_dispatcher/app.py`). It is separate from this legacy hub calculator.
+
 Quick Streamlit app to filter rows by a dispatcher ID from an Excel file and compute payout.
 
 Supports two payout modes:

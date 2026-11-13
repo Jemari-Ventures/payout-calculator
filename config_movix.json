@@ -1,0 +1,23 @@
+{
+  "currency_symbol": "RM",
+  "sheet_name": "Sheet1",
+  "billable_service_prefixes": ["Del - FWD"],
+  "weight_commission": [
+    {"min_kg": 0.0, "max_kg": 5.0, "rate": 1.0, "label": "0 – 5.00 kg"},
+    {"min_kg": 5.01, "max_kg": 20.0, "rate": 1.8, "label": "5.01 – 20.00 kg"},
+    {"min_kg": 20.01, "max_kg": null, "rate": 3.0, "label": "> 20.00 kg"}
+  ],
+  "basic_salary": {
+    "amount": 1700.0,
+    "required_working_days": 26,
+    "min_avg_parcels_per_day": 50.0
+  },
+  "attendance_allowance": {
+    "amount": 200.0,
+    "required_working_days": 26,
+    "min_avg_parcels_per_day": 50.0,
+    "mc_deduction_per_day": 100.0,
+    "mc_days_disqualify_at": 2
+  },
+  "absent_penalty_per_day": 30.0
+}
