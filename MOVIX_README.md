@@ -3,7 +3,7 @@
 > **Canonical repo:** this Movix IC app now lives at [Jemari-Ventures/movix-ic-payout](https://github.com/Jemari-Ventures/movix-ic-payout). Prefer that repository for new work; this copy is retained for reference on the `movix-dispatcher` branch.
 
 
-Standalone Streamlit app for **Movix Logistics Kulim Independent Contractor (IC)** courier payment.
+Standalone Streamlit app for **Movix Logistics OS Karangan (OKAR)** courier payment.
 
 This is **separate from** the legacy hub dispatcher (`app.py`) and management (`management.py`) calculators. Do not mix configs or sheets between them.
 

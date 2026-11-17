@@ -3,8 +3,14 @@
 from __future__ import annotations
 
 import io
+import sys
 from pathlib import Path
 from typing import Dict
+
+# Streamlit runs this file as a script; ensure repo root is importable.
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 import pandas as pd
 import streamlit as st
@@ -26,9 +32,9 @@ def main() -> None:
         page_icon=None,
         layout="wide",
     )
-    st.title("Movix IC Courier Payout")
+    st.title("Movix OKAR Courier Payout")
     st.caption(
-        "Standalone calculator for Kulim Independent Contractor couriers. "
+        "Standalone calculator for OS Karangan (OKAR) couriers. "
         "Uses Sheet1 of the IC Payment export and the Movix weight / basic / attendance rate card."
     )
 
@@ -39,7 +45,7 @@ def main() -> None:
         st.header("Data")
         uploaded = st.file_uploader("Upload IC Payment Excel (.xlsx)", type=["xlsx"])
         st.markdown("**Rate card**")
-        st.dataframe(pd.DataFrame(config.rate_table_rows()), hide_index=True, use_container_width=True)
+        st.dataframe(pd.DataFrame(config.rate_table_rows()), hide_index=True, width='stretch')
         st.markdown(
             f"- Basic salary: **{config.currency_symbol}{config.basic_amount:,.0f}** "
             f"(≥{config.basic_required_working_days} days & avg ≥{config.basic_min_avg_parcels_per_day:.0f}/day)\n"
@@ -86,7 +92,7 @@ def main() -> None:
         edited = st.data_editor(
             adj_seed,
             hide_index=True,
-            use_container_width=True,
+            width='stretch',
             disabled=["driver_id", "driver_name"],
             column_config={
                 "mc_days": st.column_config.NumberColumn("MC days", min_value=0, step=1),
@@ -124,7 +130,7 @@ def main() -> None:
                 "eligibility_reason",
             ]
             present = [c for c in display_cols if c in summary.columns]
-            st.dataframe(summary[present], hide_index=True, use_container_width=True)
+            st.dataframe(summary[present], hide_index=True, width='stretch')
 
             totals = {
                 "Parcels": int(summary["total_parcels"].sum()),
@@ -187,11 +193,11 @@ def main() -> None:
                     ]
                 )
                 st.markdown("**Commission by weight band**")
-                st.dataframe(band_df, hide_index=True, use_container_width=True)
+                st.dataframe(band_df, hide_index=True, width='stretch')
 
             if not result.daily_summary.empty:
                 st.markdown("**Daily summary**")
-                st.dataframe(result.daily_summary, hide_index=True, use_container_width=True)
+                st.dataframe(result.daily_summary, hide_index=True, width='stretch')
 
             if not result.parcel_detail.empty:
                 export_cols = [
